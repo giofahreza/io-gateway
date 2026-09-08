@@ -3,8 +3,8 @@ import { dirname, join } from "node:path";
 
 const outputDir = "site/docs";
 const docsVersion = "v0.1.11+";
-const updated = "July 28, 2026";
-const assetVersion = "20260728i";
+const updated = "September 4, 2026";
+const assetVersion = "20260908a";
 
 const groups = [
   { title: "Tutorials", slug: "tutorials", description: "First-run paths that take an operator from zero to a working gateway." },
@@ -14,6 +14,16 @@ const groups = [
   { title: "Operations", slug: "operations", description: "Release, deployment, and production operating procedures." },
   { title: "Troubleshooting", slug: "troubleshooting", description: "Symptom-led diagnosis and recovery checks." },
 ];
+
+const docsFigureDimensions = {
+  "docs-api-key-limits.png": [720, 760],
+  "docs-custom-models.png": [1420, 343],
+  "docs-dashboard-overview.png": [1220, 860],
+  "docs-priority-routing.png": [414, 302],
+  "docs-provider-accounts.png": [947, 366],
+  "docs-test-api.png": [720, 741],
+  "docs-usage-quota.png": [1412, 367],
+};
 
 const pages = [
   {
@@ -95,6 +105,51 @@ cp config.example.json config.json
         <li><strong>Create managed API keys</strong> Replace broad shared-key access with scoped keys and prompt-token limits.</li>
         <li><strong>Plan routing</strong> Use priority routing or custom models when traffic should prefer specific accounts.</li>
       </ul>
+    `,
+  },
+  {
+    slug: "first-client-request",
+    title: "First client request",
+    group: "Tutorials",
+    type: "Tutorial",
+    appliesTo: "A running gateway with one enabled provider account",
+    introduced: docsVersion,
+    updated,
+    categories: ["Tutorials", "API access", "Routing"],
+    keywords: "client request curl responses api chat completions base url bearer key models first request openai claude",
+    summary: "Point a client at IO Gateway, inspect its model catalog, and prove a request reaches an upstream account.",
+    seeAlso: ["quick-start", "api-keys", "routing-and-models", "usage-and-quota"],
+    body: `
+      <p class="docs-lead">Use this path after the gateway is healthy and at least one provider account is enabled. It proves the client-facing boundary: base URL, bearer key, model selection, and the receipt left in usage history.</p>
+      <h2>What you need</h2>
+      <ul class="docs-list">
+        <li><strong>A ready gateway</strong> Confirm <code>/ready</code> returns successfully before configuring a client.</li>
+        <li><strong>A client key</strong> Use the shared <code>proxy_api_key</code> or a managed key with access to the provider or alias you intend to call.</li>
+        <li><strong>An enabled model</strong> Ask the gateway for its catalog instead of guessing a provider model name.</li>
+      </ul>
+      <h2>Read the catalog first</h2>
+      <pre><code>export IO_GATEWAY_URL=http://127.0.0.1:8319
+export IO_GATEWAY_KEY='replace-with-your-client-key'
+
+curl -sS "$IO_GATEWAY_URL/v1/models" \\
+  -H "Authorization: Bearer $IO_GATEWAY_KEY"</code></pre>
+      <p>Choose a model returned by <code>/v1/models</code>. A model name can select a provider naturally, a three-letter prefix can force a provider, and a <code>ctm:</code> alias can apply a route policy you created.</p>
+      <h2>Send one response</h2>
+      <pre><code>curl -sS "$IO_GATEWAY_URL/v1/responses" \\
+  -H "Authorization: Bearer $IO_GATEWAY_KEY" \\
+  -H "Content-Type: application/json" \\
+  --data '{
+    "model": "gpt-5.2",
+    "input": "Reply with one short line."
+  }'</code></pre>
+      <p>Replace <code>gpt-5.2</code> with a model from your own catalog. The Responses API is the primary OpenAI-compatible route; existing OpenAI Chat Completions clients can use <code>POST /v1/chat/completions</code>, and Anthropic clients can use <code>POST /claude/v1/messages</code>.</p>
+      <h2>Read the receipt</h2>
+      <ol class="docs-steps compact">
+        <li><span>1</span><div><strong>Confirm the client response.</strong><p>A successful response proves the request cleared client authentication and reached an eligible route.</p></div></li>
+        <li><span>2</span><div><strong>Check usage history.</strong><p>Confirm the selected provider and account match the route policy you expected.</p></div></li>
+        <li><span>3</span><div><strong>Repeat with a managed key.</strong><p>Use the real key your client will receive to prove that its scope and prompt limits behave as intended.</p></div></li>
+      </ol>
+      <div class="docs-note"><strong>If the route is rejected</strong><p>Check the key scope, model spelling or prefix, custom-model state, and provider-account eligibility before changing the client. The <a class="docs-inline-link" href="/docs/test-api/">Test API</a> is useful for separating an operator route problem from a client-key problem.</p></div>
     `,
   },
   {
@@ -340,14 +395,15 @@ cp config.example.json config.json
     seeAlso: ["quick-start", "deployment", "troubleshooting"],
     body: `
       <p class="docs-lead">Configuration controls the HTTP listener, upstream defaults, credential directory, dashboard authentication, proxy trust, and retention settings.</p>
-      <h2>Minimal config</h2>
+      <h2>Start local</h2>
       <pre><code>{
-  "listen": "0.0.0.0:8319",
+  "listen": "127.0.0.1:8319",
   "upstream_base": "https://chatgpt.com/backend-api/codex",
   "proxy_api_key": "your-shared-proxy-key",
   "tokens": [],
   "auth_dir": "./auths"
 }</code></pre>
+      <p>A local listener is the safe first-run default. It keeps the dashboard and client API on the same machine until you deliberately place the gateway behind an authenticated HTTPS proxy.</p>
       <h2>Important fields</h2>
       <div class="docs-table-wrap"><table class="docs-table"><thead><tr><th>Field</th><th>Purpose</th></tr></thead><tbody>
         <tr><td><code>listen</code></td><td>Socket address for the dashboard and API server.</td></tr>
@@ -365,6 +421,7 @@ ADMIN_AUTH_TOTP_SECRET=BASE32_SECRET
 ADMIN_AUTH_SESSION_TTL_SECONDS=43200
 ADMIN_AUTH_SECURE_COOKIES=true</code></pre>
       <h2>Security notes</h2>
+      <div class="docs-note warning"><strong>Public binding is a separate deployment decision</strong><p>Do not change <code>listen</code> to <code>0.0.0.0:8319</code> until dashboard authentication is enabled, client keys are protected, and the proxy in front of the gateway sanitizes forwarded headers.</p></div>
       <div class="docs-note warning"><strong>Use secure cookies behind HTTPS</strong><p>Set <code>ADMIN_AUTH_SECURE_COOKIES=true</code> when the dashboard is served through HTTPS.</p></div>
     `,
   },
@@ -458,22 +515,41 @@ ADMIN_AUTH_SECURE_COOKIES=true</code></pre>
     summary: "Understand gateway endpoints, model prefixes, custom aliases, failover, and routing rules.",
     seeAlso: ["custom-models", "priority-routing", "api-keys"],
     body: `
-      <p class="docs-lead">IO Gateway routes OpenAI-compatible requests to upstream providers by model prefix, custom alias, account health, key scope, and provider availability.</p>
-      <h2>Routing inputs</h2>
-      <ul class="docs-list">
-        <li><strong>Endpoint shape</strong> OpenAI-compatible routes, Claude Messages routes, and runtime OpenAPI docs are served by the app.</li>
-        <li><strong>Model prefix</strong> Prefixes such as <code>cld:</code>, <code>gem:</code>, <code>glm:</code>, or <code>ctm:</code> select provider or alias behavior.</li>
-        <li><strong>API-key scope</strong> Managed keys can restrict which routes a client may call.</li>
-        <li><strong>Account state</strong> Disabled, failed, cooling-down, and exhausted accounts are skipped.</li>
-      </ul>
-      <h2>How selection works</h2>
+      <p class="docs-lead">A request crosses several deliberate boundaries before it reaches an upstream account: client key, requested model or alias, account eligibility, priority policy, and fallback. This page makes that route inspectable.</p>
+      <h2>Choose the client surface</h2>
+      <div class="docs-table-wrap"><table class="docs-table"><thead><tr><th>Client need</th><th>Gateway route</th></tr></thead><tbody>
+        <tr><td>Discover enabled models</td><td><code>GET /v1/models</code></td></tr>
+        <tr><td>OpenAI Responses API</td><td><code>POST /v1/responses</code></td></tr>
+        <tr><td>OpenAI Chat Completions API</td><td><code>POST /v1/chat/completions</code></td></tr>
+        <tr><td>Anthropic Messages API</td><td><code>POST /claude/v1/messages</code> or <code>POST /claude/messages</code></td></tr>
+        <tr><td>Codex-path catalog and responses</td><td><code>GET /codex/models</code> and <code>POST /codex/responses</code></td></tr>
+      </tbody></table></div>
+      <p>Clients stay on one gateway base URL. Change the <code>model</code> field to select an upstream provider; do not invent a separate URL for every provider.</p>
+      <h2>Selection order</h2>
       <ol class="docs-steps compact">
-        <li><span>1</span><div><strong>Resolve the requested model.</strong><p>Raw provider prefixes route directly; <code>ctm:</code> aliases resolve to configured targets.</p></div></li>
-        <li><span>2</span><div><strong>Apply client access rules.</strong><p>The managed API key must allow the provider, account, model, or alias.</p></div></li>
-        <li><span>3</span><div><strong>Prefer priority accounts.</strong><p>Eligible priority accounts for that provider are tried before the normal pool.</p></div></li>
-        <li><span>4</span><div><strong>Fallback when needed.</strong><p>Custom-model fallback can move traffic to another target when a provider route fails.</p></div></li>
+        <li><span>1</span><div><strong>Accept the client key.</strong><p>The request must pass the shared gateway key or the managed API-key rules before any provider is contacted.</p></div></li>
+        <li><span>2</span><div><strong>Resolve the requested model.</strong><p>A natural model name selects its provider, a three-letter prefix forces one, and <code>ctm:</code> resolves a custom alias.</p></div></li>
+        <li><span>3</span><div><strong>Apply the boundary.</strong><p>Managed-key provider, account, alias, and prompt-token rules reject requests outside the client’s allowed route.</p></div></li>
+        <li><span>4</span><div><strong>Build an eligible account pool.</strong><p>Disabled, failed, cooling-down, and quota-exhausted accounts are excluded before selection.</p></div></li>
+        <li><span>5</span><div><strong>Use priority where present.</strong><p>Eligible priority accounts are selected before the normal pool for that provider.</p></div></li>
+        <li><span>6</span><div><strong>Fail over and leave evidence.</strong><p>A custom alias may try another target; usage history records the resulting route so the decision can be checked.</p></div></li>
       </ol>
-      <h2>Tradeoffs</h2>
+      <h2>Force a provider when the name is ambiguous</h2>
+      <div class="docs-table-wrap"><table class="docs-table"><thead><tr><th>Prefix</th><th>Provider</th></tr></thead><tbody>
+        <tr><td><code>cod:</code></td><td>Codex / OpenAI</td></tr>
+        <tr><td><code>cld:</code></td><td>Claude</td></tr>
+        <tr><td><code>gem:</code></td><td>Gemini</td></tr>
+        <tr><td><code>agw:</code></td><td>Antigravity</td></tr>
+        <tr><td><code>qwn:</code></td><td>Qwen</td></tr>
+        <tr><td><code>dsk:</code></td><td>DeepSeek</td></tr>
+        <tr><td><code>min:</code></td><td>MiniMax</td></tr>
+        <tr><td><code>grk:</code></td><td>Grok</td></tr>
+        <tr><td><code>cop:</code></td><td>GitHub Copilot</td></tr>
+        <tr><td><code>glm:</code></td><td>GLM / Z.AI</td></tr>
+        <tr><td><code>ctm:</code></td><td>A custom model alias</td></tr>
+      </tbody></table></div>
+      <p>For example, <code>gem:gemini-2.5-pro</code> forces Gemini even when another provider could recognize a similar model name. Use a <code>ctm:</code> alias when clients should see a stable name while you manage targets and fallbacks behind it.</p>
+      <h2>Choose the right control</h2>
       <p>Use <a class="docs-inline-link" href="/docs/priority-routing/">priority routing</a> for temporary account draining. Use <a class="docs-inline-link" href="/docs/custom-models/">custom models</a> for stable client-facing aliases and cross-provider failover. Use <a class="docs-inline-link" href="/docs/api-keys/">API keys</a> for tenant or client access boundaries.</p>
     `,
   },
@@ -561,6 +637,39 @@ curl http://127.0.0.1:8319/api-docs/openapi.json</code></pre>
   },
 ];
 
+const journeys = [
+  {
+    number: "01",
+    title: "Bring online",
+    description: "Install the gateway, keep its first listener local, and make readiness a fact before any client depends on it.",
+    pageSlugs: ["quick-start", "configuration"],
+  },
+  {
+    number: "02",
+    title: "Connect capacity",
+    description: "Add provider accounts, understand their state, and use the dashboard as the place to see what can serve traffic.",
+    pageSlugs: ["provider-accounts", "dashboard"],
+  },
+  {
+    number: "03",
+    title: "Set route policy",
+    description: "Draw client boundaries, choose model behavior, and decide when an account or fallback should be preferred.",
+    pageSlugs: ["api-keys", "routing-and-models", "priority-routing", "custom-models"],
+  },
+  {
+    number: "04",
+    title: "Prove and observe",
+    description: "Send a real client request, test a route deliberately, and read the account and quota evidence it leaves behind.",
+    pageSlugs: ["first-client-request", "test-api", "usage-and-quota", "notifications"],
+  },
+  {
+    number: "05",
+    title: "Repair and release",
+    description: "Work from the symptom outward, then use the release process only after the service is known to be healthy.",
+    pageSlugs: ["troubleshooting", "deployment"],
+  },
+];
+
 const topicCategories = [
   { title: "Routing", slug: "routing", description: "Priority routing, custom models, model prefixes, fallback, and account selection." },
   { title: "Accounts", slug: "accounts", description: "Upstream provider credentials, account health, quota use, and priority membership." },
@@ -586,10 +695,12 @@ function escapeHtml(value) {
 
 function docsFigure(fileName, alt, caption) {
   const src = `/assets/${fileName}?v=${assetVersion}`;
+  const [width, height] = docsFigureDimensions[fileName] || [];
+  const dimensions = width && height ? ` width="${width}" height="${height}"` : "";
   return `
       <figure class="docs-figure">
         <div class="docs-figure-frame">
-          <img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" loading="lazy">
+          <img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" loading="lazy"${dimensions}>
         </div>
         <figcaption>${escapeHtml(caption)}</figcaption>
       </figure>`;
@@ -621,42 +732,51 @@ function renderHeader(active = "docs") {
           <span class="brand-mark">IO</span>
           <span>IO Gateway</span>
         </a>
-        <nav aria-label="Site navigation">
-          <a href="/">Home</a>
-          <a href="/#dashboard">Dashboard</a>
-          <a href="/#custom-models">Custom</a>
-          <a href="/docs/"${active === "docs" ? ' aria-current="page"' : ""}>Docs</a>
-          <a href="https://github.com/giofahreza/io-gateway">GitHub</a>
-          <a class="nav-action" href="https://github.com/giofahreza/io-gateway/releases">Releases</a>
-        </nav>
+        <div class="site-header-actions">
+          <nav aria-label="Site navigation">
+            <a href="/">Home</a>
+            <a href="/docs/"${active === "docs" ? ' aria-current="page"' : ""}>Docs</a>
+            <a href="https://github.com/giofahreza/io-gateway">GitHub</a>
+            <a class="nav-action" href="https://github.com/giofahreza/io-gateway/releases">Releases</a>
+          </nav>
+          <button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false" aria-label="Switch theme">
+            <span class="theme-toggle-mark" aria-hidden="true">◐</span>
+            <span data-theme-label>Theme</span>
+          </button>
+        </div>
       </div>
     </header>`;
 }
 
 function renderSidebar(activeSlug = "") {
-  const groupsHtml = groups
-    .map((group) => {
-      const groupPages = pages.filter((page) => page.group === group.title);
+  const journeysHtml = journeys
+    .map((journey) => {
+      const journeyPages = journey.pageSlugs
+        .map((slug) => pages.find((page) => page.slug === slug))
+        .filter(Boolean);
       return `
-            <div class="docs-nav-group">
-              <p class="docs-toc-label">${escapeHtml(group.title)}</p>
-              ${groupPages.map((page) => renderSidebarLink(page, activeSlug)).join("\n")}
+            <div class="docs-nav-group docs-journey-nav">
+              <p class="docs-toc-label docs-journey-label"><span>${escapeHtml(journey.number)}</span>${escapeHtml(journey.title)}</p>
+              ${journeyPages.map((page) => renderSidebarLink(page, activeSlug)).join("\n")}
             </div>`;
     })
     .join("\n");
 
   return `
-        <aside class="docs-toc" aria-label="Docs pages">
-          <label class="docs-search" for="docs-search">
-            <span>Search docs</span>
-            <input id="docs-search" type="search" autocomplete="off" placeholder="Search docs">
-          </label>
-          <div id="docs-search-results" class="docs-search-results" aria-live="polite"></div>
-          <a class="docs-home-link${activeSlug === "" ? " is-active" : ""}" href="/docs/"${activeSlug === "" ? ' aria-current="page"' : ""}>Docs home</a>
-          ${groupsHtml}
-          <div class="docs-nav-group docs-nav-group-compact">
-            <p class="docs-toc-label">Browse topics</p>
-            ${topicCategories.map((category) => `<a href="${categoryUrl(category)}" data-title="${escapeHtml(category.title)}" data-category="Topic" data-summary="${escapeHtml(category.description)}" data-keywords="${escapeHtml(category.title.toLowerCase())}"><span>${escapeHtml(category.title)}</span><small>${escapeHtml(category.description)}</small></a>`).join("\n")}
+        <aside class="docs-toc" aria-label="Documentation navigation">
+          <button class="docs-nav-toggle" type="button" aria-expanded="false" aria-controls="docs-nav-panel">
+            <span>Browse routebook</span>
+            <span aria-hidden="true">+</span>
+          </button>
+          <div id="docs-nav-panel" class="docs-toc-inner">
+            <label class="docs-search" for="docs-search">
+              <span class="docs-search-label">Find a task <kbd aria-hidden="true">/</kbd></span>
+              <input id="docs-search" type="search" autocomplete="off" placeholder="Search the routebook" aria-describedby="docs-search-help">
+            </label>
+            <p id="docs-search-help" class="docs-search-hint">Search setup, scope, routing, or recovery.</p>
+            <div id="docs-search-results" class="docs-search-results" aria-live="polite"></div>
+            <a class="docs-home-link${activeSlug === "" ? " is-active" : ""}" href="/docs/"${activeSlug === "" ? ' aria-current="page"' : ""}>Routebook index</a>
+            ${journeysHtml}
           </div>
         </aside>`;
 }
@@ -672,10 +792,8 @@ function renderSidebarLink(page, activeSlug) {
 
 function renderMeta(page) {
   const rows = [
-    ["Type", page.type],
-    ["Applies to", page.appliesTo],
+    ["Use when", page.appliesTo],
     page.storage ? ["Storage", `<code>${escapeHtml(page.storage)}</code>`] : null,
-    ["Docs version", page.introduced],
     ["Updated", page.updated],
   ].filter(Boolean);
 
@@ -704,8 +822,8 @@ function renderSeeAlso(page) {
     .join("\n");
 
   return `
-          <section class="docs-related" aria-labelledby="see-also">
-            <h2 id="see-also">See also</h2>
+          <section class="docs-related" aria-labelledby="continue-the-route">
+            <h2 id="continue-the-route">Continue the route</h2>
             <ul class="docs-link-list">
               ${links}
             </ul>
@@ -726,11 +844,13 @@ function renderShell({ title, description, canonicalPath, activeSlug = "", artic
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="dark">
+    <meta name="color-scheme" content="light dark">
+    <meta name="theme-color" content="#ebe8df">
     <meta name="description" content="${escapeHtml(description)}">
     <title>${escapeHtml(title)}</title>
     <link rel="icon" href="data:,">
     <link rel="canonical" href="https://gateway.giofahreza.com${canonicalPath}">
+    <script src="/theme.js?v=${assetVersion}"></script>
     <link rel="stylesheet" href="/docs.css?v=${assetVersion}">
   </head>
   <body>
@@ -753,66 +873,70 @@ ${renderRightOutline()}
 }
 
 function renderMainPage() {
-  const commonTasks = ["quick-start", "provider-accounts", "api-keys", "priority-routing", "custom-models", "deployment"]
-    .map((slug) => pages.find((page) => page.slug === slug));
-
   const article = `
         <article id="docs-content" class="docs-content docs-article docs-index-page" data-page-slug="">
           <div class="docs-heading">
-            <p class="eyebrow">Product documentation</p>
-            <h1>Documentation</h1>
+            <p class="eyebrow">IO Gateway documentation</p>
+            <h1>Routebook</h1>
             <dl class="docs-meta">
-              <div><dt>Product</dt><dd>IO Gateway</dd></div>
-              <div><dt>Docs version</dt><dd>${docsVersion}</dd></div>
+              <div><dt>Scope</dt><dd>Client traffic and provider operations</dd></div>
               <div><dt>Updated</dt><dd>${updated}</dd></div>
             </dl>
           </div>
-          <p class="docs-lead">IO Gateway is a self-hosted AI account gateway for managing upstream accounts, routing traffic, enforcing API-key limits, prioritizing account usage, and operating releases. Use the landing page for product overview and screenshots; use these docs for setup and operation.</p>
-          <section aria-labelledby="what-is-io-gateway">
-            <h2 id="what-is-io-gateway">What is IO Gateway</h2>
-            <p>IO Gateway sits between clients and upstream AI providers. It centralizes provider credentials, model routing, custom aliases, prompt-token limits, priority account usage, Test API, notifications, usage history, and deployment operations.</p>
+          <p class="docs-lead">A working guide for the point where client requests meet provider accounts. Start with the request path, then take the journey that matches the work in front of you.</p>
+          <section class="docs-routebook" aria-labelledby="request-path">
+            <div class="docs-routebook-intro">
+              <p class="docs-routebook-label">The request path</p>
+              <h2 id="request-path">Know where a request can change.</h2>
+              <p>IO Gateway is not a provider catalog. It is the decision point between a client’s credentials, the route it asks for, and the accounts allowed to carry that request.</p>
+            </div>
+            <ol class="docs-request-path">
+              <li><span>01</span><a href="/docs/first-client-request/"><strong>Client</strong><small>base URL + bearer key</small></a></li>
+              <li><span>02</span><a href="/docs/api-keys/"><strong>Key scope</strong><small>what this client may use</small></a></li>
+              <li><span>03</span><a href="/docs/routing-and-models/"><strong>Model / <code>ctm:</code></strong><small>provider choice or alias policy</small></a></li>
+              <li><span>04</span><a href="/docs/provider-accounts/"><strong>Eligible account</strong><small>health, quota, priority</small></a></li>
+              <li><span>05</span><a href="/docs/usage-and-quota/"><strong>Receipt</strong><small>usage and route evidence</small></a></li>
+            </ol>
           </section>
-          <section class="docs-overview" aria-labelledby="common-tasks">
-            <h2 id="common-tasks">Common tasks</h2>
-            <ul class="docs-page-list compact">
-              ${commonTasks.map((page) => `<li><a href="${pageUrl(page)}"><span>${escapeHtml(page.title)}</span><small>${escapeHtml(page.summary)}</small></a></li>`).join("\n")}
-            </ul>
+          <section class="docs-journeys" aria-labelledby="choose-your-work">
+            <p class="docs-routebook-label">Operator journeys</p>
+            <h2 id="choose-your-work">Choose the work in front of you.</h2>
+            <p>Each route begins with an action and ends with something you can verify. Open the page closest to the decision you need to make, not a generic feature bucket.</p>
+            <ol class="docs-journey-list">
+              ${journeys.map((journey) => renderJourneyBlock(journey)).join("\n")}
+            </ol>
           </section>
-          <section aria-labelledby="documentation-map">
-            <h2 id="documentation-map">Documentation map</h2>
-            ${groups.map((group) => renderGroupBlock(group)).join("\n")}
-          </section>
-          <section aria-labelledby="product-areas">
-            <h2 id="product-areas">Product areas</h2>
-            <ul class="docs-page-list compact">
-              ${topicCategories.map((category) => `<li><a href="${categoryUrl(category)}"><span>${escapeHtml(category.title)}</span><small>${escapeHtml(category.description)}</small></a></li>`).join("\n")}
-            </ul>
-          </section>
-          <section aria-labelledby="release-status">
-            <h2 id="release-status">Release and status</h2>
-            <p>For downloadable releases and server deployment status, use <a class="docs-inline-link" href="https://github.com/giofahreza/io-gateway/releases">GitHub Releases</a> and the deployment workflow. Static product pages deploy from <code>site/</code> changes; app deployment runs from release tags.</p>
+          <section class="docs-routebook-footer" aria-labelledby="runtime-reference">
+            <h2 id="runtime-reference">Need the live API surface?</h2>
+            <p>The running gateway publishes its own runtime API reference at <code>/docs/</code> and <code>/api-docs/openapi.json</code> on the gateway base URL. Use the routebook for operator intent; use the runtime reference for the exact request shape your installed version serves.</p>
           </section>
         </article>`;
 
   return renderShell({
-    title: "Documentation - IO Gateway Docs",
-    description: "IO Gateway product documentation for setup, provider accounts, routing, API-key limits, priority account usage, deployment, and troubleshooting.",
+    title: "Routebook - IO Gateway Docs",
+    description: "The IO Gateway routebook for bringing a gateway online, connecting accounts, setting route policy, proving client traffic, and recovering service.",
     canonicalPath: "/docs/",
     activeSlug: "",
     article,
   });
 }
 
-function renderGroupBlock(group) {
-  const groupPages = pages.filter((page) => page.group === group.title);
+function renderJourneyBlock(journey) {
+  const journeyPages = journey.pageSlugs
+    .map((slug) => pages.find((page) => page.slug === slug))
+    .filter(Boolean);
+
   return `
-            <section class="docs-category" aria-labelledby="category-${group.slug}">
-              <h3 id="category-${group.slug}"><a href="/docs/category/${group.slug}/">${escapeHtml(group.title)}</a></h3>
-              <p>${escapeHtml(group.description)}</p>
-              <ul class="docs-link-list">
-                ${groupPages.map((page) => `<li><a href="${pageUrl(page)}">${escapeHtml(page.title)}</a> - ${escapeHtml(page.summary)}</li>`).join("\n")}
-              </ul>
-            </section>`;
+              <li>
+                <span class="docs-journey-number">${escapeHtml(journey.number)}</span>
+                <div class="docs-journey-copy">
+                  <h3>${escapeHtml(journey.title)}</h3>
+                  <p>${escapeHtml(journey.description)}</p>
+                </div>
+                <ul class="docs-journey-pages">
+                  ${journeyPages.map((page) => `<li><a href="${pageUrl(page)}"><span>${escapeHtml(page.title)}</span><small>${escapeHtml(page.summary)}</small></a></li>`).join("\n")}
+                </ul>
+              </li>`;
 }
 
 function renderCategoryPage(category) {
@@ -824,7 +948,6 @@ function renderCategoryPage(category) {
             <h1>${escapeHtml(category.title)}</h1>
             <dl class="docs-meta">
               <div><dt>Pages</dt><dd>${categoryPages.length}</dd></div>
-              <div><dt>Docs version</dt><dd>${docsVersion}</dd></div>
               <div><dt>Updated</dt><dd>${updated}</dd></div>
             </dl>
           </div>
@@ -881,18 +1004,18 @@ function buildSearchIndex() {
   }));
 
   return {
-    generatedAt: "2026-07-28",
+    generatedAt: "2026-09-04",
     docsVersion,
     pages: [
       {
-        title: "Documentation",
+        title: "Routebook",
         category: "Product documentation",
         type: "Main page",
-        summary: "IO Gateway documentation home for setup, routing, limits, deployment, operations, and troubleshooting.",
+        summary: "IO Gateway routebook for bringing a gateway online, connecting accounts, setting route policy, proving traffic, and recovering service.",
         href: "/docs/",
-        keywords: "docs documentation main page io gateway product overview setup routing limits deployment",
-        headings: ["What is IO Gateway", "Common tasks", "Documentation map", "Product areas", "Release and status"],
-        excerpt: "IO Gateway is a self-hosted AI account gateway for managing upstream accounts, routing traffic, enforcing API-key limits, prioritizing account usage, and operating releases.",
+        keywords: "docs documentation routebook setup account routing policy client request usage deployment recovery",
+        headings: ["Know where a request can change", "Choose the work in front of you", "Need the live API surface"],
+        excerpt: "A working guide for the point where client requests meet provider accounts.",
       },
       ...articleRecords,
       ...categoryRecords,

@@ -1,22 +1,20 @@
 {
-  "generatedAt": "2026-07-28",
+  "generatedAt": "2026-09-04",
   "docsVersion": "v0.1.11+",
   "pages": [
     {
-      "title": "Documentation",
+      "title": "Routebook",
       "category": "Product documentation",
       "type": "Main page",
-      "summary": "IO Gateway documentation home for setup, routing, limits, deployment, operations, and troubleshooting.",
+      "summary": "IO Gateway routebook for bringing a gateway online, connecting accounts, setting route policy, proving traffic, and recovering service.",
       "href": "/docs/",
-      "keywords": "docs documentation main page io gateway product overview setup routing limits deployment",
+      "keywords": "docs documentation routebook setup account routing policy client request usage deployment recovery",
       "headings": [
-        "What is IO Gateway",
-        "Common tasks",
-        "Documentation map",
-        "Product areas",
-        "Release and status"
+        "Know where a request can change",
+        "Choose the work in front of you",
+        "Need the live API surface"
       ],
-      "excerpt": "IO Gateway is a self-hosted AI account gateway for managing upstream accounts, routing traffic, enforcing API-key limits, prioritizing account usage, and operating releases."
+      "excerpt": "A working guide for the point where client requests meet provider accounts."
     },
     {
       "title": "Quick start",
@@ -37,6 +35,21 @@
         "Next steps"
       ],
       "excerpt": "Install a published IO Gateway release or build it from source, then open the operator dashboard, add upstream credentials, and verify that a model request reaches a provider account. The dashboard is the first place to verify that the gateway sees accounts, quota, and routes. Choose an install path Published release Recommended for a desktop or server. It d"
+    },
+    {
+      "title": "First client request",
+      "category": "Tutorials",
+      "type": "Tutorial",
+      "summary": "Point a client at IO Gateway, inspect its model catalog, and prove a request reaches an upstream account.",
+      "href": "/docs/first-client-request/",
+      "keywords": "client request curl responses api chat completions base url bearer key models first request openai claude",
+      "headings": [
+        "What you need",
+        "Read the catalog first",
+        "Send one response",
+        "Read the receipt"
+      ],
+      "excerpt": "Use this path after the gateway is healthy and at least one provider account is enabled. It proves the client-facing boundary: base URL, bearer key, model selection, and the receipt left in usage history. What you need A ready gateway Confirm /ready returns successfully before configuring a client. A client key Use the shared proxy_api_key or a managed key w"
     },
     {
       "title": "Dashboard",
@@ -139,12 +152,12 @@
       "href": "/docs/configuration/",
       "keywords": "config json env admin auth proxy api key totp secure cookies trusted proxy",
       "headings": [
-        "Minimal config",
+        "Start local",
         "Important fields",
         "Admin auth environment overrides",
         "Security notes"
       ],
-      "excerpt": "Configuration controls the HTTP listener, upstream defaults, credential directory, dashboard authentication, proxy trust, and retention settings. Minimal config { \"listen\": \"0.0.0.0:8319\", \"upstream_base\": \"https://chatgpt.com/backend-api/codex\", \"proxy_api_key\": \"your-shared-proxy-key\", \"tokens\": [], \"auth_dir\": \"./auths\" } Important fields Field Purpose li"
+      "excerpt": "Configuration controls the HTTP listener, upstream defaults, credential directory, dashboard authentication, proxy trust, and retention settings. Start local { \"listen\": \"127.0.0.1:8319\", \"upstream_base\": \"https://chatgpt.com/backend-api/codex\", \"proxy_api_key\": \"your-shared-proxy-key\", \"tokens\": [], \"auth_dir\": \"./auths\" } A local listener is the safe first"
     },
     {
       "title": "API keys",
@@ -187,11 +200,12 @@
       "href": "/docs/routing-and-models/",
       "keywords": "routing models v1 responses chat completions claude messages prefix ctm alias failover",
       "headings": [
-        "Routing inputs",
-        "How selection works",
-        "Tradeoffs"
+        "Choose the client surface",
+        "Selection order",
+        "Force a provider when the name is ambiguous",
+        "Choose the right control"
       ],
-      "excerpt": "IO Gateway routes OpenAI-compatible requests to upstream providers by model prefix, custom alias, account health, key scope, and provider availability. Routing inputs Endpoint shape OpenAI-compatible routes, Claude Messages routes, and runtime OpenAPI docs are served by the app. Model prefix Prefixes such as cld: , gem: , glm: , or ctm: select provider or al"
+      "excerpt": "A request crosses several deliberate boundaries before it reaches an upstream account: client key, requested model or alias, account eligibility, priority policy, and fallback. This page makes that route inspectable. Choose the client surface Client need Gateway route Discover enabled models GET /v1/models OpenAI Responses API POST /v1/responses OpenAI Chat "
     },
     {
       "title": "Deployment",

@@ -3,12 +3,14 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="dark">
+    <meta name="color-scheme" content="light dark">
+    <meta name="theme-color" content="#ebe8df">
     <meta name="description" content="Create ctm: aliases with provider targets, specific accounts, weights, and fallback chains.">
     <title>Custom models - IO Gateway Docs</title>
     <link rel="icon" href="data:,">
     <link rel="canonical" href="https://gateway.giofahreza.com/docs/custom-models/">
-    <link rel="stylesheet" href="/docs.css?v=20260728i">
+    <script src="/theme.js?v=20260908a"></script>
+    <link rel="stylesheet" href="/docs.css?v=20260908a">
   </head>
   <body>
 
@@ -19,47 +21,76 @@
           <span class="brand-mark">IO</span>
           <span>IO Gateway</span>
         </a>
-        <nav aria-label="Site navigation">
-          <a href="/">Home</a>
-          <a href="/#dashboard">Dashboard</a>
-          <a href="/#custom-models">Custom</a>
-          <a href="/docs/" aria-current="page">Docs</a>
-          <a href="https://github.com/giofahreza/io-gateway">GitHub</a>
-          <a class="nav-action" href="https://github.com/giofahreza/io-gateway/releases">Releases</a>
-        </nav>
+        <div class="site-header-actions">
+          <nav aria-label="Site navigation">
+            <a href="/">Home</a>
+            <a href="/docs/" aria-current="page">Docs</a>
+            <a href="https://github.com/giofahreza/io-gateway">GitHub</a>
+            <a class="nav-action" href="https://github.com/giofahreza/io-gateway/releases">Releases</a>
+          </nav>
+          <button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false" aria-label="Switch theme">
+            <span class="theme-toggle-mark" aria-hidden="true">◐</span>
+            <span data-theme-label>Theme</span>
+          </button>
+        </div>
       </div>
     </header>
     <main class="docs-page-shell">
       <div class="docs-layout">
 
-        <aside class="docs-toc" aria-label="Docs pages">
-          <label class="docs-search" for="docs-search">
-            <span>Search docs</span>
-            <input id="docs-search" type="search" autocomplete="off" placeholder="Search docs">
-          </label>
-          <div id="docs-search-results" class="docs-search-results" aria-live="polite"></div>
-          <a class="docs-home-link" href="/docs/">Docs home</a>
+        <aside class="docs-toc" aria-label="Documentation navigation">
+          <button class="docs-nav-toggle" type="button" aria-expanded="false" aria-controls="docs-nav-panel">
+            <span>Browse routebook</span>
+            <span aria-hidden="true">+</span>
+          </button>
+          <div id="docs-nav-panel" class="docs-toc-inner">
+            <label class="docs-search" for="docs-search">
+              <span class="docs-search-label">Find a task <kbd aria-hidden="true">/</kbd></span>
+              <input id="docs-search" type="search" autocomplete="off" placeholder="Search the routebook" aria-describedby="docs-search-help">
+            </label>
+            <p id="docs-search-help" class="docs-search-hint">Search setup, scope, routing, or recovery.</p>
+            <div id="docs-search-results" class="docs-search-results" aria-live="polite"></div>
+            <a class="docs-home-link" href="/docs/">Routebook index</a>
 
-            <div class="docs-nav-group">
-              <p class="docs-toc-label">Tutorials</p>
+            <div class="docs-nav-group docs-journey-nav">
+              <p class="docs-toc-label docs-journey-label"><span>01</span>Bring online</p>
 
               <a href="/docs/quick-start/" data-title="Quick start" data-category="Tutorials" data-summary="Build, configure, run, and smoke-test IO Gateway for the first time." data-keywords="setup install local run build config dashboard test api health ready first run">
                 <span>Quick start</span>
                 <small>Build, configure, run, and smoke-test IO Gateway for the first time.</small>
               </a>
+
+              <a href="/docs/configuration/" data-title="Configuration" data-category="Reference" data-summary="Core config.json fields, environment overrides, dashboard auth, and proxy safety settings." data-keywords="config json env admin auth proxy api key totp secure cookies trusted proxy">
+                <span>Configuration</span>
+                <small>Core config.json fields, environment overrides, dashboard auth, and proxy safety settings.</small>
+              </a>
             </div>
 
-            <div class="docs-nav-group">
-              <p class="docs-toc-label">How-to guides</p>
+            <div class="docs-nav-group docs-journey-nav">
+              <p class="docs-toc-label docs-journey-label"><span>02</span>Connect capacity</p>
+
+              <a href="/docs/provider-accounts/" data-title="Provider accounts" data-category="How-to guides" data-summary="Add, enable, refresh, re-auth, and test upstream provider accounts." data-keywords="provider accounts codex gemini claude qwen glm grok copilot oauth api key auth_dir disable refresh reauth">
+                <span>Provider accounts</span>
+                <small>Add, enable, refresh, re-auth, and test upstream provider accounts.</small>
+              </a>
 
               <a href="/docs/dashboard/" data-title="Dashboard" data-category="How-to guides" data-summary="Use the operator dashboard for accounts, testing, custom models, keys, and history." data-keywords="dashboard login providers settings overview custom models api keys usage history admin">
                 <span>Dashboard</span>
                 <small>Use the operator dashboard for accounts, testing, custom models, keys, and history.</small>
               </a>
+            </div>
 
-              <a href="/docs/provider-accounts/" data-title="Provider accounts" data-category="How-to guides" data-summary="Add, enable, refresh, re-auth, and test upstream provider accounts." data-keywords="provider accounts codex gemini claude qwen glm grok copilot oauth api key auth_dir disable refresh reauth">
-                <span>Provider accounts</span>
-                <small>Add, enable, refresh, re-auth, and test upstream provider accounts.</small>
+            <div class="docs-nav-group docs-journey-nav">
+              <p class="docs-toc-label docs-journey-label"><span>03</span>Set route policy</p>
+
+              <a href="/docs/api-keys/" data-title="API keys" data-category="Reference" data-summary="Create managed keys with provider/account scopes and prompt-token limits at whole, provider, and account levels." data-keywords="api keys managed scopes provider account prompt token limits whole key custom aliases access rules">
+                <span>API keys</span>
+                <small>Create managed keys with provider/account scopes and prompt-token limits at whole, provider, and account levels.</small>
+              </a>
+
+              <a href="/docs/routing-and-models/" data-title="Routing and models" data-category="Explanation" data-summary="Understand gateway endpoints, model prefixes, custom aliases, failover, and routing rules." data-keywords="routing models v1 responses chat completions claude messages prefix ctm alias failover">
+                <span>Routing and models</span>
+                <small>Understand gateway endpoints, model prefixes, custom aliases, failover, and routing rules.</small>
               </a>
 
               <a href="/docs/priority-routing/" data-title="Priority routing" data-category="How-to guides" data-summary="Prioritize one or more provider accounts so they are used first until unavailable or fully drained." data-keywords="priority account use first drain quota disabled auto remove routing provider account-routing">
@@ -71,10 +102,24 @@
                 <span>Custom models</span>
                 <small>Create ctm: aliases with provider targets, specific accounts, weights, and fallback chains.</small>
               </a>
+            </div>
+
+            <div class="docs-nav-group docs-journey-nav">
+              <p class="docs-toc-label docs-journey-label"><span>04</span>Prove and observe</p>
+
+              <a href="/docs/first-client-request/" data-title="First client request" data-category="Tutorials" data-summary="Point a client at IO Gateway, inspect its model catalog, and prove a request reaches an upstream account." data-keywords="client request curl responses api chat completions base url bearer key models first request openai claude">
+                <span>First client request</span>
+                <small>Point a client at IO Gateway, inspect its model catalog, and prove a request reaches an upstream account.</small>
+              </a>
 
               <a href="/docs/test-api/" data-title="Test API" data-category="How-to guides" data-summary="Validate models and routes from the dashboard without creating a separate client API key." data-keywords="test api dashboard settings model validate route prompt admin session smoke test">
                 <span>Test API</span>
                 <small>Validate models and routes from the dashboard without creating a separate client API key.</small>
+              </a>
+
+              <a href="/docs/usage-and-quota/" data-title="Usage and quota" data-category="Reference" data-summary="Read usage history, context-token charts, account health, provider quota, and useful admin endpoints." data-keywords="usage quota history context tokens account health endpoints dashboard json account-routing">
+                <span>Usage and quota</span>
+                <small>Read usage history, context-token charts, account health, provider quota, and useful admin endpoints.</small>
               </a>
 
               <a href="/docs/notifications/" data-title="Notifications" data-category="How-to guides" data-summary="Configure Telegram or Google Chat alerts for auth errors, upstream failures, and quota events." data-keywords="notifications telegram google chat webhook alerts auth upstream quota test failures">
@@ -83,60 +128,19 @@
               </a>
             </div>
 
-            <div class="docs-nav-group">
-              <p class="docs-toc-label">Reference</p>
+            <div class="docs-nav-group docs-journey-nav">
+              <p class="docs-toc-label docs-journey-label"><span>05</span>Repair and release</p>
 
-              <a href="/docs/configuration/" data-title="Configuration" data-category="Reference" data-summary="Core config.json fields, environment overrides, dashboard auth, and proxy safety settings." data-keywords="config json env admin auth proxy api key totp secure cookies trusted proxy">
-                <span>Configuration</span>
-                <small>Core config.json fields, environment overrides, dashboard auth, and proxy safety settings.</small>
+              <a href="/docs/troubleshooting/" data-title="Troubleshooting" data-category="Troubleshooting" data-summary="Diagnose readiness failures, 401s, provider auth errors, custom-model misses, and notification failures." data-keywords="troubleshooting ready 401 custom model provider auth logs quota access rules notifications">
+                <span>Troubleshooting</span>
+                <small>Diagnose readiness failures, 401s, provider auth errors, custom-model misses, and notification failures.</small>
               </a>
-
-              <a href="/docs/api-keys/" data-title="API keys" data-category="Reference" data-summary="Create managed keys with provider/account scopes and prompt-token limits at whole, provider, and account levels." data-keywords="api keys managed scopes provider account prompt token limits whole key custom aliases access rules">
-                <span>API keys</span>
-                <small>Create managed keys with provider/account scopes and prompt-token limits at whole, provider, and account levels.</small>
-              </a>
-
-              <a href="/docs/usage-and-quota/" data-title="Usage and quota" data-category="Reference" data-summary="Read usage history, context-token charts, account health, provider quota, and useful admin endpoints." data-keywords="usage quota history context tokens account health endpoints dashboard json account-routing">
-                <span>Usage and quota</span>
-                <small>Read usage history, context-token charts, account health, provider quota, and useful admin endpoints.</small>
-              </a>
-            </div>
-
-            <div class="docs-nav-group">
-              <p class="docs-toc-label">Explanation</p>
-
-              <a href="/docs/routing-and-models/" data-title="Routing and models" data-category="Explanation" data-summary="Understand gateway endpoints, model prefixes, custom aliases, failover, and routing rules." data-keywords="routing models v1 responses chat completions claude messages prefix ctm alias failover">
-                <span>Routing and models</span>
-                <small>Understand gateway endpoints, model prefixes, custom aliases, failover, and routing rules.</small>
-              </a>
-            </div>
-
-            <div class="docs-nav-group">
-              <p class="docs-toc-label">Operations</p>
 
               <a href="/docs/deployment/" data-title="Deployment" data-category="Operations" data-summary="Release with tag-triggered app deployment and push-triggered GitHub Pages deployment." data-keywords="deployment release tags github actions pages health ready artifact systemd ci cd">
                 <span>Deployment</span>
                 <small>Release with tag-triggered app deployment and push-triggered GitHub Pages deployment.</small>
               </a>
             </div>
-
-            <div class="docs-nav-group">
-              <p class="docs-toc-label">Troubleshooting</p>
-
-              <a href="/docs/troubleshooting/" data-title="Troubleshooting" data-category="Troubleshooting" data-summary="Diagnose readiness failures, 401s, provider auth errors, custom-model misses, and notification failures." data-keywords="troubleshooting ready 401 custom model provider auth logs quota access rules notifications">
-                <span>Troubleshooting</span>
-                <small>Diagnose readiness failures, 401s, provider auth errors, custom-model misses, and notification failures.</small>
-              </a>
-            </div>
-          <div class="docs-nav-group docs-nav-group-compact">
-            <p class="docs-toc-label">Browse topics</p>
-            <a href="/docs/category/routing/" data-title="Routing" data-category="Topic" data-summary="Priority routing, custom models, model prefixes, fallback, and account selection." data-keywords="routing"><span>Routing</span><small>Priority routing, custom models, model prefixes, fallback, and account selection.</small></a>
-<a href="/docs/category/accounts/" data-title="Accounts" data-category="Topic" data-summary="Upstream provider credentials, account health, quota use, and priority membership." data-keywords="accounts"><span>Accounts</span><small>Upstream provider credentials, account health, quota use, and priority membership.</small></a>
-<a href="/docs/category/limits/" data-title="Limits" data-category="Topic" data-summary="Prompt-token limits, usage history, quota views, and managed API-key controls." data-keywords="limits"><span>Limits</span><small>Prompt-token limits, usage history, quota views, and managed API-key controls.</small></a>
-<a href="/docs/category/deployment/" data-title="Deployment" data-category="Topic" data-summary="Release tags, production service updates, GitHub Pages deployment, and rollback." data-keywords="deployment"><span>Deployment</span><small>Release tags, production service updates, GitHub Pages deployment, and rollback.</small></a>
-<a href="/docs/category/notifications/" data-title="Notifications" data-category="Topic" data-summary="Telegram and Google Chat alerts for provider, quota, and operational events." data-keywords="notifications"><span>Notifications</span><small>Telegram and Google Chat alerts for provider, quota, and operational events.</small></a>
-<a href="/docs/category/configuration/" data-title="Configuration" data-category="Topic" data-summary="Config files, environment overrides, dashboard auth, and proxy safety." data-keywords="configuration"><span>Configuration</span><small>Config files, environment overrides, dashboard auth, and proxy safety.</small></a>
-<a href="/docs/category/api-access/" data-title="API access" data-category="Topic" data-summary="Managed API keys, Test API, runtime API docs, and client-facing model access." data-keywords="api access"><span>API access</span><small>Managed API keys, Test API, runtime API docs, and client-facing model access.</small></a>
           </div>
         </aside>
 
@@ -144,14 +148,14 @@
           <div class="docs-heading">
             <p class="eyebrow">How-to guides</p>
             <h1>Custom models</h1>
-            <dl class="docs-meta"><div><dt>Type</dt><dd>How-to guide</dd></div><div><dt>Applies to</dt><dd>Model alias routing</dd></div><div><dt>Docs version</dt><dd>v0.1.11+</dd></div><div><dt>Updated</dt><dd>July 28, 2026</dd></div></dl>
+            <dl class="docs-meta"><div><dt>Use when</dt><dd>Model alias routing</dd></div><div><dt>Updated</dt><dd>September 4, 2026</dd></div></dl>
           </div>
 
       <p class="docs-lead">Custom models create stable <code>ctm:</code> aliases that can route to one or more provider models, specific accounts, weighted target sets, or fallback chains.</p>
 
       <figure class="docs-figure">
         <div class="docs-figure-frame">
-          <img src="/assets/docs-custom-models.png?v=20260728i" alt="Custom model cards showing ctm aliases with weighted provider targets and fallback steps." loading="lazy">
+          <img src="/assets/docs-custom-models.png?v=20260908a" alt="Custom model cards showing ctm aliases with weighted provider targets and fallback steps." loading="lazy" width="1420" height="343">
         </div>
         <figcaption>A custom model is shown as a route card: stable alias, route steps, target count, and provider/account targets.</figcaption>
       </figure>
@@ -184,8 +188,8 @@
 }</code></pre>
 
 
-          <section class="docs-related" aria-labelledby="see-also">
-            <h2 id="see-also">See also</h2>
+          <section class="docs-related" aria-labelledby="continue-the-route">
+            <h2 id="continue-the-route">Continue the route</h2>
             <ul class="docs-link-list">
               <li><a href="/docs/routing-and-models/">Routing and models</a> - Understand gateway endpoints, model prefixes, custom aliases, failover, and routing rules.</li>
 <li><a href="/docs/api-keys/">API keys</a> - Create managed keys with provider/account scopes and prompt-token limits at whole, provider, and account levels.</li>
@@ -204,6 +208,6 @@
       <span>IO Gateway Docs</span>
       <span>giofahreza.com</span>
     </footer>
-    <script src="/docs.js?v=20260728i" defer></script>
+    <script src="/docs.js?v=20260908a" defer></script>
   </body>
 </html>

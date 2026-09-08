@@ -1,6 +1,7 @@
 const legacyHashRoutes = {
   "feature-index": "/docs/",
   "quick-start": "/docs/quick-start/",
+  "first-client-request": "/docs/first-client-request/",
   configuration: "/docs/configuration/",
   dashboard: "/docs/dashboard/",
   "provider-accounts": "/docs/provider-accounts/",
@@ -18,38 +19,8 @@ const article = document.querySelector(".docs-article");
 const outline = document.getElementById("on-this-page");
 const searchInput = document.getElementById("docs-search");
 const searchResults = document.getElementById("docs-search-results");
-
-const categoryAnchors = {
-  Tutorials: "/docs/category/tutorials/",
-  "How-to guides": "/docs/category/how-to-guides/",
-  Reference: "/docs/category/reference/",
-  Explanation: "/docs/category/explanation/",
-  Operations: "/docs/category/operations/",
-  Troubleshooting: "/docs/category/troubleshooting/",
-  Routing: "/docs/category/routing/",
-  Accounts: "/docs/category/accounts/",
-  Limits: "/docs/category/limits/",
-  Deployment: "/docs/category/deployment/",
-  Notifications: "/docs/category/notifications/",
-  Configuration: "/docs/category/configuration/",
-  "API access": "/docs/category/api-access/",
-};
-
-const extraCategoriesBySlug = {
-  "api-keys": ["API access", "Limits"],
-  configuration: ["Configuration"],
-  "custom-models": ["Routing"],
-  dashboard: ["Accounts", "API access"],
-  deployment: ["Deployment"],
-  notifications: ["Notifications"],
-  "priority-routing": ["Routing", "Accounts"],
-  "provider-accounts": ["Accounts"],
-  "quick-start": ["Configuration"],
-  "routing-and-models": ["Routing"],
-  "test-api": ["API access"],
-  troubleshooting: ["Configuration"],
-  "usage-and-quota": ["Limits", "Accounts"],
-};
+const docsNavigation = document.querySelector(".docs-toc");
+const docsNavigationToggle = document.querySelector(".docs-nav-toggle");
 
 function redirectLegacyHashRoute() {
   const hash = decodeURIComponent(window.location.hash.slice(1));
@@ -94,7 +65,7 @@ function buildOutline() {
   }
 
   const headings = [...article.querySelectorAll("h2, h3")].filter(
-    (heading) => !heading.closest(".docs-grid, .docs-related, .docs-categories"),
+    (heading) => !heading.closest(".docs-grid, .docs-related"),
   );
   const usedIds = new Set([...document.querySelectorAll("[id]")].map((element) => element.id));
   const fragment = document.createDocumentFragment();
@@ -134,8 +105,7 @@ function installBreadcrumbs() {
     return;
   }
 
-  const title = article.querySelector("h1")?.textContent.trim() || "Documentation";
-  const category = article.querySelector(".eyebrow")?.textContent.trim();
+  const title = article.querySelector("h1")?.textContent.trim() || "Routebook";
   const slug = article.dataset.pageSlug || "";
   const breadcrumbs = document.createElement("nav");
   breadcrumbs.className = "docs-breadcrumbs";
@@ -147,21 +117,18 @@ function installBreadcrumbs() {
 
   const docs = document.createElement("a");
   docs.href = "/docs/";
-  docs.textContent = "Docs";
+  docs.textContent = "Routebook";
 
   breadcrumbs.append(home, divider(), docs);
 
-  if (slug && !slug.startsWith("category-") && category) {
-    const categoryLink = document.createElement("a");
-    categoryLink.href = categoryAnchors[category] || "/docs/";
-    categoryLink.textContent = category;
-    breadcrumbs.append(divider(), categoryLink);
+  if (slug) {
+    const current = document.createElement("span");
+    current.setAttribute("aria-current", "page");
+    current.textContent = title;
+    breadcrumbs.append(divider(), current);
+  } else {
+    docs.setAttribute("aria-current", "page");
   }
-
-  const current = document.createElement("span");
-  current.setAttribute("aria-current", "page");
-  current.textContent = slug ? title : "Documentation";
-  breadcrumbs.append(divider(), current);
   article.prepend(breadcrumbs);
 }
 
@@ -185,7 +152,6 @@ function installMobileOutline() {
 
   const details = document.createElement("details");
   details.className = "docs-mobile-outline";
-  details.open = true;
 
   const summary = document.createElement("summary");
   summary.textContent = "Contents";
@@ -206,40 +172,44 @@ function installMobileOutline() {
   }
 }
 
-function installCategories() {
-  if (!article || article.querySelector(".docs-categories")) {
+function installDocsNavigation() {
+  if (!docsNavigation || !docsNavigationToggle) {
     return;
   }
 
-  const slug = article.dataset.pageSlug || "";
-  if (!slug || slug.startsWith("category-")) {
-    return;
+  const compactViewport = window.matchMedia("(max-width: 860px)");
+  const stateMark = docsNavigationToggle.querySelector("[aria-hidden='true']");
+
+  function setExpanded(expanded) {
+    docsNavigation.classList.toggle("is-expanded", expanded);
+    docsNavigationToggle.setAttribute("aria-expanded", String(expanded));
+    if (stateMark) stateMark.textContent = expanded ? "−" : "+";
   }
 
-  const currentPageLink = document.querySelector('.docs-toc a[aria-current="page"]');
-  const baseCategory = currentPageLink?.dataset.category || article.querySelector(".eyebrow")?.textContent.trim();
-  const labels = [...new Set([baseCategory, ...(extraCategoriesBySlug[slug] || [])].filter(Boolean))];
-
-  if (!labels.length) {
-    return;
+  function syncForViewport() {
+    setExpanded(!compactViewport.matches);
   }
 
-  const categories = document.createElement("nav");
-  categories.className = "docs-categories";
-  categories.setAttribute("aria-label", "Page categories");
-
-  const label = document.createElement("span");
-  label.textContent = "Categories:";
-  categories.appendChild(label);
-
-  labels.forEach((name) => {
-    const link = document.createElement("a");
-    link.href = categoryAnchors[name] || "/docs/";
-    link.textContent = name;
-    categories.appendChild(link);
+  docsNavigationToggle.addEventListener("click", () => {
+    setExpanded(!docsNavigation.classList.contains("is-expanded"));
   });
 
-  article.appendChild(categories);
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || !compactViewport.matches || !docsNavigation.classList.contains("is-expanded")) {
+      return;
+    }
+
+    setExpanded(false);
+    docsNavigationToggle.focus();
+  });
+
+  if (compactViewport.addEventListener) {
+    compactViewport.addEventListener("change", syncForViewport);
+  } else if (compactViewport.addListener) {
+    compactViewport.addListener(syncForViewport);
+  }
+
+  syncForViewport();
 }
 
 function installHeadingSpy() {
@@ -251,8 +221,22 @@ function installHeadingSpy() {
 
   const linksById = new Map(links.map((link) => [decodeURIComponent(link.hash.slice(1)), link]));
 
+  function setActiveLink(activeLink) {
+    links.forEach((link) => {
+      const isActive = link === activeLink;
+      link.classList.toggle("is-active", isActive);
+
+      if (isActive) {
+        link.setAttribute("aria-current", "location");
+      } else {
+        link.removeAttribute("aria-current");
+      }
+    });
+  }
+
+  setActiveLink(links[0]);
+
   if (!("IntersectionObserver" in window)) {
-    links[0].classList.add("is-active");
     return;
   }
 
@@ -267,7 +251,7 @@ function installHeadingSpy() {
         return;
       }
 
-      links.forEach((link) => link.classList.toggle("is-active", link === linksById.get(active)));
+      setActiveLink(linksById.get(active));
     },
     {
       rootMargin: "-84px 0px -72% 0px",
@@ -281,6 +265,116 @@ function installHeadingSpy() {
       observer.observe(heading);
     }
   });
+}
+
+function installCodeBlocks() {
+  document.querySelectorAll(".docs-article pre").forEach((pre) => {
+    if (pre.parentElement?.classList.contains("docs-code-block")) {
+      return;
+    }
+
+    const frame = document.createElement("div");
+    frame.className = "docs-code-block";
+
+    const toolbar = document.createElement("div");
+    toolbar.className = "docs-code-toolbar";
+
+    const label = document.createElement("span");
+    label.className = "docs-code-label";
+    label.textContent = pre.textContent.trimStart().startsWith("{") ? "JSON example" : "Terminal example";
+
+    const button = document.createElement("button");
+    button.className = "docs-code-copy";
+    button.type = "button";
+    button.textContent = "Copy";
+    button.setAttribute("aria-label", "Copy code example");
+
+    const status = document.createElement("span");
+    status.className = "sr-only";
+    status.setAttribute("aria-live", "polite");
+
+    pre.tabIndex = 0;
+    pre.setAttribute("aria-label", "Code example. Scroll horizontally to read the full line.");
+
+    button.addEventListener("click", async () => {
+      const originalLabel = button.textContent;
+
+      try {
+        await copyText(pre.textContent);
+        button.textContent = "Copied";
+        status.textContent = "Code copied to clipboard.";
+      } catch {
+        button.textContent = "Copy failed";
+        status.textContent = "Unable to copy code to the clipboard.";
+      }
+
+      window.setTimeout(() => {
+        button.textContent = originalLabel;
+        status.textContent = "";
+      }, 1800);
+    });
+
+    toolbar.append(label, button, status);
+    pre.before(frame);
+    frame.append(toolbar, pre);
+  });
+}
+
+async function copyText(value) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+
+  const helper = document.createElement("textarea");
+  helper.value = value;
+  helper.setAttribute("readonly", "");
+  helper.style.position = "fixed";
+  helper.style.opacity = "0";
+  document.body.appendChild(helper);
+  helper.select();
+  const copied = document.execCommand("copy");
+  helper.remove();
+
+  if (!copied) {
+    throw new Error("clipboard unavailable");
+  }
+}
+
+function installTableScrollHints() {
+  const tables = [...document.querySelectorAll(".docs-table-wrap")].map((wrapper) => {
+    wrapper.tabIndex = 0;
+    wrapper.setAttribute("role", "region");
+    wrapper.setAttribute("aria-label", "Documentation table. Scroll horizontally to read all columns.");
+
+    const hint = document.createElement("p");
+    hint.className = "docs-scroll-hint";
+    hint.textContent = "Scroll horizontally to read all columns →";
+    wrapper.prepend(hint);
+
+    return { wrapper, hint };
+  });
+
+  if (!tables.length) {
+    return;
+  }
+
+  const update = () => {
+    tables.forEach(({ wrapper, hint }) => {
+      const scrollable = wrapper.scrollWidth > wrapper.clientWidth + 1;
+      wrapper.classList.toggle("is-scrollable", scrollable);
+      hint.hidden = !scrollable;
+    });
+  };
+
+  update();
+
+  if ("ResizeObserver" in window) {
+    const observer = new ResizeObserver(update);
+    tables.forEach(({ wrapper }) => observer.observe(wrapper));
+  } else {
+    window.addEventListener("resize", update, { passive: true });
+  }
 }
 
 function installSearch() {
@@ -309,7 +403,7 @@ function installSearch() {
       pageLinks = buildFallbackSearchPages();
     });
 
-  searchInput.addEventListener("input", () => {
+  const updateResults = () => {
     const query = searchInput.value.trim().toLowerCase();
 
     if (!query) {
@@ -367,6 +461,39 @@ function installSearch() {
       link.append(title, summary);
       searchResults.appendChild(link);
     });
+  };
+
+  function clearSearch() {
+    searchInput.value = "";
+    updateResults();
+  }
+
+  searchInput.addEventListener("input", updateResults);
+
+  searchInput.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") {
+      return;
+    }
+
+    clearSearch();
+    searchInput.blur();
+  });
+
+  document.addEventListener("keydown", (event) => {
+    const target = event.target;
+    const typingInControl = target instanceof Element && target.closest("input, textarea, select, [contenteditable='true']");
+
+    if (event.key !== "/" || event.altKey || event.ctrlKey || event.metaKey || typingInControl) {
+      return;
+    }
+
+    event.preventDefault();
+
+    if (docsNavigation && docsNavigationToggle && !docsNavigation.classList.contains("is-expanded")) {
+      docsNavigationToggle.click();
+    }
+
+    window.requestAnimationFrame(() => searchInput.focus());
   });
 }
 
@@ -387,6 +514,8 @@ installActivePageState();
 installBreadcrumbs();
 buildOutline();
 installMobileOutline();
+installDocsNavigation();
 installHeadingSpy();
-installCategories();
+installCodeBlocks();
+installTableScrollHints();
 installSearch();

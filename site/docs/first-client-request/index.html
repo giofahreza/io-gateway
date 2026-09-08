@@ -5,10 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
     <meta name="theme-color" content="#ebe8df">
-    <meta name="description" content="Diagnose readiness failures, 401s, provider auth errors, custom-model misses, and notification failures.">
-    <title>Troubleshooting - IO Gateway Docs</title>
+    <meta name="description" content="Point a client at IO Gateway, inspect its model catalog, and prove a request reaches an upstream account.">
+    <title>First client request - IO Gateway Docs</title>
     <link rel="icon" href="data:,">
-    <link rel="canonical" href="https://gateway.giofahreza.com/docs/troubleshooting/">
+    <link rel="canonical" href="https://gateway.giofahreza.com/docs/first-client-request/">
     <script src="/theme.js?v=20260908a"></script>
     <link rel="stylesheet" href="/docs.css?v=20260908a">
   </head>
@@ -107,7 +107,7 @@
             <div class="docs-nav-group docs-journey-nav">
               <p class="docs-toc-label docs-journey-label"><span>04</span>Prove and observe</p>
 
-              <a href="/docs/first-client-request/" data-title="First client request" data-category="Tutorials" data-summary="Point a client at IO Gateway, inspect its model catalog, and prove a request reaches an upstream account." data-keywords="client request curl responses api chat completions base url bearer key models first request openai claude">
+              <a href="/docs/first-client-request/" data-title="First client request" data-category="Tutorials" data-summary="Point a client at IO Gateway, inspect its model catalog, and prove a request reaches an upstream account." data-keywords="client request curl responses api chat completions base url bearer key models first request openai claude" aria-current="page" class="is-active">
                 <span>First client request</span>
                 <small>Point a client at IO Gateway, inspect its model catalog, and prove a request reaches an upstream account.</small>
               </a>
@@ -131,7 +131,7 @@
             <div class="docs-nav-group docs-journey-nav">
               <p class="docs-toc-label docs-journey-label"><span>05</span>Repair and release</p>
 
-              <a href="/docs/troubleshooting/" data-title="Troubleshooting" data-category="Troubleshooting" data-summary="Diagnose readiness failures, 401s, provider auth errors, custom-model misses, and notification failures." data-keywords="troubleshooting ready 401 custom model provider auth logs quota access rules notifications" aria-current="page" class="is-active">
+              <a href="/docs/troubleshooting/" data-title="Troubleshooting" data-category="Troubleshooting" data-summary="Diagnose readiness failures, 401s, provider auth errors, custom-model misses, and notification failures." data-keywords="troubleshooting ready 401 custom model provider auth logs quota access rules notifications">
                 <span>Troubleshooting</span>
                 <small>Diagnose readiness failures, 401s, provider auth errors, custom-model misses, and notification failures.</small>
               </a>
@@ -144,41 +144,52 @@
           </div>
         </aside>
 
-        <article id="docs-content" class="docs-content docs-article" data-page-slug="troubleshooting">
+        <article id="docs-content" class="docs-content docs-article" data-page-slug="first-client-request">
           <div class="docs-heading">
-            <p class="eyebrow">Troubleshooting</p>
-            <h1>Troubleshooting</h1>
-            <dl class="docs-meta"><div><dt>Use when</dt><dd>Operational diagnosis</dd></div><div><dt>Updated</dt><dd>September 4, 2026</dd></div></dl>
+            <p class="eyebrow">Tutorials</p>
+            <h1>First client request</h1>
+            <dl class="docs-meta"><div><dt>Use when</dt><dd>A running gateway with one enabled provider account</dd></div><div><dt>Updated</dt><dd>September 4, 2026</dd></div></dl>
           </div>
 
-      <p class="docs-lead">Use this page when IO Gateway starts but requests, dashboard actions, provider accounts, or release checks do not behave as expected.</p>
-      <h2>Diagnostic order</h2>
+      <p class="docs-lead">Use this path after the gateway is healthy and at least one provider account is enabled. It proves the client-facing boundary: base URL, bearer key, model selection, and the receipt left in usage history.</p>
+      <h2>What you need</h2>
+      <ul class="docs-list">
+        <li><strong>A ready gateway</strong> Confirm <code>/ready</code> returns successfully before configuring a client.</li>
+        <li><strong>A client key</strong> Use the shared <code>proxy_api_key</code> or a managed key with access to the provider or alias you intend to call.</li>
+        <li><strong>An enabled model</strong> Ask the gateway for its catalog instead of guessing a provider model name.</li>
+      </ul>
+      <h2>Read the catalog first</h2>
+      <pre><code>export IO_GATEWAY_URL=http://127.0.0.1:8319
+export IO_GATEWAY_KEY='replace-with-your-client-key'
+
+curl -sS "$IO_GATEWAY_URL/v1/models" \
+  -H "Authorization: Bearer $IO_GATEWAY_KEY"</code></pre>
+      <p>Choose a model returned by <code>/v1/models</code>. A model name can select a provider naturally, a three-letter prefix can force a provider, and a <code>ctm:</code> alias can apply a route policy you created.</p>
+      <h2>Send one response</h2>
+      <pre><code>curl -sS "$IO_GATEWAY_URL/v1/responses" \
+  -H "Authorization: Bearer $IO_GATEWAY_KEY" \
+  -H "Content-Type: application/json" \
+  --data '{
+    "model": "gpt-5.2",
+    "input": "Reply with one short line."
+  }'</code></pre>
+      <p>Replace <code>gpt-5.2</code> with a model from your own catalog. The Responses API is the primary OpenAI-compatible route; existing OpenAI Chat Completions clients can use <code>POST /v1/chat/completions</code>, and Anthropic clients can use <code>POST /claude/v1/messages</code>.</p>
+      <h2>Read the receipt</h2>
       <ol class="docs-steps compact">
-        <li><span>1</span><div><strong>Check process health.</strong><p>Start with <code>/health</code>, <code>/ready</code>, and service logs.</p></div></li>
-        <li><span>2</span><div><strong>Check authentication.</strong><p>Separate dashboard auth failures from client API-key failures.</p></div></li>
-        <li><span>3</span><div><strong>Check provider accounts.</strong><p>Look for disabled, expired, cooling-down, failed, or quota-exhausted accounts.</p></div></li>
-        <li><span>4</span><div><strong>Check routing rules.</strong><p>Inspect custom models, managed-key scopes, priority routing, and fallback behavior.</p></div></li>
+        <li><span>1</span><div><strong>Confirm the client response.</strong><p>A successful response proves the request cleared client authentication and reached an eligible route.</p></div></li>
+        <li><span>2</span><div><strong>Check usage history.</strong><p>Confirm the selected provider and account match the route policy you expected.</p></div></li>
+        <li><span>3</span><div><strong>Repeat with a managed key.</strong><p>Use the real key your client will receive to prove that its scope and prompt limits behave as intended.</p></div></li>
       </ol>
-      <h2>Common symptoms</h2>
-      <div class="docs-table-wrap"><table class="docs-table"><thead><tr><th>Symptom</th><th>Likely check</th></tr></thead><tbody>
-        <tr><td><code>401</code> from client request</td><td>Wrong shared proxy key or managed API key.</td></tr>
-        <tr><td>Dashboard login fails</td><td>Admin auth key, TOTP secret, cookie security, or session settings.</td></tr>
-        <tr><td>Model alias not found</td><td>Custom model name, <code>ctm:</code> prefix, or saved alias state.</td></tr>
-        <tr><td>Unexpected account used</td><td>Priority routing, account health, key scope, or custom-model fallback.</td></tr>
-        <tr><td>Notification missing</td><td>Destination token/webhook, outbound network access, or dashboard notification settings.</td></tr>
-      </tbody></table></div>
-      <h2>Useful commands</h2>
-      <pre><code>curl http://127.0.0.1:8319/health
-curl http://127.0.0.1:8319/ready
-curl http://127.0.0.1:8319/api-docs/openapi.json</code></pre>
+      <div class="docs-note"><strong>If the route is rejected</strong><p>Check the key scope, model spelling or prefix, custom-model state, and provider-account eligibility before changing the client. The <a class="docs-inline-link" href="/docs/test-api/">Test API</a> is useful for separating an operator route problem from a client-key problem.</p></div>
 
 
           <section class="docs-related" aria-labelledby="continue-the-route">
             <h2 id="continue-the-route">Continue the route</h2>
             <ul class="docs-link-list">
-              <li><a href="/docs/usage-and-quota/">Usage and quota</a> - Read usage history, context-token charts, account health, provider quota, and useful admin endpoints.</li>
-<li><a href="/docs/configuration/">Configuration</a> - Core config.json fields, environment overrides, dashboard auth, and proxy safety settings.</li>
-<li><a href="/docs/deployment/">Deployment</a> - Release with tag-triggered app deployment and push-triggered GitHub Pages deployment.</li>
+              <li><a href="/docs/quick-start/">Quick start</a> - Build, configure, run, and smoke-test IO Gateway for the first time.</li>
+<li><a href="/docs/api-keys/">API keys</a> - Create managed keys with provider/account scopes and prompt-token limits at whole, provider, and account levels.</li>
+<li><a href="/docs/routing-and-models/">Routing and models</a> - Understand gateway endpoints, model prefixes, custom aliases, failover, and routing rules.</li>
+<li><a href="/docs/usage-and-quota/">Usage and quota</a> - Read usage history, context-token charts, account health, provider quota, and useful admin endpoints.</li>
             </ul>
           </section>
         </article>
