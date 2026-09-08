@@ -3,32 +3,133 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="dark">
-    <title>IO Gateway</title>
-    <link rel="icon" href="data:,">
+    <meta name="color-scheme" content="light dark">
+    <meta
+      name="theme-color"
+      content="#f2efe6"
+      data-theme-color-light="#f2efe6"
+      data-theme-color-dark="#111a14"
+    >
     <meta
       name="description"
-      content="Fast Rust self-hosted AI account gateway with native one-command desktop installs, /v1, /codex, and /claude endpoints, quota-aware routing, scoped API-key limits, and dashboard operations."
+      content="A self-hosted Rust gateway that keeps AI provider credentials private while giving clients one local endpoint."
     >
+    <title>IO Gateway — local routing for AI accounts</title>
+    <link rel="icon" href="data:,">
+    <script src="/theme.js?v=20260906a"></script>
     <style>
+      @font-face {
+        font-family: "IBM Plex Sans";
+        font-style: normal;
+        font-weight: 100 700;
+        font-stretch: 85% 100%;
+        font-display: swap;
+        src: url("/assets/fonts/ibm-plex-sans-latin.woff2?v=20260906a") format("woff2");
+        unicode-range: U+0000, U+000D, U+0020-007E, U+00A0-00FF, U+0131, U+0152-0153, U+02C6, U+02DA, U+02DC, U+2013-2014, U+2018-201A, U+201C-201E, U+2020-2022, U+2026, U+2030, U+2039-203A, U+2044, U+20AC, U+2122, U+2212, U+FB01-FB02;
+      }
+
+      @font-face {
+        font-family: "IBM Plex Mono";
+        font-style: normal;
+        font-weight: 100 700;
+        font-display: swap;
+        src: url("/assets/fonts/ibm-plex-mono-latin.woff2?v=20260906a") format("woff2");
+        unicode-range: U+0020-007E, U+00A0-00FF, U+0131, U+0152-0153, U+02C6, U+02DA, U+02DC, U+2013-2014, U+2018-201A, U+201C-201E, U+2020-2022, U+2026, U+2030, U+2039-203A, U+2044, U+20AC, U+2122, U+2212, U+FB01-FB02;
+      }
+
       :root {
+        color-scheme: light;
+        --canvas: #f2efe6;
+        --surface: #faf7f0;
+        --elevated: #eae7dd;
+        --ink: #18231d;
+        --body: #36443b;
+        --muted: #5b675e;
+        --rule: #b8bdb4;
+        --rule-strong: #737c72;
+        --code-bg: #162119;
+        --code-surface: #203027;
+        --code-rule: #6a836f;
+        --code-ink: #f7f4ea;
+        --code-muted: #bac6b8;
+        --code-label: #d8e2d4;
+        --code-ready: #b3e1ba;
+        --action: #a83e1b;
+        --action-hover: #7b2d12;
+        --on-action: #ffffff;
+        --action-wash: #f2d6c7;
+        --link: #7b2d12;
+        --ready: #246b4a;
+        --notice: #806000;
+        --blocked: #9b2c3b;
+        --focus: #005fcc;
+        --focus-on-code: #91c6ff;
+        --shadow: color-mix(in srgb, var(--ink) 17%, transparent);
+        --shell: min(1180px, calc(100% - 40px));
+        --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
+        --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+
+      :root[data-theme="dark"] {
         color-scheme: dark;
-        --ink: #eff8f5;
-        --muted: #a6b8b4;
-        --line: rgba(255, 255, 255, 0.12);
-        --paper: #050807;
-        --panel: #0c1412;
-        --panel-soft: #101b18;
-        --night: #060908;
-        --night-soft: #0c1412;
-        --accent: #5dd6c4;
-        --accent-strong: #8bf4e4;
-        --blue: #5687f5;
-        --amber: #c9822c;
-        --rose: #d25a70;
-        --green: #58b783;
-        --violet: #a9a3ff;
-        --shadow: 0 24px 90px rgba(0, 0, 0, 0.5);
+        --canvas: #111a14;
+        --surface: #1b251d;
+        --elevated: #253025;
+        --ink: #f6f2e7;
+        --body: #d5ddd2;
+        --muted: #abb8a9;
+        --rule: #455246;
+        --rule-strong: #657863;
+        --code-bg: #0b110d;
+        --code-surface: #152018;
+        --code-rule: #617861;
+        --code-ink: #f8f4e8;
+        --code-muted: #b8c6b5;
+        --code-label: #d8e2d4;
+        --code-ready: #8dd39c;
+        --action: #ff926a;
+        --action-hover: #ffb494;
+        --on-action: #21150f;
+        --action-wash: #422a20;
+        --link: #ffb494;
+        --ready: #8dd39c;
+        --notice: #f4c75a;
+        --blocked: #ff99a4;
+        --focus: #91c6ff;
+        --focus-on-code: #91c6ff;
+        --shadow: color-mix(in srgb, #000 42%, transparent);
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root:not([data-theme]) {
+          color-scheme: dark;
+          --canvas: #111a14;
+          --surface: #1b251d;
+          --elevated: #253025;
+          --ink: #f6f2e7;
+          --body: #d5ddd2;
+          --muted: #abb8a9;
+          --rule: #455246;
+          --rule-strong: #657863;
+          --code-bg: #0b110d;
+          --code-surface: #152018;
+          --code-rule: #617861;
+          --code-ink: #f8f4e8;
+          --code-muted: #b8c6b5;
+          --code-label: #d8e2d4;
+          --code-ready: #8dd39c;
+          --action: #ff926a;
+          --action-hover: #ffb494;
+          --on-action: #21150f;
+          --action-wash: #422a20;
+          --link: #ffb494;
+          --ready: #8dd39c;
+          --notice: #f4c75a;
+          --blocked: #ff99a4;
+          --focus: #91c6ff;
+          --focus-on-code: #91c6ff;
+          --shadow: color-mix(in srgb, #000 42%, transparent);
+        }
       }
 
       * {
@@ -36,240 +137,44 @@
       }
 
       html {
+        background: var(--canvas);
         scroll-behavior: smooth;
       }
 
       body {
         margin: 0;
+        overflow-x: hidden;
+        background:
+          linear-gradient(90deg, transparent 0, transparent calc(50% - 590px), color-mix(in srgb, var(--ink) 4%, transparent) calc(50% - 590px), color-mix(in srgb, var(--ink) 4%, transparent) calc(50% - 589px), transparent calc(50% - 589px)),
+          var(--canvas);
         color: var(--ink);
-        background: var(--paper);
-        font-family:
-          "Adwaita Sans", system-ui, -apple-system, BlinkMacSystemFont,
-          "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-        letter-spacing: 0px;
-        line-height: 1.5;
+        font-family: var(--sans);
+        font-size: 16px;
+        line-height: 1.55;
+        font-synthesis: none;
+        text-rendering: optimizeLegibility;
+      }
+
+      ::selection {
+        background: var(--action);
+        color: var(--on-action);
       }
 
       a {
         color: inherit;
       }
 
+      button,
+      input,
+      textarea,
+      select {
+        font: inherit;
+      }
+
       code,
       pre,
-      .mono,
-      .surface-route code,
-      .terminal,
-      .brand-mark {
-        font-family:
-          "Adwaita Mono", "SFMono-Regular", Consolas, "Liberation Mono", Menlo,
-          monospace;
-      }
-
-      .shell {
-        width: min(1160px, calc(100% - 32px));
-        margin: 0 auto;
-      }
-
-      header {
-        position: fixed;
-        z-index: 10;
-        top: 12px;
-        left: 0;
-        right: 0;
-        color: #fff;
-        pointer-events: none;
-      }
-
-      .nav {
-        display: flex;
-        min-height: 56px;
-        align-items: center;
-        justify-content: space-between;
-        gap: 18px;
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        border-radius: 8px;
-        background: rgba(6, 9, 8, 0.72);
-        padding: 0 10px;
-        box-shadow: 0 18px 60px rgba(0, 0, 0, 0.25);
-        backdrop-filter: blur(18px);
-        pointer-events: auto;
-      }
-
-      .brand {
-        display: inline-flex;
-        min-height: 44px;
-        align-items: center;
-        gap: 10px;
-        font-size: 15px;
-        font-weight: 800;
-        text-decoration: none;
-      }
-
-      .brand-mark {
-        display: grid;
-        width: 30px;
-        height: 30px;
-        place-items: center;
-        border: 1px solid rgba(255, 255, 255, 0.24);
-        border-radius: 8px;
-        background: rgba(255, 255, 255, 0.1);
-        font-size: 12px;
-      }
-
-      nav {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        color: rgba(255, 255, 255, 0.76);
-        font-size: 14px;
-      }
-
-      nav a {
-        display: inline-flex;
-        min-height: 44px;
-        align-items: center;
-        border-radius: 8px;
-        padding: 0 10px;
-        text-decoration: none;
-      }
-
-      nav a:hover {
-        color: #fff;
-        background: rgba(255, 255, 255, 0.08);
-      }
-
-      .nav-cta {
-        border: 1px solid rgba(157, 229, 217, 0.34);
-        color: #d9fff7;
-      }
-
-      .mobile-actions {
-        display: none;
-      }
-
-      .button:focus-visible,
-      .brand:focus-visible,
-      nav a:focus-visible,
-      .mobile-actions a:focus-visible,
-      .feature-group summary:focus-visible {
-        outline: 2px solid var(--accent);
-        outline-offset: 3px;
-      }
-
-      .hero {
-        position: relative;
-        min-height: 86svh;
-        overflow: hidden;
-        padding: 0;
-        color: #fff;
-        background:
-          linear-gradient(90deg, rgba(255, 255, 255, 0.028) 1px, transparent 1px),
-          linear-gradient(180deg, rgba(255, 255, 255, 0.022) 1px, transparent 1px),
-          linear-gradient(135deg, #040706 0%, #07100e 58%, #050807 100%);
-        background-size:
-          72px 72px,
-          72px 72px,
-          auto,
-          auto;
-      }
-
-      #routing-canvas {
-        position: absolute;
-        inset: 0;
-        z-index: 0;
-        width: 100%;
-        height: 100%;
-        opacity: 0.22;
-      }
-
-      .hero::after {
-        position: absolute;
-        inset: 0;
-        z-index: 1;
-        content: "";
-        background:
-          linear-gradient(90deg, rgba(5, 7, 6, 0.98) 0%, rgba(5, 7, 6, 0.9) 38%, rgba(5, 7, 6, 0.42) 72%, rgba(5, 7, 6, 0.76) 100%),
-          linear-gradient(180deg, rgba(5, 7, 6, 0.18) 0%, rgba(5, 7, 6, 0.9) 100%);
-        pointer-events: none;
-      }
-
-      .hero-backdrop {
-        position: absolute;
-        z-index: 1;
-        right: max(24px, calc((100vw - 1160px) / 2));
-        bottom: 124px;
-        width: min(720px, 56vw);
-        opacity: 0.78;
-        transform: perspective(1200px) rotateY(-7deg) rotateX(1.5deg);
-        transform-origin: right center;
-        pointer-events: none;
-      }
-
-      .hero-backdrop::after {
-        position: absolute;
-        inset: 0;
-        border-radius: 8px;
-        box-shadow: inset 0 0 90px rgba(5, 8, 7, 0.8);
-        content: "";
-      }
-
-      .hero-backdrop img {
-        display: block;
-        width: 100%;
-        border: 1px solid rgba(255, 255, 255, 0.16);
-        border-radius: 8px;
-        box-shadow: 0 34px 120px rgba(0, 0, 0, 0.56);
-      }
-
-      .product-shot {
-        margin: 0;
-        min-width: 0;
-      }
-
-      .product-shot-frame {
-        overflow: hidden;
-        border: 1px solid rgba(255, 255, 255, 0.14);
-        border-radius: 8px;
-        background: #07100e;
-        box-shadow: 0 34px 110px rgba(0, 0, 0, 0.52);
-      }
-
-      .product-shot img {
-        display: block;
-        width: 100%;
-        height: auto;
-      }
-
-      .product-shot figcaption {
-        margin-top: 10px;
-        color: rgba(255, 255, 255, 0.58);
-        font-size: 12px;
-      }
-
-      .hero-inner {
-        position: relative;
-        z-index: 2;
-        display: flex;
-        min-height: 86svh;
-        align-items: center;
-        padding: 118px 0 150px;
-      }
-
-      .hero-copy {
-        max-width: 720px;
-      }
-
-      .eyebrow {
-        display: inline-flex;
-        margin: 0 0 20px;
-        border: 1px solid rgba(157, 229, 216, 0.22);
-        border-radius: 999px;
-        background: rgba(157, 229, 216, 0.08);
-        padding: 7px 10px;
-        color: #b9fff4;
-        font-size: 13px;
-        font-weight: 800;
-        text-transform: none;
+      .mono {
+        font-family: var(--mono);
       }
 
       h1,
@@ -279,1027 +184,1191 @@
         overflow-wrap: anywhere;
       }
 
-      h1 {
-        max-width: 760px;
+      .shell {
+        width: var(--shell);
+        margin: 0 auto;
+      }
+
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+      }
+
+      .skip-link {
+        position: fixed;
+        z-index: 100;
+        top: 12px;
+        left: 12px;
+        padding: 10px 12px;
+        transform: translateY(-180%);
+        background: var(--ink);
+        color: var(--surface);
+        font-weight: 700;
+        text-decoration: none;
+        transition: transform 160ms ease;
+      }
+
+      .skip-link:focus {
+        transform: translateY(0);
+      }
+
+      :focus-visible {
+        outline: 3px solid var(--focus);
+        outline-offset: 3px;
+      }
+
+      .install-section :focus-visible {
+        outline-color: var(--focus-on-code);
+      }
+
+      .site-header {
+        border-bottom: 1px solid var(--rule);
+        background: color-mix(in srgb, var(--canvas) 94%, transparent);
+      }
+
+      .nav {
+        display: flex;
+        min-height: 72px;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+      }
+
+      .brand {
+        display: inline-flex;
+        min-height: 48px;
+        align-items: center;
+        gap: 11px;
+        color: var(--ink);
+        font-size: 15px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+        text-decoration: none;
+      }
+
+      .brand-mark {
+        display: grid;
+        width: 35px;
+        height: 35px;
+        place-items: center;
+        border: 1px solid var(--ink);
+        background: var(--action);
+        color: var(--on-action);
+        font-family: var(--mono);
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: -0.08em;
+      }
+
+      .primary-nav {
+        display: flex;
+        align-items: center;
+        gap: 2px;
+        font-size: 13px;
+        font-weight: 600;
+      }
+
+      .primary-nav a {
+        display: inline-flex;
+        min-height: 42px;
+        align-items: center;
+        padding: 0 10px;
+        color: var(--muted);
+        text-decoration: none;
+      }
+
+      .primary-nav a:hover {
+        color: var(--ink);
+        text-decoration: underline;
+        text-decoration-color: var(--action);
+        text-decoration-thickness: 2px;
+        text-underline-offset: 5px;
+      }
+
+      .primary-nav .nav-release {
+        margin-left: 4px;
+        border: 1px solid var(--ink);
+        color: var(--ink);
+      }
+
+      .primary-nav .nav-release:hover {
+        background: var(--ink);
+        color: var(--surface);
+        text-decoration: none;
+      }
+
+      .nav-actions {
+        display: flex;
+        min-width: 0;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .theme-toggle {
+        display: inline-flex;
+        min-height: 40px;
+        align-items: center;
+        gap: 7px;
+        border: 1px solid var(--ink);
+        background: transparent;
+        padding: 0 10px;
+        color: var(--ink);
+        cursor: pointer;
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        transition:
+          background 150ms ease,
+          color 150ms ease,
+          transform 150ms ease;
+      }
+
+      .theme-toggle:hover {
+        background: var(--ink);
+        color: var(--surface);
+        transform: translate(-1px, -1px);
+      }
+
+      .theme-toggle-mark {
+        color: var(--action);
+        font-size: 15px;
+        line-height: 1;
+      }
+
+      .mobile-nav {
+        display: none;
+      }
+
+      .menu {
+        position: relative;
+      }
+
+      .menu summary {
+        display: inline-flex;
+        min-height: 42px;
+        align-items: center;
+        border: 1px solid var(--ink);
+        padding: 0 12px;
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 600;
+        list-style: none;
+      }
+
+      .menu summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .menu summary::after {
+        margin-left: 9px;
+        content: "+";
+        font-family: var(--mono);
+      }
+
+      .menu[open] summary::after {
+        content: "-";
+      }
+
+      .menu-panel {
+        position: absolute;
+        z-index: 20;
+        top: calc(100% + 8px);
+        right: 0;
+        display: grid;
+        width: min(290px, calc(100vw - 40px));
+        border: 1px solid var(--ink);
+        background: var(--surface);
+        box-shadow: 6px 6px 0 var(--ink);
+      }
+
+      .menu-panel a {
+        padding: 13px 14px;
+        border-bottom: 1px solid var(--rule);
+        color: var(--ink);
+        font-size: 14px;
+        font-weight: 700;
+        text-decoration: none;
+      }
+
+      .menu-panel a:last-child {
+        border-bottom: 0;
+      }
+
+      .menu-panel a:hover {
+        background: var(--action-wash);
+      }
+
+      main {
+        overflow: clip;
+      }
+
+      section {
+        scroll-margin-top: 18px;
+      }
+
+      .eyebrow,
+      .section-index,
+      .route-label,
+      .table-label,
+      .install-label,
+      .note-label {
         margin: 0;
-        font-size: 58px;
-        line-height: 1.02;
-        font-weight: 800;
-        letter-spacing: 0px;
+        color: var(--link);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .hero {
+        position: relative;
+        padding: clamp(64px, 9vw, 130px) 0 0;
+        border-bottom: 1px solid var(--ink);
+      }
+
+      .hero::before {
+        position: absolute;
+        top: 0;
+        right: calc((100% - min(1180px, calc(100% - 40px))) / 2);
+        width: min(46vw, 515px);
+        height: 100%;
+        border-left: 1px solid color-mix(in srgb, var(--ink) 10%, transparent);
+        background:
+          linear-gradient(90deg, color-mix(in srgb, var(--ink) 6%, transparent) 1px, transparent 1px),
+          linear-gradient(180deg, color-mix(in srgb, var(--ink) 6%, transparent) 1px, transparent 1px);
+        background-size: 24px 24px;
+        content: "";
+        pointer-events: none;
+      }
+
+      .hero-grid {
+        position: relative;
+        display: grid;
+        grid-template-columns: minmax(0, 1.02fr) minmax(360px, 0.78fr);
+        align-items: end;
+        gap: clamp(40px, 7vw, 110px);
+      }
+
+      .hero-copy {
+        max-width: 690px;
+        padding-bottom: clamp(58px, 7vw, 94px);
+      }
+
+      h1,
+      h2 {
+        color: var(--ink);
+      }
+
+      h1 {
+        max-width: 700px;
+        margin: 18px 0 0;
+        font-family: var(--sans);
+        font-size: clamp(52px, 6vw, 86px);
+        font-weight: 600;
+        letter-spacing: -0.06em;
+        line-height: 0.92;
+      }
+
+      h2 {
+        font-family: var(--sans);
+        font-weight: 600;
+        letter-spacing: -0.045em;
       }
 
       .lead {
-        max-width: 620px;
-        margin: 26px 0 0;
-        color: rgba(255, 255, 255, 0.82);
-        font-size: 19px;
+        max-width: 610px;
+        margin: 28px 0 0;
+        color: var(--body);
+        font-size: clamp(17px, 1.55vw, 21px);
+        line-height: 1.5;
       }
 
-      .hero-signals {
+      .lead strong {
+        color: var(--ink);
+      }
+
+      .hero-actions,
+      .button-row {
         display: flex;
         flex-wrap: wrap;
-        gap: 9px;
-        margin-top: 24px;
-      }
-
-      .hero-signal {
-        display: inline-flex;
-        min-height: 34px;
-        align-items: center;
-        gap: 8px;
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        border-radius: 999px;
-        background: rgba(255, 255, 255, 0.055);
-        padding: 0 11px;
-        color: rgba(255, 255, 255, 0.78);
-        font-size: 13px;
-        font-weight: 700;
-      }
-
-      .hero-signal::before {
-        width: 7px;
-        height: 7px;
-        border-radius: 50%;
-        background: var(--accent);
-        content: "";
-      }
-
-      .hero-signal:nth-child(2)::before {
-        background: var(--blue);
-      }
-
-      .hero-signal:nth-child(3)::before {
-        background: var(--amber);
-      }
-
-      .actions {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 12px;
-        margin-top: 34px;
+        gap: 11px;
+        margin-top: 31px;
       }
 
       .button {
         display: inline-flex;
-        min-height: 46px;
+        min-height: 47px;
         align-items: center;
         justify-content: center;
-        border: 1px solid rgba(255, 255, 255, 0.25);
-        border-radius: 8px;
-        padding: 0 18px;
+        border: 1px solid var(--ink);
+        padding: 0 16px;
         font-size: 14px;
-        font-weight: 800;
-        white-space: nowrap;
+        font-weight: 600;
         text-decoration: none;
-        transition:
-          background 160ms ease,
-          border-color 160ms ease,
-          color 160ms ease,
-          transform 160ms ease;
+        transition: background 150ms ease, color 150ms ease, transform 150ms ease;
       }
 
       .button:hover {
-        transform: translateY(-1px);
+        transform: translate(-2px, -2px);
       }
 
-      .button.primary {
-        border-color: #9ee5d8;
-        background: #9ee5d8;
-        color: #10201f;
+      .button-primary {
+        background: var(--action);
+        color: var(--on-action);
+        box-shadow: 3px 3px 0 var(--ink);
       }
 
-      .button.secondary {
-        background: rgba(255, 255, 255, 0.08);
-        color: #fff;
+      .button-primary:hover {
+        background: var(--action-hover);
       }
 
-      .surface-strip {
-        position: absolute;
-        z-index: 3;
-        left: 50%;
-        bottom: 24px;
-        display: grid;
-        width: min(1160px, calc(100% - 32px));
-        grid-template-columns: repeat(4, minmax(0, 1fr));
-        margin: 0;
-        overflow: hidden;
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        border-radius: 8px;
-        background: rgba(6, 12, 11, 0.74);
-        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.32);
-        backdrop-filter: blur(18px);
-        transform: translateX(-50%);
+      .button-secondary {
+        background: transparent;
+        color: var(--ink);
       }
 
-      .surface-route {
-        min-width: 0;
-        border-right: 1px solid rgba(255, 255, 255, 0.1);
-        padding: 16px 20px;
+      .button-secondary:hover {
+        background: var(--elevated);
       }
 
-      .surface-route:last-child {
-        border-right: 0;
-      }
-
-      .surface-route code {
-        display: block;
-        color: #fff;
-        font-size: 22px;
-        font-weight: 850;
-      }
-
-      .surface-route span {
-        display: block;
-        margin-top: 4px;
-        color: rgba(255, 255, 255, 0.62);
+      .hero-notes {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px 18px;
+        margin: 28px 0 0;
+        color: var(--body);
         font-size: 13px;
       }
 
-      .mobile-proof {
+      .hero-notes span::before {
+        margin-right: 7px;
+        color: var(--action);
+        content: "->";
+        font-family: var(--mono);
+      }
+
+      .routing-receipt {
         position: relative;
-        z-index: 3;
-        display: none;
-        margin-top: 12px;
-        margin-bottom: 20px;
+        z-index: 1;
+        margin-bottom: -1px;
+        border: 1px solid var(--ink);
+        background: var(--code-bg);
+        color: var(--code-ink);
+        box-shadow: 8px 8px 0 var(--action);
       }
 
-      .mobile-proof .product-shot-frame {
-        max-height: 190px;
+      .receipt-title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 20px;
+        padding: 16px 18px;
+        border-bottom: 1px solid var(--code-rule);
+        color: var(--code-muted);
+        font-family: var(--mono);
+        font-size: 12px;
+        letter-spacing: 0.02em;
       }
 
-      .mobile-proof img {
+      .receipt-title .receipt-status {
+        color: var(--code-ready);
+      }
+
+      .receipt-status::before {
+        margin-right: 5px;
+        content: "[ok]";
+        font-size: 10px;
+        font-weight: 600;
+      }
+
+      .receipt-line {
+        display: grid;
+        grid-template-columns: 92px minmax(0, 1fr);
+        gap: 16px;
+        padding: 16px 18px;
+        border-bottom: 1px solid var(--code-rule);
+      }
+
+      .receipt-line:last-of-type {
+        border-bottom: 0;
+      }
+
+      .receipt-line dt {
+        color: var(--code-muted);
+        font-family: var(--mono);
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+      }
+
+      .receipt-line dd {
+        margin: 0;
+        color: var(--code-ink);
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.55;
+      }
+
+      .receipt-line dd small {
         display: block;
-        width: 100%;
-        height: 190px;
-        object-fit: cover;
-        object-position: top left;
+        margin-top: 4px;
+        color: var(--code-muted);
+        font-family: var(--sans);
+        font-size: 12px;
       }
 
-      main {
-        background:
-          linear-gradient(180deg, #08100e 0%, var(--paper) 18%, #07100e 100%);
+      .receipt-line.result dd {
+        color: var(--code-ready);
       }
 
-      section {
-        scroll-margin-top: 64px;
-        padding: 74px 0;
+      .receipt-footer {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px 16px;
+        padding: 13px 18px;
+        border-top: 1px solid var(--code-rule);
+        color: var(--code-muted);
+        font-size: 11px;
       }
 
-      .section-head {
-        max-width: 760px;
-        margin-bottom: 34px;
+      .receipt-footer span::before {
+        margin-right: 6px;
+        color: var(--code-ready);
+        content: "[ok]";
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 600;
+      }
+
+      .surface-index {
+        position: relative;
+        z-index: 2;
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        border-top: 1px solid var(--ink);
+      }
+
+      .surface-index > div {
+        min-width: 0;
+        padding: 17px 18px 20px;
+        border-right: 1px solid var(--ink);
+      }
+
+      .surface-index > div:first-child {
+        border-left: 1px solid var(--ink);
+      }
+
+      .surface-index code {
+        display: block;
+        color: var(--link);
+        font-size: 18px;
+        font-weight: 700;
+      }
+
+      .surface-index span {
+        display: block;
+        margin-top: 5px;
+        color: var(--body);
+        font-size: 12px;
+        line-height: 1.35;
+      }
+
+      .section-intro {
+        display: grid;
+        grid-template-columns: 150px minmax(0, 1fr);
+        gap: 28px;
+        align-items: start;
+      }
+
+      .section-title {
+        max-width: 770px;
       }
 
       h2 {
         margin: 0;
-        font-size: 44px;
-        line-height: 1.02;
-        letter-spacing: 0px;
+        font-size: clamp(38px, 4vw, 61px);
+        line-height: 0.97;
       }
 
-      .section-head p {
-        margin: 14px 0 0;
-        color: var(--muted);
-        font-size: 18px;
+      .section-title p,
+      .section-copy {
+        max-width: 640px;
+        margin: 18px 0 0;
+        color: var(--body);
+        font-size: 17px;
       }
 
-      .unique-section {
-        border-bottom: 1px solid var(--line);
-        background: #050807;
+      .flow-section {
+        padding: clamp(78px, 9vw, 130px) 0;
       }
 
-      .unique-head {
-        max-width: 840px;
+      .flow-layout {
+        display: grid;
+        grid-template-columns: minmax(0, 0.86fr) minmax(430px, 1.14fr);
+        gap: clamp(44px, 7vw, 100px);
+        margin-top: clamp(42px, 6vw, 74px);
       }
 
-      .unique-kicker {
-        display: inline-flex;
-        min-height: 30px;
-        align-items: center;
-        border: 1px solid rgba(93, 214, 196, 0.24);
-        border-radius: 999px;
-        background: rgba(93, 214, 196, 0.11);
-        padding: 0 12px;
-        color: var(--accent-strong);
+      .request-ledger {
+        margin: 0;
+        border-top: 1px solid var(--ink);
+      }
+
+      .request-row {
+        display: grid;
+        grid-template-columns: 42px minmax(0, 1fr);
+        gap: 16px;
+        padding: 18px 0 19px;
+        border-bottom: 1px solid var(--rule);
+      }
+
+      .request-row dt {
+        color: var(--link);
+        font-family: var(--mono);
         font-size: 12px;
-        font-weight: 850;
-        text-transform: uppercase;
+        font-weight: 700;
       }
 
-      .feature-ledger,
-      .endpoint-ledger,
-      .runtime-spec,
-      .workflow-list {
-        display: grid;
+      .request-row dd {
         margin: 0;
-        padding: 0;
-        border-top: 1px solid var(--line);
-        list-style: none;
       }
 
-      .feature-ledger-row,
-      .endpoint-row,
-      .runtime-row,
-      .workflow-step {
-        display: grid;
-        min-width: 0;
-        grid-template-columns: 220px minmax(0, 1fr);
-        gap: 24px;
-        border-bottom: 1px solid var(--line);
-        padding: 18px 0;
-      }
-
-      .feature-ledger-row code,
-      .endpoint-row code,
-      .runtime-row code,
-      .workflow-step code {
-        color: var(--accent-strong);
-      }
-
-      .feature-ledger-row strong,
-      .endpoint-row strong,
-      .runtime-row strong,
-      .workflow-step strong {
+      .request-row strong {
         display: block;
         color: var(--ink);
-        font-size: 17px;
+        font-size: 16px;
       }
 
-      .feature-ledger-row span,
-      .endpoint-row span,
-      .runtime-row span,
-      .workflow-step span {
-        color: var(--muted);
-      }
-
-      .feature-ledger-row p,
-      .endpoint-row p,
-      .runtime-row p,
-      .workflow-step p {
-        margin: 6px 0 0;
-        color: var(--muted);
-      }
-
-      .feature-map {
-        display: grid;
-        gap: 10px;
-        margin-top: 16px;
-      }
-
-      .feature-group {
-        border: 1px solid var(--line);
-        border-radius: 8px;
-        background:
-          linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.014)),
-          var(--panel);
-      }
-
-      .feature-group summary {
-        display: flex;
-        gap: 14px;
-        align-items: center;
-        min-height: 58px;
-        padding: 0 18px;
-        cursor: pointer;
-        list-style: none;
-      }
-
-      .feature-group summary::-webkit-details-marker {
-        display: none;
-      }
-
-      .feature-group summary span {
-        flex: 0 1 auto;
-        color: var(--ink);
-        font-weight: 850;
-      }
-
-      .feature-group summary small {
-        flex: 1 1 auto;
-        text-align: right;
-        color: var(--muted);
-      }
-
-      .feature-group summary::after {
-        content: "+";
-        display: grid;
-        flex: 0 0 28px;
-        width: 28px;
-        height: 28px;
-        place-items: center;
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        border-radius: 50%;
-        color: var(--accent-strong);
-        font-family:
-          "Adwaita Mono", "SFMono-Regular", Consolas, "Liberation Mono", Menlo,
-          monospace;
-        font-weight: 900;
-      }
-
-      .feature-group[open] summary::after {
-        content: "-";
-      }
-
-      .feature-list {
-        display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 12px;
-        margin: 0;
-        border-top: 1px solid var(--line);
-        padding: 16px 18px 18px;
-        list-style: none;
-      }
-
-      .feature-list li {
-        min-width: 0;
-        border-left: 3px solid rgba(93, 214, 196, 0.32);
-        padding-left: 12px;
-        color: var(--muted);
-        line-height: 1.48;
-      }
-
-      .feature-list b {
+      .request-row span {
         display: block;
-        color: var(--ink);
+        margin-top: 4px;
+        color: var(--body);
+        font-size: 14px;
       }
 
-      .feature-list.compact li {
-        border-left-color: rgba(86, 135, 245, 0.38);
-      }
-
-      .proof-section {
-        border-top: 1px solid var(--line);
-        border-bottom: 1px solid var(--line);
-        background: #07100e;
-      }
-
-      .product-grid {
-        display: grid;
-        grid-template-columns: 0.94fr 1.06fr;
-        gap: 26px;
-        align-items: start;
-      }
-
-      .product-grid > *,
-      .visual-feature > *,
-      .custom-model-layout > *,
-      .routes > * {
-        min-width: 0;
-      }
-
-      .terminal {
-        min-width: 0;
-        overflow: hidden;
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        border-radius: 8px;
-        background: #0f171a;
-        box-shadow: var(--shadow);
-      }
-
-      .window-bar {
-        display: flex;
-        height: 38px;
-        align-items: center;
-        gap: 7px;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-        padding: 0 12px;
-        background: #0d1518;
-      }
-
-      .window-bar span {
-        width: 9px;
-        height: 9px;
-        border-radius: 50%;
-        background: #4d5b63;
-      }
-
-      .window-bar span:nth-child(1) {
-        background: var(--rose);
-      }
-
-      .window-bar span:nth-child(2) {
-        background: var(--amber);
-      }
-
-      .window-bar span:nth-child(3) {
-        background: var(--accent-strong);
-      }
-
-      .product-copy {
-        display: grid;
-        gap: 18px;
-      }
-
-      .plain-points {
-        display: grid;
-        gap: 12px;
-        margin: 0;
-        padding: 0;
-        list-style: none;
-      }
-
-      .plain-points li {
-        border-left: 2px solid rgba(93, 214, 196, 0.42);
-        padding-left: 12px;
-        color: var(--muted);
-      }
-
-      .plain-points b {
-        display: block;
-        color: var(--ink);
-      }
-
-      .showcase-section {
-        border-bottom: 1px solid var(--line);
-        background: #050807;
-      }
-
-      .visual-stack {
-        display: grid;
-        border-top: 1px solid var(--line);
-      }
-
-      .visual-feature {
-        display: grid;
-        grid-template-columns: minmax(0, 1.08fr) minmax(300px, 0.92fr);
-        gap: 28px;
-        align-items: center;
-        border-bottom: 1px solid var(--line);
-        padding: 28px 0;
-      }
-
-      .visual-shot {
-        margin: 0;
-        min-width: 0;
-      }
-
-      .visual-shot .product-shot-frame {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        background: #09111f;
-      }
-
-      .visual-shot img {
-        display: block;
-        width: auto;
-        max-width: 100%;
-        max-height: 560px;
-      }
-
-      .visual-copy {
-        display: grid;
-        gap: 12px;
-      }
-
-      .visual-copy h3 {
-        margin: 0;
-        color: var(--ink);
-        font-size: 26px;
-        line-height: 1.08;
-        letter-spacing: 0;
-      }
-
-      .visual-copy p {
-        margin: 0;
-        color: var(--muted);
-        font-size: 17px;
-      }
-
-      .visual-points {
-        display: grid;
-        gap: 9px;
-        margin: 4px 0 0;
-        padding: 0;
-        list-style: none;
-      }
-
-      .visual-points li {
-        position: relative;
-        padding-left: 18px;
-        color: var(--muted);
-      }
-
-      .visual-points li::before {
-        position: absolute;
-        top: 0.66em;
-        left: 0;
-        width: 7px;
-        height: 7px;
-        border-radius: 50%;
-        background: var(--accent);
-        content: "";
-      }
-
-      .visual-points li:nth-child(2)::before {
-        background: var(--blue);
-      }
-
-      .visual-points li:nth-child(3)::before {
-        background: var(--amber);
-      }
-
-      .architecture-section {
-        border-bottom: 1px solid var(--line);
-        background: #050807;
-      }
-
-      .architecture-layout {
-        display: grid;
-        grid-template-columns: 0.86fr 1.14fr;
-        gap: 32px;
-        align-items: start;
-      }
-
-      .architecture-layout > * {
-        min-width: 0;
-      }
-
-      .request-stack {
-        display: grid;
-        margin: 0;
-        padding: 0;
-        border-top: 1px solid var(--line);
-        list-style: none;
-      }
-
-      .request-step {
-        display: grid;
-        min-width: 0;
-        grid-template-columns: 74px minmax(0, 1fr);
-        gap: 18px;
-        border-bottom: 1px solid var(--line);
-        padding: 16px 0;
-      }
-
-      .request-step code {
-        color: var(--accent-strong);
-        font-weight: 850;
-      }
-
-      .request-step strong {
-        display: block;
-        color: var(--ink);
-        font-size: 17px;
-      }
-
-      .request-step span {
-        color: var(--muted);
-      }
-
-      .prefix-strip {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-        margin-top: 18px;
-      }
-
-      .prefix-strip code {
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        border-radius: 999px;
-        background: rgba(255, 255, 255, 0.045);
-        padding: 6px 10px;
-        color: #dffbf5;
+      .margin-note {
+        margin: 32px 0 0 58px;
+        padding: 14px 16px;
+        border-left: 3px solid var(--action);
+        background: color-mix(in srgb, var(--action-wash) 52%, transparent);
+        color: var(--body);
         font-size: 13px;
       }
 
-      .custom-models {
-        border-bottom: 1px solid var(--line);
-        background: #050807;
+      .margin-note strong {
+        color: var(--ink);
       }
 
-      .custom-model-layout {
+      .product-frame {
+        margin: 0;
+      }
+
+      .product-frame-inner {
+        overflow: hidden;
+        border: 1px solid var(--ink);
+        background: var(--code-bg);
+        box-shadow: 8px 8px 0 var(--shadow);
+      }
+
+      .product-frame img {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+
+      .product-frame figcaption {
+        margin-top: 11px;
+        color: var(--body);
+        font-size: 12px;
+      }
+
+      .product-frame figcaption::before {
+        margin-right: 7px;
+        color: var(--action);
+        content: "+";
+        font-family: var(--mono);
+        font-size: 11px;
+      }
+
+      .controls-section {
+        border-top: 1px solid var(--ink);
+        background: var(--surface);
+      }
+
+      .controls-header {
+        padding: clamp(72px, 9vw, 125px) 0 clamp(38px, 5vw, 64px);
+      }
+
+      .control-module {
         display: grid;
-        grid-template-columns: 0.92fr 1.08fr;
-        gap: 28px;
-        align-items: start;
+        grid-template-columns: minmax(285px, 0.72fr) minmax(0, 1.28fr);
+        gap: clamp(34px, 6vw, 92px);
+        align-items: center;
+        padding: clamp(46px, 6vw, 80px) 0;
+        border-top: 1px solid var(--rule);
       }
 
-      .routes {
+      .control-module:last-child {
+        border-bottom: 1px solid var(--rule);
+      }
+
+      .control-module:nth-of-type(2n) .control-copy {
+        order: 2;
+      }
+
+      .control-module:nth-of-type(2n) .control-shot {
+        order: 1;
+      }
+
+      .control-number {
+        margin: 0 0 14px;
+        color: var(--link);
+        font-family: var(--mono);
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      h3 {
+        max-width: 470px;
+        margin: 0;
+        color: var(--ink);
+        font-family: var(--sans);
+        font-size: clamp(24px, 2.25vw, 34px);
+        font-weight: 600;
+        letter-spacing: -0.035em;
+        line-height: 1.08;
+      }
+
+      .control-copy p {
+        max-width: 475px;
+        margin: 16px 0 0;
+        color: var(--body);
+      }
+
+      .control-list {
+        margin: 20px 0 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .control-list li {
+        position: relative;
+        padding: 8px 0 8px 19px;
+        border-top: 1px solid color-mix(in srgb, var(--rule-strong) 58%, transparent);
+        color: var(--body);
+        font-size: 14px;
+      }
+
+      .control-list li::before {
+        position: absolute;
+        left: 0;
+        color: var(--action);
+        content: "->";
+        font-family: var(--mono);
+      }
+
+      .compatibility-section {
+        padding: clamp(76px, 9vw, 125px) 0;
+        border-bottom: 1px solid var(--ink);
+      }
+
+      .compatibility-layout {
         display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 30px;
+        grid-template-columns: minmax(0, 0.88fr) minmax(410px, 1.12fr);
+        gap: clamp(42px, 7vw, 104px);
         align-items: start;
+        margin-top: clamp(42px, 6vw, 74px);
       }
 
-      #routing {
-        padding: 56px 0;
+      .endpoint-table {
+        margin: 0;
+        border-top: 1px solid var(--ink);
       }
 
-      .terminal pre {
+      .endpoint-table > div {
+        display: grid;
+        grid-template-columns: 108px minmax(0, 1fr);
+        gap: 15px;
+        padding: 17px 0;
+        border-bottom: 1px solid var(--rule);
+      }
+
+      .endpoint-table dt {
+        color: var(--link);
+        font-family: var(--mono);
+        font-size: 14px;
+        font-weight: 700;
+      }
+
+      .endpoint-table dd {
+        margin: 0;
+        color: var(--body);
+        font-size: 14px;
+      }
+
+      .endpoint-table strong {
+        color: var(--ink);
+      }
+
+      .endpoint-note {
+        margin: 26px 0 0;
+        color: var(--body);
+        font-size: 13px;
+      }
+
+      .code-sheet {
+        border: 1px solid var(--ink);
+        background: var(--code-bg);
+        box-shadow: 7px 7px 0 var(--action-wash);
+      }
+
+      .code-sheet header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 20px;
+        padding: 13px 15px;
+        border-bottom: 1px solid var(--code-rule);
+        color: var(--code-muted);
+        font-family: var(--mono);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.07em;
+      }
+
+      .code-sheet header span:last-child {
+        color: var(--code-label);
+      }
+
+      .code-sheet pre {
         margin: 0;
         overflow-x: auto;
-        padding: 22px;
-        color: #d7efe8;
-        font-size: 14px;
-        line-height: 1.62;
-      }
-
-      .terminal code {
-        white-space: pre-wrap;
-        overflow-wrap: anywhere;
-      }
-
-      .runtime-section {
-        border-top: 1px solid var(--line);
-        border-bottom: 1px solid var(--line);
-        background: #050807;
+        padding: 22px 20px;
+        color: var(--code-ink);
+        font-size: clamp(12px, 1.2vw, 14px);
+        line-height: 1.75;
+        white-space: pre;
       }
 
       .install-section {
-        border-bottom: 1px solid var(--line);
-        background: #07100e;
+        padding: clamp(76px, 9vw, 126px) 0;
+        background: var(--code-bg);
+        color: var(--code-ink);
+      }
+
+      .install-section .section-index {
+        color: var(--code-label);
+      }
+
+      .install-section h2 {
+        color: var(--code-ink);
+      }
+
+      .install-section .section-title p {
+        color: var(--code-muted);
       }
 
       .install-layout {
         display: grid;
-        grid-template-columns: 0.92fr 1.08fr;
-        gap: 26px;
+        grid-template-columns: minmax(0, 1fr) minmax(390px, 0.92fr);
+        gap: clamp(42px, 7vw, 100px);
         align-items: start;
+        margin-top: clamp(42px, 6vw, 74px);
       }
 
-      .install-layout > * {
-        min-width: 0;
+      .install-command {
+        border: 1px solid var(--code-rule);
+        background: var(--code-surface);
+        box-shadow: 8px 8px 0 var(--action);
       }
 
-      .install-terminal {
-        background: #101316;
-      }
-
-      .install-note {
-        margin: 14px 0 0;
-        color: var(--muted);
-        font-size: 14px;
-      }
-
-      .runtime-layout {
-        display: grid;
-        grid-template-columns: 0.92fr 1.08fr;
-        gap: 26px;
-        align-items: start;
-      }
-
-      .runtime-layout > * {
-        min-width: 0;
-      }
-
-      .runtime-terminal {
-        background: #101316;
-      }
-
-      .cta {
-        border-top: 1px solid var(--line);
-        background: #07100e;
-        color: #fff;
-      }
-
-      .cta .shell {
+      .install-command-head {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        gap: 24px;
+        gap: 14px;
+        padding: 13px 15px;
+        border-bottom: 1px solid var(--code-rule);
+        color: var(--code-muted);
+        font-family: var(--mono);
+        font-size: 11px;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
       }
 
-      .cta p {
-        margin: 12px 0 0;
-        color: rgba(255, 255, 255, 0.72);
+      .copy-button {
+        min-height: 34px;
+        border: 1px solid var(--code-rule);
+        background: transparent;
+        padding: 0 10px;
+        color: var(--code-ink);
+        cursor: pointer;
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: none;
       }
 
-      footer {
-        border-top: 1px solid rgba(255, 255, 255, 0.1);
-        background: var(--night-soft);
-        color: rgba(255, 255, 255, 0.62);
-        padding: 24px 0;
+      .copy-button:hover,
+      .copy-button[data-copy-state="copied"] {
+        border-color: var(--action);
+        background: var(--action);
+        color: var(--on-action);
+      }
+
+      .install-command pre {
+        margin: 0;
+        overflow-wrap: anywhere;
+        padding: 24px 20px 25px;
+        color: var(--code-ink);
+        font-size: clamp(12px, 1.2vw, 14px);
+        line-height: 1.75;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      .command-block + .command-block {
+        border-top: 1px solid var(--code-rule);
+      }
+
+      .command-block .install-command-head {
+        border-bottom: 1px solid var(--code-rule);
+      }
+
+      .command-block .install-command-head:last-child {
+        border-bottom: 0;
+      }
+
+      .install-command .command-block:last-child pre {
+        padding-bottom: 25px;
+      }
+
+      .install-command code {
+        display: block;
+      }
+
+      .install-command pre {
+        overflow-x: hidden;
+      }
+
+      .install-command .comment {
+        color: var(--code-muted);
+      }
+
+      .install-details {
+        margin: 0;
+        border-top: 1px solid var(--code-rule);
+      }
+
+      .install-details > div {
+        display: grid;
+        grid-template-columns: 110px minmax(0, 1fr);
+        gap: 18px;
+        padding: 16px 0;
+        border-bottom: 1px solid var(--code-rule);
+      }
+
+      .install-details dt {
+        color: var(--code-label);
+        font-family: var(--mono);
+        font-size: 12px;
+        font-weight: 600;
+      }
+
+      .install-details dd {
+        margin: 0;
+        color: var(--code-muted);
         font-size: 14px;
       }
 
-      footer .shell {
-        display: flex;
-        justify-content: space-between;
-        gap: 16px;
+      .install-details strong {
+        color: var(--code-ink);
       }
 
-      @media (max-width: 1040px) {
-        .hero {
-          min-height: 0;
+      .install-note {
+        margin: 23px 0 0;
+        color: var(--code-muted);
+        font-size: 13px;
+      }
+
+      .install-section .button-secondary {
+        border-color: var(--code-rule);
+        color: var(--code-ink);
+      }
+
+      .install-section .button-secondary:hover {
+        border-color: var(--action);
+        background: var(--action);
+        color: var(--on-action);
+      }
+
+      .closing-section {
+        padding: clamp(76px, 10vw, 142px) 0;
+        border-bottom: 1px solid var(--ink);
+      }
+
+      .closing-layout {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 35px;
+        align-items: end;
+      }
+
+      .closing-layout h2 {
+        max-width: 760px;
+      }
+
+      .closing-layout p {
+        max-width: 600px;
+        margin: 18px 0 0;
+        color: var(--body);
+        font-size: 17px;
+      }
+
+      footer {
+        padding: 24px 0 29px;
+        color: var(--muted);
+        font-family: var(--mono);
+        font-size: 11px;
+      }
+
+      .footer-inner {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 20px;
+      }
+
+      .footer-links {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 14px;
+      }
+
+      .footer-links a:hover {
+        color: var(--link);
+      }
+
+      .reveal {
+        animation: settle 620ms both cubic-bezier(0.2, 0.72, 0.22, 1);
+      }
+
+      .reveal-delay {
+        animation-delay: 100ms;
+      }
+
+      @keyframes settle {
+        from {
+          opacity: 0;
+          transform: translateY(12px);
         }
 
-        .hero::after {
-          background:
-            linear-gradient(90deg, rgba(5, 7, 6, 0.98) 0%, rgba(5, 7, 6, 0.9) 58%, rgba(5, 7, 6, 0.62) 100%),
-            linear-gradient(180deg, rgba(5, 7, 6, 0.08) 0%, rgba(5, 7, 6, 0.84) 100%);
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      @media (max-width: 960px) {
+        .primary-nav {
+          display: none;
         }
 
-        .hero-backdrop {
-          right: -64px;
-          bottom: 138px;
-          width: min(680px, 66vw);
-          opacity: 0.54;
+        .mobile-nav {
+          display: block;
         }
 
-        .hero-inner {
-          min-height: 0;
-          padding: 104px 0 148px;
+        .hero::before {
+          right: 20px;
+          width: 42vw;
+        }
+
+        .hero-grid,
+        .flow-layout,
+        .compatibility-layout,
+        .install-layout {
+          grid-template-columns: 1fr;
         }
 
         .hero-copy {
-          max-width: 680px;
+          padding-bottom: 0;
         }
 
-        h1 {
-          max-width: 680px;
-          font-size: 54px;
-          line-height: 1.02;
+        .routing-receipt {
+          width: min(100%, 610px);
+          margin-top: 4px;
+          justify-self: end;
         }
 
-        h2 {
-          font-size: 38px;
+        .flow-layout,
+        .compatibility-layout,
+        .install-layout {
+          gap: 44px;
         }
 
-        .product-grid,
-        .visual-feature,
-        .custom-model-layout,
-        .routes,
-        .architecture-layout,
-        .install-layout,
-        .runtime-layout {
+        .control-module {
           grid-template-columns: 1fr;
+          gap: 30px;
+        }
+
+        .control-module:nth-of-type(2n) .control-copy,
+        .control-module:nth-of-type(2n) .control-shot {
+          order: initial;
+        }
+
+        .control-copy {
+          max-width: 600px;
         }
       }
 
-      @media (max-width: 1040px) {
-        nav {
-          display: none;
+      @media (max-width: 680px) {
+        :root {
+          --shell: min(100% - 30px, 1180px);
         }
 
         .nav {
-          min-height: 56px;
-          gap: 10px;
+          min-height: 64px;
         }
 
-        .mobile-actions {
-          display: flex;
-          min-width: 0;
-          align-items: center;
-          justify-content: flex-end;
-          gap: 6px;
-        }
-
-        .mobile-actions a {
-          display: inline-flex;
-          min-height: 34px;
-          align-items: center;
-          justify-content: center;
-          border-radius: 8px;
-          padding: 0 9px;
-          color: rgba(255, 255, 255, 0.78);
-          font-size: 12px;
-          font-weight: 800;
-          text-decoration: none;
+        .brand {
+          font-size: 14px;
           white-space: nowrap;
         }
 
-        .mobile-actions .mobile-release {
-          border: 1px solid rgba(157, 229, 217, 0.34);
-          color: #d9fff7;
-        }
-      }
-
-      @media (max-width: 760px) {
-        .hero {
-          min-height: 0;
+        .brand-mark {
+          width: 32px;
+          height: 32px;
         }
 
-        #routing-canvas {
-          opacity: 0.44;
+        .theme-toggle {
+          min-width: 42px;
+          justify-content: center;
+          padding: 0 9px;
         }
 
-        .hero::after {
-          background:
-            linear-gradient(90deg, rgba(5, 7, 6, 0.98) 0%, rgba(5, 7, 6, 0.94) 70%, rgba(5, 7, 6, 0.84) 100%),
-            linear-gradient(180deg, rgba(5, 7, 6, 0.18) 0%, rgba(5, 7, 6, 0.94) 100%);
-        }
-
-        .hero-backdrop {
+        .theme-toggle [data-theme-label] {
           display: none;
         }
 
-        .hero-inner {
-          min-height: 0;
-          padding: 96px 0 30px;
+        .hero {
+          padding-top: 55px;
         }
 
-        .hero-copy {
-          max-width: 100%;
+        .hero::before {
+          right: 15px;
+          width: 68vw;
+          opacity: 0.65;
         }
 
         h1 {
-          max-width: 100%;
-          font-size: 42px;
-          line-height: 1;
+          font-size: clamp(48px, 14vw, 65px);
         }
 
         .lead {
-          margin-top: 22px;
           font-size: 17px;
-          line-height: 1.48;
         }
 
-        .actions {
-          gap: 10px;
-          margin-top: 28px;
+        .hero-actions,
+        .button-row {
+          display: grid;
+          grid-template-columns: 1fr;
         }
 
-        .actions .button {
-          flex: 1 1 0;
-          min-width: 0;
-          padding: 0 12px;
-        }
-
-        .surface-strip {
-          position: relative;
-          left: auto;
-          bottom: auto;
+        .button {
           width: 100%;
+        }
+
+        .routing-receipt {
+          margin-top: 24px;
+          box-shadow: 5px 5px 0 var(--action);
+        }
+
+        .receipt-title,
+        .receipt-line,
+        .receipt-footer {
+          padding-right: 14px;
+          padding-left: 14px;
+        }
+
+        .receipt-line {
+          grid-template-columns: 72px minmax(0, 1fr);
+          gap: 10px;
+        }
+
+        .surface-index {
           grid-template-columns: repeat(2, minmax(0, 1fr));
-          border-right: 0;
-          border-left: 0;
-          border-radius: 0;
-          transform: none;
+          margin-top: 36px;
         }
 
-        .mobile-proof {
-          display: block;
-          margin-top: -8px;
+        .surface-index > div:nth-child(3) {
+          border-left: 1px solid var(--ink);
         }
 
-        .surface-route {
-          padding: 10px 16px;
+        .surface-index > div:nth-child(-n + 2) {
+          border-bottom: 1px solid var(--ink);
         }
 
-        .hero-signals {
-          gap: 8px;
-          margin-top: 20px;
+        .section-intro {
+          grid-template-columns: 1fr;
+          gap: 12px;
         }
 
-        .hero-signal {
-          min-height: 32px;
-          font-size: 12px;
-        }
-
-        section {
-          padding: 46px 0;
-        }
-
-        .section-head {
-          margin-bottom: 24px;
+        .flow-section,
+        .compatibility-section,
+        .install-section,
+        .closing-section {
+          padding-top: 72px;
+          padding-bottom: 72px;
         }
 
         h2 {
-          font-size: 30px;
-          line-height: 1.06;
+          font-size: clamp(38px, 11vw, 52px);
         }
 
-        .section-head p {
-          font-size: 16px;
+        .margin-note {
+          margin-left: 0;
         }
 
-        .feature-list {
-          grid-template-columns: 1fr;
-        }
-
-        .feature-ledger-row,
-        .endpoint-row,
-        .request-step,
-        .runtime-row,
-        .workflow-step {
+        .endpoint-table > div,
+        .install-details > div {
           grid-template-columns: 1fr;
           gap: 6px;
-          padding: 14px 0;
         }
 
-        .feature-group summary {
-          min-height: 52px;
-          padding: 0 14px;
+        .code-sheet,
+        .install-command {
+          box-shadow: 5px 5px 0 var(--action-wash);
         }
 
-        .feature-group summary span {
-          flex: 1 1 auto;
+        .install-command {
+          box-shadow: 5px 5px 0 var(--action);
         }
 
-        .feature-group summary small {
-          display: none;
+        .install-command-head {
+          align-items: flex-start;
+          flex-direction: column;
         }
 
-        .feature-group summary::after {
-          flex: 0 0 28px;
+        .copy-button {
+          min-height: 43px;
+          padding: 0 12px;
+          font-size: 13px;
         }
 
-        .proof-section .product-copy {
-          order: -1;
-          gap: 14px;
+        .closing-layout {
+          grid-template-columns: 1fr;
+          align-items: start;
         }
 
-        .dashboard-shot {
-          display: none;
-        }
-
-        .visual-feature {
-          gap: 16px;
-          padding: 22px 0;
-        }
-
-        .visual-copy h3 {
-          font-size: 23px;
-        }
-
-        .visual-copy p {
-          font-size: 16px;
-        }
-
-        .visual-shot img {
-          width: 100%;
-          max-height: none;
-        }
-
-        .custom-models .feature-ledger {
-          display: none;
-        }
-
-        #routing .terminal {
-          display: none;
-        }
-
-        .runtime-terminal {
-          display: none;
-        }
-
-        #routing {
-          padding: 44px 0;
-        }
-
-        .cta .shell,
-        footer .shell {
-          display: grid;
-        }
-      }
-
-      @media (max-width: 360px) {
-        .shell {
-          width: min(1160px, calc(100% - 28px));
-        }
-
-        .brand-name {
-          display: none;
-        }
-
-        .mobile-actions a {
-          padding: 0 8px;
-        }
-
-        .hero-inner {
-          padding-top: 78px;
-        }
-
-        .eyebrow {
-          margin-bottom: 14px;
-          padding: 6px 9px;
-          font-size: 12px;
-        }
-
-        h1 {
-          font-size: 34px;
-        }
-
-        .lead {
-          margin-top: 18px;
-          font-size: 16px;
-          line-height: 1.42;
-        }
-
-        .actions {
-          margin-top: 22px;
-        }
-
-        .hero-signals {
-          margin-top: 18px;
-        }
-
-        .actions .button {
-          flex-basis: 100%;
-        }
-
-        .surface-route {
-          padding: 10px 12px;
-        }
-
-        .surface-route code {
-          font-size: 21px;
-        }
-
-        .surface-route span {
-          font-size: 12px;
-          line-height: 1.28;
+        .footer-inner {
+          align-items: flex-start;
+          flex-direction: column;
         }
       }
 
@@ -1307,648 +1376,505 @@
         *,
         *::before,
         *::after {
+          scroll-behavior: auto !important;
           animation-duration: 0.001ms !important;
           animation-iteration-count: 1 !important;
-          scroll-behavior: auto !important;
           transition-duration: 0.001ms !important;
         }
       }
     </style>
   </head>
   <body>
-    <header>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+
+    <header class="site-header">
       <div class="shell nav">
         <a class="brand" href="#top" aria-label="IO Gateway home">
           <span class="brand-mark" aria-hidden="true">IO</span>
-          <span class="brand-name">IO Gateway</span>
+          <span>IO Gateway</span>
         </a>
-        <nav aria-label="Primary">
-          <a href="#unique">Features</a>
-          <a href="#dashboard">Dashboard</a>
-          <a href="#showcase">Controls</a>
-          <a href="#workflow">Workflow</a>
-          <a href="#custom-models">Custom</a>
-          <a href="#routing">Routing</a>
-          <a href="#install">Install</a>
-          <a href="#runtime">Runtime</a>
-          <a href="/docs/">Docs</a>
-          <a href="https://github.com/giofahreza/io-gateway">GitHub</a>
-          <a class="nav-cta" href="https://github.com/giofahreza/io-gateway/releases">Releases</a>
-        </nav>
-        <div class="mobile-actions" aria-label="Quick links">
-          <a href="#unique">Features</a>
-          <a href="/docs/">Docs</a>
-          <a class="mobile-release" href="https://github.com/giofahreza/io-gateway/releases">Release</a>
+        <div class="nav-actions">
+          <nav class="primary-nav" aria-label="Primary navigation">
+            <a href="#flow">How it works</a>
+            <a href="#controls">Controls</a>
+            <a href="#compatibility">Endpoints</a>
+            <a href="#install">Install</a>
+            <a href="/docs/">Docs</a>
+            <a href="https://github.com/giofahreza/io-gateway">GitHub</a>
+            <a class="nav-release" href="https://github.com/giofahreza/io-gateway/releases">Releases</a>
+          </nav>
+          <button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false" aria-label="Switch theme">
+            <span class="theme-toggle-mark" aria-hidden="true">◐</span>
+            <span data-theme-label>Theme</span>
+          </button>
+          <nav class="mobile-nav" aria-label="Mobile navigation">
+            <details class="menu">
+              <summary>Menu</summary>
+              <div class="menu-panel">
+                <a href="#flow">How it works</a>
+                <a href="#controls">Controls</a>
+                <a href="#compatibility">Endpoints</a>
+                <a href="#install">Install</a>
+                <a href="/docs/">Docs</a>
+                <a href="https://github.com/giofahreza/io-gateway">GitHub</a>
+                <a href="https://github.com/giofahreza/io-gateway/releases">Releases</a>
+              </div>
+            </details>
+          </nav>
         </div>
       </div>
     </header>
 
-    <section class="hero" id="top" aria-labelledby="hero-title">
-      <canvas id="routing-canvas" aria-hidden="true"></canvas>
-      <div class="hero-backdrop" aria-hidden="true">
-        <img src="/assets/dashboard-real.png?v=20260728-1703" alt="">
-      </div>
-      <div class="shell hero-inner">
-        <div class="hero-copy">
-          <p class="eyebrow">Self-hosted Rust AI gateway</p>
-          <h1 id="hero-title">IO Gateway for /v1, /codex, and /claude.</h1>
-          <p class="lead">
-            Run Codex, Claude, Gemini, Qwen, Copilot, GLM, and API-key accounts behind
-            one server. Route traffic, drain priority accounts to quota, and keep client
-            keys bounded without exposing upstream credentials.
-          </p>
-          <div class="hero-signals" aria-label="Gateway capabilities">
-            <span class="hero-signal">OpenAI-compatible clients</span>
-            <span class="hero-signal">Priority drain mode</span>
-            <span class="hero-signal">One-command desktop install</span>
-          </div>
-          <div class="actions">
-            <a class="button primary" href="#install">Install locally</a>
-            <a class="button secondary" href="/docs/">Read Docs</a>
-          </div>
-        </div>
-      </div>
-      <div class="shell mobile-proof" aria-label="Compact dashboard preview">
-        <div class="product-shot-frame">
-          <img src="/assets/dashboard-real.png?v=20260728-1703" alt="">
-        </div>
-      </div>
-      <div class="surface-strip" aria-label="Client endpoint surfaces">
-        <div class="surface-route">
-          <code>/v1</code>
-          <span>OpenAI-compatible SDKs, tools, Responses, Chat Completions, and models.</span>
-        </div>
-        <div class="surface-route">
-          <code>/codex</code>
-          <span>Codex-style response sessions with gateway-side account selection.</span>
-        </div>
-        <div class="surface-route">
-          <code>/claude</code>
-          <span>Anthropic-style messages through the same key and routing controls.</span>
-        </div>
-        <div class="surface-route">
-          <code>ctm:</code>
-          <span>Custom aliases backed by ordered provider targets and fallback rules.</span>
-        </div>
-      </div>
-    </section>
-
-    <main>
-      <section class="unique-section" id="unique" aria-labelledby="features-title">
-        <div class="shell">
-          <div class="section-head unique-head">
-            <span class="unique-kicker">Account operations</span>
-            <h2 id="features-title">Account policy before every request.</h2>
-            <p>
-              These controls matter when several upstream accounts share one client-facing
-              gateway and traffic needs predictable dispatch rules.
+    <main id="main-content">
+      <section class="hero" id="top" aria-labelledby="hero-title">
+        <div class="shell hero-grid">
+          <div class="hero-copy reveal">
+            <p class="eyebrow">Self-hosted request routing · Rust</p>
+            <h1 id="hero-title">One local endpoint for the AI accounts you already use.</h1>
+            <p class="lead">
+              IO Gateway accepts <strong>OpenAI-compatible, Codex, and Claude</strong> client traffic,
+              applies the route rules you set, then selects an eligible upstream account without
+              putting its credentials in a client configuration.
+            </p>
+            <div class="hero-actions">
+              <a class="button button-primary" href="#install">Install locally</a>
+              <a class="button button-secondary" href="/docs/">Read the docs</a>
+            </div>
+            <p class="hero-notes" aria-label="Key properties">
+              <span>localhost by default</span>
+              <span>native desktop releases</span>
+              <span>real account state in the dashboard</span>
             </p>
           </div>
-          <div class="feature-ledger" aria-label="IO Gateway operator features">
-            <div class="feature-ledger-row">
-              <strong>Priority drain to quota</strong>
-              <span>Mark one or more accounts as <code>Use first</code>. IO Gateway sends traffic there until the account is disabled, cooling down, unavailable, or fully used.</span>
-            </div>
-            <div class="feature-ledger-row">
-              <strong>Prompt limits at three scopes</strong>
-              <span>Set estimated prompt-token ceilings for a client key globally, per provider, or per upstream account before a request is dispatched.</span>
-            </div>
-            <div class="feature-ledger-row">
-              <strong>Provider-aware account setup</strong>
-              <span>Add Codex, Claude, Gemini, Qwen, Grok, Copilot, GLM, and direct API-key accounts through provider-specific flows.</span>
-            </div>
-            <div class="feature-ledger-row">
-              <strong>Route aliases</strong>
-              <span>Create <code>ctm:</code> models with provider targets, weights, fallback steps, account targeting, and dashboard test checks.</span>
-            </div>
-            <div class="feature-ledger-row">
-              <strong>Operator signals</strong>
-              <span>Use quota snapshots, cooldown state, recent errors, usage history, and notifications as routing and maintenance inputs.</span>
-            </div>
-          </div>
-          <div class="feature-map" aria-label="Expandable IO Gateway feature index">
-            <details class="feature-group">
-              <summary><span>Routing policy</span><small>priority, fallback, cooldowns</small></summary>
-              <ul class="feature-list">
-                <li><b>Use-first accounts</b> Drain selected accounts before the normal pool.</li>
-                <li><b>Disabled account guard</b> Priority is ignored automatically when an account is disabled.</li>
-                <li><b>Quota-aware fallback</b> Skip unavailable, cooling-down, or exhausted routes.</li>
-                <li><b>Weighted custom targets</b> Spread aliases across providers and accounts.</li>
-              </ul>
-            </details>
-            <details class="feature-group">
-              <summary><span>Access control</span><small>client keys and prompt ceilings</small></summary>
-              <ul class="feature-list compact">
-                <li><b>Whole-key limit</b> Cap estimated prompt tokens for everything a key can send.</li>
-                <li><b>Provider limit</b> Apply different ceilings to Codex, Claude, Gemini, and other providers.</li>
-                <li><b>Account limit</b> Protect individual upstream accounts from oversized prompts.</li>
-                <li><b>Scoped routes</b> Restrict keys to specific providers, accounts, or model aliases.</li>
-              </ul>
-            </details>
-            <details class="feature-group">
-              <summary><span>Operator console</span><small>setup, testing, notifications</small></summary>
-              <ul class="feature-list">
-                <li><b>Provider onboarding</b> Keep login, browser-token, and API-key setup in the dashboard.</li>
-                <li><b>Test API workspace</b> Verify provider routes and <code>ctm:</code> aliases before publishing them.</li>
-                <li><b>Usage windows</b> Inspect requests, errors, cache, reasoning, and output usage.</li>
-                <li><b>Notifications</b> Surface quota, cooldown, and provider health events for operators.</li>
-              </ul>
-            </details>
-          </div>
-        </div>
-      </section>
 
-      <section class="proof-section" id="dashboard" aria-labelledby="dashboard-title">
-        <div class="shell product-grid">
-          <figure class="product-shot dashboard-shot">
-            <div class="product-shot-frame">
-              <img src="/assets/dashboard-real.png?v=20260728-1703" alt="IO Gateway dashboard showing usage totals, context usage chart, custom models, and provider account panels.">
+          <aside class="routing-receipt reveal reveal-delay" aria-label="Example gateway routing receipt">
+            <div class="receipt-title">
+              <span>Route receipt / example</span>
+              <span class="receipt-status">eligible</span>
             </div>
-            <figcaption>Real dashboard screenshot from a local IO Gateway instance.</figcaption>
-          </figure>
-          <div class="product-copy">
-            <div class="section-head">
-              <h2 id="dashboard-title">The dashboard is the control plane.</h2>
-              <p>
-                Users call the gateway. Operators keep provider credentials private and manage
-                accounts, keys, custom models, usage, and notifications from a local UI.
-              </p>
-            </div>
-            <ul class="plain-points">
-              <li><b>Add accounts</b> OAuth, device login, browser-token fallback, and API-key entry stay inside the operator surface.</li>
-              <li><b>Test before routing</b> The toolbar Test API action sits next to Add account and sends prompts through provider routes or <code>ctm:</code> aliases.</li>
-              <li><b>Bound client access</b> API keys can be scoped by provider, account, and prompt size.</li>
-            </ul>
-          </div>
-        </div>
-      </section>
-
-      <section class="showcase-section" id="showcase" aria-labelledby="showcase-title">
-        <div class="shell">
-          <div class="section-head">
-            <span class="unique-kicker">Product controls</span>
-            <h2 id="showcase-title">Every routing claim has an operator view.</h2>
-            <p>
-              The dashboard exposes account priority, quota state, key limits, custom routes,
-              and route testing as concrete controls instead of hidden config-only behavior.
-            </p>
-          </div>
-          <div class="visual-stack" aria-label="IO Gateway product screenshots">
-            <article class="visual-feature">
-              <figure class="visual-shot">
-                <div class="product-shot-frame">
-                  <img src="/assets/priority-usage-detail.png?v=20260728-1737" alt="Codex account cards showing enabled, disabled, priority, near-quota, reset limit, and quota bar states.">
-                </div>
-              </figure>
-              <div class="visual-copy">
-                <span class="unique-kicker">Priority usage</span>
-                <h3>Spend selected accounts first, then leave the rest as fallback.</h3>
-                <p>
-                  Priority accounts are visible on the same cards that show quota, disabled
-                  state, reset availability, recent errors, and model availability.
-                </p>
-                <ul class="visual-points">
-                  <li>Use-first accounts show a visible Priority badge.</li>
-                  <li>Disabled accounts stay visible but leave routing automatically.</li>
-                  <li>Quota bars make exhausted and near-limit accounts obvious.</li>
-                </ul>
+            <dl>
+              <div class="receipt-line">
+                <dt>request</dt>
+                <dd>POST /v1/responses<small>client key: production-bot · model: ctm:workhorse</small></dd>
               </div>
-            </article>
-            <article class="visual-feature">
-              <figure class="visual-shot">
-                <div class="product-shot-frame">
-                  <img src="/assets/api-key-limits.png?v=20260728-1731" alt="API key settings showing whole-key, provider-level, and account-level prompt token limits.">
-                </div>
-              </figure>
-              <div class="visual-copy">
-                <span class="unique-kicker">Scoped client keys</span>
-                <h3>Limit prompts globally, by provider, or by individual account.</h3>
-                <p>
-                  Managed API keys can expose only the providers and accounts a client should
-                  reach, with prompt ceilings applied before dispatch.
-                </p>
-                <ul class="visual-points">
-                  <li>Whole-key prompt token limit protects every route behind that key.</li>
-                  <li>Provider limits let Codex, Qwen, Claude, and Gemini use different ceilings.</li>
-                  <li>Account limits protect a single upstream account from oversized requests.</li>
-                </ul>
+              <div class="receipt-line">
+                <dt>policy</dt>
+                <dd>key scope → prompt ceiling → route rules<small>disabled accounts, cooldowns, and unavailable quota are excluded</small></dd>
               </div>
-            </article>
-            <article class="visual-feature">
-              <figure class="visual-shot">
-                <div class="product-shot-frame">
-                  <img src="/assets/custom-model-routing-detail.png?v=20260728-1737" alt="Custom model card showing a ctm alias with weighted provider targets and fallback steps.">
-                </div>
-              </figure>
-              <div class="visual-copy">
-                <span class="unique-kicker">Custom model routes</span>
-                <h3>Publish stable <code>ctm:</code> aliases over changing provider pools.</h3>
-                <p>
-                  A custom model is a route policy: ordered steps, weighted targets, exact
-                  account targeting, exclusions, and provider fallback in one dashboard card.
-                </p>
-                <ul class="visual-points">
-                  <li>Expose a stable alias while changing providers behind it.</li>
-                  <li>Combine Codex, Qwen, Claude, Gemini, and other targets in one route.</li>
-                  <li>Use fallback steps when the first account is cooling down or out of quota.</li>
-                </ul>
+              <div class="receipt-line result">
+                <dt>selected</dt>
+                <dd>cod:gpt-5<small>priority account ready; fallback remains available</small></dd>
               </div>
-            </article>
-            <article class="visual-feature">
-              <figure class="visual-shot">
-                <div class="product-shot-frame">
-                  <img src="/assets/test-api-workspace.png?v=20260728-1731" alt="Test API panel showing a custom model request and successful response with latency and raw response details.">
-                </div>
-              </figure>
-              <div class="visual-copy">
-                <span class="unique-kicker">Route testing</span>
-                <h3>Send a real prompt through a route before handing it to clients.</h3>
-                <p>
-                  Test API uses the dashboard session to exercise the same routing path clients
-                  use, then returns status, latency, selected model, output, and raw response.
-                </p>
-                <ul class="visual-points">
-                  <li>Test direct provider models or <code>ctm:</code> aliases.</li>
-                  <li>Validate prompt, instructions, and output ceiling from the UI.</li>
-                  <li>Confirm successful routing before publishing client keys.</li>
-                </ul>
+              <div class="receipt-line">
+                <dt>relay</dt>
+                <dd>stream returned to client<small>usage, failures, and account state remain visible to the operator</small></dd>
               </div>
-            </article>
-          </div>
-        </div>
-      </section>
-
-      <section class="architecture-section" id="architecture" aria-labelledby="architecture-title">
-        <div class="shell architecture-layout">
-          <div class="section-head">
-            <span class="unique-kicker">Request flow</span>
-            <h2 id="architecture-title">Clients never talk to upstream accounts directly.</h2>
-            <p>
-              IO Gateway is the boundary. It receives client traffic, applies key limits and
-              routing policy, then selects an eligible provider account.
-            </p>
-          </div>
-          <div aria-label="Gateway request architecture">
-            <ol class="request-stack">
-              <li class="request-step">
-                <code>01</code>
-                <span><strong>Authenticate the client key</strong> Reject disabled keys and enforce prompt-token ceilings before dispatch.</span>
-              </li>
-              <li class="request-step">
-                <code>02</code>
-                <span><strong>Resolve the requested surface</strong> Normalize <code>/v1</code>, <code>/codex</code>, <code>/claude</code>, and <code>ctm:</code> aliases into route intent.</span>
-              </li>
-              <li class="request-step">
-                <code>03</code>
-                <span><strong>Select an eligible account</strong> Prefer priority accounts, skip disabled accounts automatically, then check quota, cooldown, and route scope.</span>
-              </li>
-              <li class="request-step">
-                <code>04</code>
-                <span><strong>Relay the stream</strong> Send the request upstream and keep usage, error, and notification state tied to the selected account.</span>
-              </li>
-            </ol>
-            <div class="prefix-strip" aria-label="Provider model prefixes">
-              <code>cod:</code>
-              <code>cld:</code>
-              <code>gem:</code>
-              <code>qwn:</code>
-              <code>glm:</code>
-              <code>ctm:</code>
+            </dl>
+            <div class="receipt-footer">
+              <span>upstream key remains private</span>
+              <span>route is inspectable</span>
+              <span>fallback is explicit</span>
             </div>
-          </div>
+          </aside>
         </div>
-      </section>
 
-      <section id="workflow" aria-labelledby="workflow-title">
-        <div class="shell">
-          <div class="section-head">
-            <h2 id="workflow-title">Daily operation stays inside the dashboard.</h2>
-            <p>
-              Connect accounts, publish one gateway URL, then keep routing policy and client
-              access inside the dashboard.
-            </p>
-          </div>
-          <ol class="workflow-list" aria-label="Operator workflow">
-            <li class="workflow-step">
-              <code>01</code>
-              <span><strong>Add provider accounts</strong> Save subscription, consumer, and API-key credentials on your own server.</span>
-            </li>
-            <li class="workflow-step">
-              <code>02</code>
-              <span><strong>Choose priority accounts</strong> Mark one or more accounts as <code>Use first</code>; disabled accounts leave the priority path automatically.</span>
-            </li>
-            <li class="workflow-step">
-              <code>03</code>
-              <span><strong>Issue bounded client keys</strong> Set prompt-token ceilings for each key globally, by provider, or by account.</span>
-            </li>
-            <li class="workflow-step">
-              <code>04</code>
-              <span><strong>Watch quota and errors</strong> Use health, usage windows, cooldowns, reset timing, and alerts to act before failures.</span>
-            </li>
-          </ol>
-        </div>
-      </section>
-
-      <section class="custom-models" id="custom-models" aria-labelledby="custom-models-title">
-        <div class="shell custom-model-layout">
+        <div class="shell surface-index" aria-label="Client surfaces">
           <div>
-            <div class="section-head">
-              <h2 id="custom-models-title">Custom models are routing rules, not another model list.</h2>
-              <p>
-                A <code>ctm:</code> alias is a stable client name backed by ordered provider
-                targets, account selection, load balancing, and fallback.
-              </p>
-            </div>
-            <div class="feature-ledger" aria-label="Custom model controls">
-              <div class="feature-ledger-row">
-                <strong>Stable aliases</strong>
-                <span>Expose names like <code>ctm:research</code> or <code>ctm:coding</code> instead of leaking provider-specific model IDs.</span>
-              </div>
-              <div class="feature-ledger-row">
-                <strong>Ordered fallback</strong>
-                <span>Move to the next target when a provider is cooling down, out of quota, or unavailable.</span>
-              </div>
-              <div class="feature-ledger-row">
-                <strong>Account targeting</strong>
-                <span>Point one alias at selected providers, selected accounts, priority pools, or mixed provider chains.</span>
-              </div>
-            </div>
+            <code>/v1</code>
+            <span>OpenAI-compatible SDKs and tools</span>
           </div>
-          <div class="terminal" aria-label="Custom model route example">
-            <div class="window-bar">
-              <span></span><span></span><span></span>
-            </div>
-            <pre><code>model: ctm:research
-
-1. cld:claude-sonnet
-   account: claude-primary
-   mode: prefer if ready
-
-2. gem:gemini-pro
-   account: gemini-shared
-   mode: fallback
-
-3. glm:glm-4.5
-   mode: last resort</code></pre>
+          <div>
+            <code>/codex</code>
+            <span>Codex-style response sessions</span>
+          </div>
+          <div>
+            <code>/claude</code>
+            <span>Anthropic-style messages</span>
+          </div>
+          <div>
+            <code>ctm:</code>
+            <span>Stable aliases over changing targets</span>
           </div>
         </div>
       </section>
 
-      <section id="routing" aria-labelledby="routing-title">
-        <div class="shell routes">
-          <div>
-            <div class="section-head">
-              <h2 id="routing-title">Three client surfaces, one gateway.</h2>
+      <section class="flow-section" id="flow" aria-labelledby="flow-title">
+        <div class="shell">
+          <div class="section-intro">
+            <p class="section-index">01 / route</p>
+            <div class="section-title">
+              <h2 id="flow-title">The first decision happens before traffic leaves your machine.</h2>
               <p>
-                Point OpenAI-compatible tools, Codex clients, and Claude clients at the same
-                server while routing providers and accounts behind it.
+                A request is checked against the client key and route policy first. Only then does
+                IO Gateway choose a provider account that can actually take the work.
               </p>
             </div>
-            <div class="endpoint-ledger" aria-label="Client endpoint surfaces">
-              <div class="endpoint-row">
-                <code>/v1</code>
-                <span><strong>OpenAI-compatible clients</strong> Responses, Chat Completions, Models, and <code>ctm:</code> aliases from familiar SDKs and tools.</span>
+          </div>
+
+          <div class="flow-layout">
+            <div>
+              <dl class="request-ledger">
+                <div class="request-row">
+                  <dt>01</dt>
+                  <dd><strong>Authenticate the client key</strong><span>Reject disabled keys and apply whole-key, provider, or account prompt limits before dispatch.</span></dd>
+                </div>
+                <div class="request-row">
+                  <dt>02</dt>
+                  <dd><strong>Resolve the intended route</strong><span>Normalize the client surface and turn direct models or <code>ctm:</code> aliases into a route intent.</span></dd>
+                </div>
+                <div class="request-row">
+                  <dt>03</dt>
+                  <dd><strong>Select an eligible account</strong><span>Prefer marked accounts, then account for quota, cooldown, scope, availability, and fallback order.</span></dd>
+                </div>
+                <div class="request-row">
+                  <dt>04</dt>
+                  <dd><strong>Relay and record the outcome</strong><span>Stream the response back while preserving the selected account’s usage, error, and notification state.</span></dd>
+                </div>
+              </dl>
+              <aside class="margin-note">
+                <strong>The gateway is the boundary.</strong> Clients get one scoped key; provider
+                credentials stay in the local operator surface.
+              </aside>
+            </div>
+
+            <figure class="product-frame">
+              <div class="product-frame-inner">
+                <img
+                  src="/assets/dashboard-real.png?v=20260728-1703"
+                  alt="IO Gateway dashboard with account panels, custom models, usage data, and routing controls."
+                  width="1440"
+                  height="1280"
+                  loading="lazy"
+                  decoding="async"
+                >
               </div>
-              <div class="endpoint-row">
-                <code>/codex</code>
-                <span><strong>Codex-style sessions</strong> Codex response and model routes with gateway-side account selection and quota state.</span>
-              </div>
-              <div class="endpoint-row">
-                <code>/claude</code>
-                <span><strong>Claude-compatible clients</strong> Anthropic-style messages through the same account, key, notification, and routing controls.</span>
-              </div>
+              <figcaption>Actual local dashboard: accounts, route aliases, usage, and operator actions in one place.</figcaption>
+            </figure>
+          </div>
+        </div>
+      </section>
+
+      <section class="controls-section" id="controls" aria-labelledby="controls-title">
+        <div class="shell">
+          <div class="controls-header section-intro">
+            <p class="section-index">02 / controls</p>
+            <div class="section-title">
+              <h2 id="controls-title">The route is a policy you can inspect, not a hopeful fallback list.</h2>
+              <p>
+                The dashboard puts the inputs to routing in front of the operator: which accounts
+                run first, which clients can ask for what, and how a stable custom route behaves.
+              </p>
             </div>
           </div>
-          <div class="terminal" aria-label="Client base URL examples">
-            <div class="window-bar">
-              <span></span><span></span><span></span>
+
+          <article class="control-module">
+            <div class="control-copy">
+              <p class="control-number">A / priority accounts</p>
+              <h3>Use the accounts you choose first—without sending work to one that is unavailable.</h3>
+              <p>
+                Mark a provider account as priority when you want it drained before the ordinary
+                pool. Its current status still matters, so a disabled, cooling-down, or exhausted
+                account is skipped instead of becoming a dead end.
+              </p>
+              <ul class="control-list">
+                <li>Priority changes selection order, not the safety checks.</li>
+                <li>Usage windows and reset points stay visible next to the account.</li>
+                <li>Fallback accounts are explicit when the first choice cannot run.</li>
+              </ul>
             </div>
-            <pre><code>OPENAI_BASE_URL=http://127.0.0.1:8319/v1
+            <figure class="product-frame control-shot">
+              <div class="product-frame-inner">
+                <img
+                  src="/assets/priority-usage-detail.png?v=20260728-1737"
+                  alt="Provider account cards showing priority, enabled, quota, and reset states."
+                  width="840"
+                  height="400"
+                  loading="lazy"
+                  decoding="async"
+                >
+              </div>
+              <figcaption>Priority and quota state shown together, where the decision is made.</figcaption>
+            </figure>
+          </article>
+
+          <article class="control-module">
+            <div class="control-copy">
+              <p class="control-number">B / client keys</p>
+              <h3>A client key is a bounded contract, not a pass-through credential.</h3>
+              <p>
+                Give each client access only to the providers, accounts, and request sizes that
+                make sense. The gateway performs those checks before upstream accounts see a prompt.
+              </p>
+              <ul class="control-list">
+                <li>Set a whole-key prompt ceiling for every route behind a key.</li>
+                <li>Apply different limits for a provider or a single account.</li>
+                <li>Restrict a key to direct targets or selected custom aliases.</li>
+              </ul>
+            </div>
+            <figure class="product-frame control-shot">
+              <div class="product-frame-inner">
+                <img
+                  src="/assets/api-key-limits.png?v=20260728-1737"
+                  alt="API-key editing screen with provider and account prompt limits."
+                  width="864"
+                  height="776"
+                  loading="lazy"
+                  decoding="async"
+                >
+              </div>
+              <figcaption>Limits can be scoped globally, per provider, or per account.</figcaption>
+            </figure>
+          </article>
+
+          <article class="control-module">
+            <div class="control-copy">
+              <p class="control-number">C / custom routes</p>
+              <h3>Publish a stable name while the provider pool behind it changes.</h3>
+              <p>
+                A <code>ctm:</code> model is a routing rule rather than another provider list:
+                ordered steps, weighted targets, exact account selection, exclusions, and fallback.
+              </p>
+              <ul class="control-list">
+                <li>Keep a familiar client-facing model name during provider changes.</li>
+                <li>Mix provider targets and account-specific steps in one alias.</li>
+                <li>Test the same route a client will use before publishing its key.</li>
+              </ul>
+            </div>
+            <figure class="product-frame control-shot">
+              <div class="product-frame-inner">
+                <img
+                  src="/assets/custom-model-routing-detail.png?v=20260728-1737"
+                  alt="Custom model route with weighted provider targets and fallback steps."
+                  width="705"
+                  height="343"
+                  loading="lazy"
+                  decoding="async"
+                >
+              </div>
+              <figcaption>A custom model route describes the selection policy in the operator UI.</figcaption>
+            </figure>
+          </article>
+        </div>
+      </section>
+
+      <section class="compatibility-section" id="compatibility" aria-labelledby="compatibility-title">
+        <div class="shell">
+          <div class="section-intro">
+            <p class="section-index">03 / endpoints</p>
+            <div class="section-title">
+              <h2 id="compatibility-title">Keep the client surface familiar. Change the route behind it.</h2>
+              <p>
+                Point the tool you already use at a localhost base URL. IO Gateway keeps the
+                compatible protocol edge separate from provider choice and account state.
+              </p>
+            </div>
+          </div>
+
+          <div class="compatibility-layout">
+            <div>
+              <dl class="endpoint-table" aria-label="Gateway endpoints">
+                <div>
+                  <dt>/v1</dt>
+                  <dd><strong>OpenAI-compatible clients.</strong> Responses, Chat Completions, Models, and direct or custom model routes.</dd>
+                </div>
+                <div>
+                  <dt>/codex</dt>
+                  <dd><strong>Codex-style sessions.</strong> Gateway account selection and quota state behind a dedicated Codex surface.</dd>
+                </div>
+                <div>
+                  <dt>/claude</dt>
+                  <dd><strong>Anthropic-style messages.</strong> The same local key, routing policy, and operator controls.</dd>
+                </div>
+                <div>
+                  <dt>ctm:</dt>
+                  <dd><strong>Custom aliases.</strong> A stable model reference backed by the ordered targets and fallbacks you decide.</dd>
+                </div>
+              </dl>
+              <p class="endpoint-note">
+                Supported provider prefixes include <code>cod:</code>, <code>cld:</code>, <code>gem:</code>,
+                <code>qwn:</code>, <code>glm:</code>, and <code>ctm:</code>.
+              </p>
+            </div>
+
+            <aside class="code-sheet" aria-label="Local client base URL examples">
+              <header>
+                <span>Client configuration</span>
+                <span>localhost</span>
+              </header>
+              <pre><code>OPENAI_BASE_URL=http://127.0.0.1:8319/v1
 CODEX_BASE_URL=http://127.0.0.1:8319/codex
 ANTHROPIC_BASE_URL=http://127.0.0.1:8319/claude
 
 POST /v1/responses
 POST /codex/responses
 POST /claude/v1/messages</code></pre>
+            </aside>
           </div>
         </div>
       </section>
 
       <section class="install-section" id="install" aria-labelledby="install-title">
-        <div class="shell install-layout">
-          <div>
-            <div class="section-head">
-              <span class="unique-kicker">Desktop install</span>
-              <h2 id="install-title">Install without building Rust.</h2>
-              <p>
-                Release installers select the native build for your computer, verify its
-                checksum, retain an existing configuration and credential directory, and guide a
-                new local install through its port, terminal-client, and autostart choices.
-              </p>
-            </div>
-            <div class="runtime-spec" aria-label="Release installer details">
-              <div class="runtime-row">
-                <code>Linux / macOS</code>
-                <span><strong>One shell command</strong> Native x86_64 and ARM64 archives; Linux targets 64-bit glibc distributions.</span>
-              </div>
-              <div class="runtime-row">
-                <code>Windows</code>
-                <span><strong>One PowerShell command</strong> Native x86_64 and ARM64 ZIP releases, installed for the current user.</span>
-              </div>
-              <div class="runtime-row">
-                <code>first run</code>
-                <span><strong>Choose what matters</strong> Pick a local port, install the optional <code>iogw</code> terminal TUI or not, and enable a systemd user service, LaunchAgent, or Windows Scheduled Task at sign-in.</span>
-              </div>
-              <div class="runtime-row">
-                <code>safe default</code>
-                <span><strong>Local only</strong> The generated config binds to <code>127.0.0.1</code>; configure administrator authentication before exposing it.</span>
-              </div>
-            </div>
-          </div>
-          <div>
-            <div class="terminal install-terminal" aria-label="One-command installation">
-              <div class="window-bar">
-                <span></span><span></span><span></span>
-              </div>
-              <pre><code># Linux / macOS
-bash -c 'set -o pipefail; curl -fsSL https://github.com/giofahreza/io-gateway/releases/latest/download/install.sh | sh'
-
-# Windows PowerShell
-irm https://github.com/giofahreza/io-gateway/releases/latest/download/install.ps1 | iex</code></pre>
-            </div>
-            <p class="install-note">
-              Every release includes verified archives, both installers, and <code>SHA256SUMS</code>. The Bash wrapper also preserves a failed download exit status.
-              In an interactive terminal, the Unix installer reads answers from <code>/dev/tty</code>, so its questions work with the download pipe. Use <code>--port</code>, <code>--with-iogw</code> / <code>--without-iogw</code>, <code>--autostart</code> / <code>--no-autostart</code>, and <code>--non-interactive</code> for automation; PowerShell provides matching <code>-Port</code>, <code>-InstallIogw</code> / <code>-NoIogw</code>, <code>-AutoStart</code> / <code>-NoAutoStart</code>, and <code>-NonInteractive</code> options.
-            </p>
-            <div class="actions">
-              <a class="button secondary" href="/docs/quick-start/">Read the installation guide</a>
-              <a class="button secondary" href="https://github.com/giofahreza/io-gateway/releases">Browse releases</a>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <section class="runtime-section" id="runtime" aria-labelledby="runtime-title">
-        <div class="shell runtime-layout">
-          <div>
-            <div class="section-head">
-              <span class="unique-kicker">Rust runtime</span>
-              <h2 id="runtime-title">A Rust binary between clients and providers.</h2>
-              <p>
-                IO Gateway runs as a compiled Rust binary on Axum and Tokio, keeping routing,
-                streaming, quota checks, and dashboard operations inside one low-overhead async service.
-              </p>
-            </div>
-            <div class="runtime-spec" aria-label="Rust runtime details">
-              <div class="runtime-row">
-                <code>binary</code>
-                <span><strong>Single compiled server</strong> Deploy the gateway without a Node or Python runtime in the request path.</span>
-              </div>
-              <div class="runtime-row">
-                <code>tokio</code>
-                <span><strong>Async streaming core</strong> Concurrent streams, retries, and upstream calls run through the async runtime.</span>
-              </div>
-              <div class="runtime-row">
-                <code>rustls</code>
-                <span><strong>Rustls upstream HTTP</strong> Reqwest uses a Rustls TLS stack for outbound provider calls.</span>
-              </div>
-            </div>
-          </div>
-          <div class="terminal runtime-terminal" aria-label="Rust deployment command">
-            <div class="window-bar">
-              <span></span><span></span><span></span>
-            </div>
-            <pre><code>cargo build --release
-./target/release/io-gateway
-
-# dashboard + /v1 + /codex + /claude
-# one Rust process on your server</code></pre>
-          </div>
-        </div>
-      </section>
-
-      <section class="cta" aria-labelledby="cta-title">
         <div class="shell">
-          <div>
-            <h2 id="cta-title">Run your AI accounts like infrastructure.</h2>
-            <p>Deploy IO Gateway, connect accounts, and give clients one stable API surface.</p>
+          <div class="section-intro">
+            <p class="section-index">04 / install</p>
+            <div class="section-title">
+              <h2 id="install-title">Install a native build. Answer the questions that affect your machine.</h2>
+              <p>
+                The release installer selects the matching archive, verifies it, preserves an
+                existing data directory, and makes first-run setup deliberate rather than hidden.
+              </p>
+            </div>
           </div>
-          <a class="button primary" href="https://github.com/giofahreza/io-gateway/releases">Download Release</a>
+
+          <div class="install-layout">
+            <div class="install-command" aria-label="IO Gateway install commands">
+              <div class="command-block">
+                <div class="install-command-head">
+                  <span>Linux / macOS</span>
+                  <button class="copy-button" type="button" data-copy-target="unix-install-command" data-copy-label="Unix command">Copy command</button>
+                </div>
+                <pre><code><span id="unix-install-command">bash -c 'set -o pipefail; curl -fsSL https://github.com/giofahreza/io-gateway/releases/latest/download/install.sh | sh'</span></code></pre>
+              </div>
+              <div class="command-block">
+                <div class="install-command-head">
+                  <span>Windows PowerShell</span>
+                  <button class="copy-button" type="button" data-copy-target="windows-install-command" data-copy-label="PowerShell command">Copy command</button>
+                </div>
+                <pre><code><span id="windows-install-command">irm https://github.com/giofahreza/io-gateway/releases/latest/download/install.ps1 | iex</span></code></pre>
+              </div>
+            </div>
+
+            <div>
+              <dl class="install-details">
+                <div>
+                  <dt>binary</dt>
+                  <dd><strong>Native x86_64 and ARM64 releases.</strong> Linux, macOS, and Windows installers pick the right archive for the current machine.</dd>
+                </div>
+                <div>
+                  <dt>port</dt>
+                  <dd><strong>Choose the local port.</strong> Keep the suggested value or use a port that fits an existing desktop setup.</dd>
+                </div>
+                <div>
+                  <dt>autostart</dt>
+                  <dd><strong>Opt in to start at sign-in.</strong> The installer offers a user systemd service, LaunchAgent, or Scheduled Task when supported.</dd>
+                </div>
+                <div>
+                  <dt>terminal</dt>
+                  <dd><strong>Choose whether to add the <code>iogw</code> TUI.</strong> The optional companion is installed only when you want it.</dd>
+                </div>
+                <div>
+                  <dt>network</dt>
+                  <dd><strong>Start localhost-only.</strong> Configure administrator authentication before deliberately exposing the operator UI.</dd>
+                </div>
+              </dl>
+              <p class="install-note">
+                Each release includes the installers, native archives, and <code>SHA256SUMS</code>.
+                The first install is interactive; documented flags cover repeatable unattended installs.
+              </p>
+              <div class="button-row">
+                <a class="button button-secondary" href="/docs/quick-start/">Installation guide</a>
+                <a class="button button-secondary" href="https://github.com/giofahreza/io-gateway/releases">Browse releases</a>
+              </div>
+            </div>
+          </div>
+        </div>
+        <p id="copy-status" class="sr-only" aria-live="polite"></p>
+      </section>
+
+      <section class="closing-section" aria-labelledby="closing-title">
+        <div class="shell closing-layout">
+          <div>
+            <p class="section-index">IO Gateway</p>
+            <h2 id="closing-title">Keep provider credentials private. Give every client a local route.</h2>
+            <p>
+              Connect accounts in the dashboard, verify the route, then point your clients at one
+              endpoint you control.
+            </p>
+          </div>
+          <a class="button button-primary" href="https://github.com/giofahreza/io-gateway/releases">Download a release</a>
         </div>
       </section>
     </main>
 
     <footer>
-      <div class="shell">
-        <span>IO Gateway</span>
-        <span>giofahreza.com</span>
+      <div class="shell footer-inner">
+        <span>IO Gateway · self-hosted request routing</span>
+        <nav class="footer-links" aria-label="Footer navigation">
+          <a href="/docs/">Docs</a>
+          <a href="https://github.com/giofahreza/io-gateway">GitHub</a>
+          <a href="https://github.com/giofahreza/io-gateway/releases">Releases</a>
+        </nav>
       </div>
     </footer>
 
     <script>
-      const canvas = document.getElementById("routing-canvas");
-      const ctx = canvas.getContext("2d");
-      const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-      const nodes = [
-        { id: "client", label: "Client", x: 0.14, y: 0.42, color: "#9ee5d8" },
-        { id: "gateway", label: "IO Gateway", x: 0.46, y: 0.44, color: "#ffffff" },
-        { id: "cod", label: "cod", x: 0.74, y: 0.25, color: "#5dd6c4" },
-        { id: "cld", label: "cld", x: 0.84, y: 0.42, color: "#f0b36a" },
-        { id: "glm", label: "glm", x: 0.72, y: 0.62, color: "#bca4ff" },
-        { id: "ctm", label: "ctm", x: 0.91, y: 0.58, color: "#a4ed8f" },
-      ];
-      const links = [
-        ["client", "gateway"],
-        ["gateway", "cod"],
-        ["gateway", "cld"],
-        ["gateway", "glm"],
-        ["gateway", "ctm"],
-      ];
+      const menu = document.querySelector(".menu");
 
-      function resizeCanvas() {
-        const ratio = Math.min(window.devicePixelRatio || 1, 2);
-        canvas.width = Math.floor(canvas.clientWidth * ratio);
-        canvas.height = Math.floor(canvas.clientHeight * ratio);
-        ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      if (menu) {
+        const summary = menu.querySelector("summary");
+
+        menu.querySelectorAll("a").forEach((link) => {
+          link.addEventListener("click", () => {
+            menu.open = false;
+          });
+        });
+
+        document.addEventListener("click", (event) => {
+          if (menu.open && !menu.contains(event.target)) menu.open = false;
+        });
+
+        document.addEventListener("keydown", (event) => {
+          if (event.key === "Escape" && menu.open) {
+            menu.open = false;
+            summary.focus();
+          }
+        });
       }
 
-      function nodePoint(node, width, height) {
-        return { x: node.x * width, y: node.y * height };
+      const copyStatus = document.getElementById("copy-status");
+
+      function fallbackCopy(text) {
+        const input = document.createElement("textarea");
+        input.value = text;
+        input.setAttribute("readonly", "");
+        input.style.position = "fixed";
+        input.style.opacity = "0";
+        document.body.append(input);
+        input.select();
+        const copied = document.execCommand("copy");
+        input.remove();
+        if (!copied) throw new Error("Copy command failed");
       }
 
-      function drawNode(node, width, height, time) {
-        const point = nodePoint(node, width, height);
-        const pulse = reduceMotion ? 0 : Math.sin(time / 560 + point.x) * 2;
-        ctx.save();
-        ctx.globalAlpha = node.id === "gateway" ? 0.7 : 0.46;
-        ctx.fillStyle = node.color;
-        ctx.beginPath();
-        ctx.arc(point.x, point.y, node.id === "gateway" ? 8 + pulse : 5 + pulse, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.font = "800 12px Inter, system-ui, sans-serif";
-        ctx.fillStyle = "rgba(255,255,255,0.54)";
-        ctx.fillText(node.label, point.x + 13, point.y + 4);
-        ctx.restore();
-      }
-
-      function drawLink(from, to, width, height, time, index) {
-        const a = nodePoint(from, width, height);
-        const b = nodePoint(to, width, height);
-        const controlX = (a.x + b.x) / 2;
-        const controlY = Math.min(a.y, b.y) - height * 0.09;
-        ctx.save();
-        ctx.strokeStyle = "rgba(158,229,216,0.15)";
-        ctx.lineWidth = 1.4;
-        ctx.beginPath();
-        ctx.moveTo(a.x, a.y);
-        ctx.quadraticCurveTo(controlX, controlY, b.x, b.y);
-        ctx.stroke();
-
-        const progress = reduceMotion ? 0.58 : ((time / 1600 + index * 0.19) % 1);
-        const oneMinus = 1 - progress;
-        const x = oneMinus * oneMinus * a.x + 2 * oneMinus * progress * controlX + progress * progress * b.x;
-        const y = oneMinus * oneMinus * a.y + 2 * oneMinus * progress * controlY + progress * progress * b.y;
-        ctx.fillStyle = index === 0 ? "#ffffff" : "#9ee5d8";
-        ctx.globalAlpha = 0.72;
-        ctx.beginPath();
-        ctx.arc(x, y, 3.8, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.restore();
-      }
-
-      function drawCanvas() {
-        const width = canvas.clientWidth;
-        const height = canvas.clientHeight;
-        const time = reduceMotion ? 1200 : performance.now();
-        ctx.clearRect(0, 0, width, height);
-
-        const gradient = ctx.createLinearGradient(0, 0, width, height);
-        gradient.addColorStop(0, "rgba(5,7,6,0.08)");
-        gradient.addColorStop(1, "rgba(93,214,196,0.12)");
-        ctx.fillStyle = gradient;
-        ctx.fillRect(0, 0, width, height);
-
-        ctx.fillStyle = "rgba(255,255,255,0.035)";
-        const blockWidth = Math.max(80, width * 0.07);
-        for (let i = 0; i < 10; i += 1) {
-          const x = width * 0.48 + i * blockWidth * 0.66 + Math.sin(time / 2400 + i) * 8;
-          const h = height * (0.18 + (i % 3) * 0.08);
-          ctx.fillRect(x, 0, blockWidth, h);
-          ctx.fillRect(x + blockWidth * 0.12, height - h * 0.7, blockWidth * 0.78, h * 0.7);
+      async function copyCommand(text) {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+          return;
         }
-
-        const byId = Object.fromEntries(nodes.map((node) => [node.id, node]));
-        links.forEach(([from, to], index) => drawLink(byId[from], byId[to], width, height, time, index));
-        nodes.forEach((node) => drawNode(node, width, height, time));
-
-        if (!reduceMotion) requestAnimationFrame(drawCanvas);
+        fallbackCopy(text);
       }
 
-      resizeCanvas();
-      drawCanvas();
-      window.addEventListener("resize", () => {
-        resizeCanvas();
-        drawCanvas();
+      document.querySelectorAll("[data-copy-target]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const target = document.getElementById(button.dataset.copyTarget);
+          if (!target) return;
+
+          const originalLabel = button.textContent;
+          const label = button.dataset.copyLabel || "Command";
+
+          try {
+            await copyCommand(target.textContent.trim());
+            button.dataset.copyState = "copied";
+            button.textContent = "Copied";
+            copyStatus.textContent = `${label} copied to the clipboard.`;
+            window.setTimeout(() => {
+              button.dataset.copyState = "";
+              button.textContent = originalLabel;
+            }, 1800);
+          } catch (error) {
+            copyStatus.textContent = `Unable to copy the ${label.toLowerCase()}. Select it from the installation block instead.`;
+          }
+        });
       });
     </script>
   </body>
