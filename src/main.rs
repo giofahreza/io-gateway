@@ -109,6 +109,15 @@ const MOBILE_QUOTA_CONTAINER_KEYS: [&str; 12] = [
     "limits",
     "current_window",
 ];
+const MOBILE_RATE_LIMIT_RESET_CREDIT_SCALAR_KEYS: [&str; 7] = [
+    "id",
+    "reset_type",
+    "status",
+    "granted_at",
+    "expires_at",
+    "title",
+    "description",
+];
 
 #[derive(Clone)]
 struct AppState {
@@ -11777,6 +11786,10 @@ fn compact_mobile_quota_value(value: &serde_json::Value) -> serde_json::Value {
                     compact.insert(key.clone(), value.clone());
                 } else if MOBILE_QUOTA_CONTAINER_KEYS.contains(&key.as_str()) {
                     compact.insert(key.clone(), compact_mobile_quota_value(value));
+                } else if key == "rate_limit_reset_credits" {
+                    if let Some(reset_credits) = compact_mobile_rate_limit_reset_credits(value) {
+                        compact.insert(key.clone(), reset_credits);
+                    }
                 } else if key == "kinds" || key == "rate_limits" {
                     let children = value
                         .as_object()
@@ -11796,6 +11809,44 @@ fn compact_mobile_quota_value(value: &serde_json::Value) -> serde_json::Value {
         }
         _ => value.clone(),
     }
+}
+
+fn compact_mobile_rate_limit_reset_credits(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let source = value.as_object()?;
+    let mut compact = serde_json::Map::new();
+
+    if let Some(available_count) = source
+        .get("available_count")
+        .and_then(serde_json::Value::as_i64)
+    {
+        compact.insert(
+            "available_count".to_string(),
+            serde_json::Value::from(available_count),
+        );
+    }
+
+    if let Some(credits) = source.get("credits").and_then(serde_json::Value::as_array) {
+        let credits = credits
+            .iter()
+            .filter_map(compact_mobile_rate_limit_reset_credit)
+            .collect::<Vec<_>>();
+        compact.insert("credits".to_string(), serde_json::Value::Array(credits));
+    }
+
+    Some(serde_json::Value::Object(compact))
+}
+
+fn compact_mobile_rate_limit_reset_credit(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let source = value.as_object()?;
+    let mut compact = serde_json::Map::new();
+
+    for key in MOBILE_RATE_LIMIT_RESET_CREDIT_SCALAR_KEYS {
+        if let Some(value) = source.get(key).filter(|value| value.is_string()) {
+            compact.insert(key.to_string(), value.clone());
+        }
+    }
+
+    (!compact.is_empty()).then_some(serde_json::Value::Object(compact))
 }
 
 fn compact_scalar_object(value: &serde_json::Value) -> serde_json::Value {
@@ -11891,6 +11942,74 @@ mod mobile_usage_tests {
             compact["kinds"]["DEFAULT_TEXT"]["rate_limits"]["requests"]["limit"],
             100
         );
+    }
+
+    #[test]
+    fn compact_quota_keeps_safe_reset_credit_metadata_and_drops_sensitive_fields() {
+        let account = compact_mobile_quota_value(&serde_json::json!({
+            "label": "Primary",
+            "rate_limit_reset_credits": {
+                "available_count": 2,
+                "access_token": "summary-access-token",
+                "refresh_token": "summary-refresh-token",
+                "cookie": "summary-cookie",
+                "cookies": { "session": "summary-cookie" },
+                "secret": "summary-secret",
+                "arbitrary_upstream_field": { "secret": "do-not-expose" },
+                "credits": [{
+                    "id": "credit-123",
+                    "reset_type": "five_hour",
+                    "status": "available",
+                    "granted_at": "2026-09-09T00:00:00Z",
+                    "expires_at": "2026-09-10T00:00:00Z",
+                    "title": "Reset 5-hour limit",
+                    "description": "Restore the current rate limit window.",
+                    "access_token": "credit-access-token",
+                    "refresh_token": "credit-refresh-token",
+                    "cookie": "credit-cookie",
+                    "cookies": { "session": "credit-cookie" },
+                    "secret": "credit-secret",
+                    "arbitrary_upstream_field": { "token": "do-not-expose" }
+                }]
+            }
+        }));
+        let mobile_response = serde_json::json!({
+            "quotas": {
+                "codex": {
+                    "accounts": [account]
+                }
+            }
+        });
+
+        let summary =
+            &mobile_response["quotas"]["codex"]["accounts"][0]["rate_limit_reset_credits"];
+        let credit = &summary["credits"][0];
+
+        assert_eq!(summary["available_count"], 2);
+        assert_eq!(credit["id"], "credit-123");
+        assert_eq!(credit["reset_type"], "five_hour");
+        assert_eq!(credit["status"], "available");
+        assert_eq!(credit["granted_at"], "2026-09-09T00:00:00Z");
+        assert_eq!(credit["expires_at"], "2026-09-10T00:00:00Z");
+        assert_eq!(credit["title"], "Reset 5-hour limit");
+        assert_eq!(
+            credit["description"],
+            "Restore the current rate limit window."
+        );
+        assert_eq!(summary.as_object().map(|value| value.len()), Some(2));
+        assert_eq!(credit.as_object().map(|value| value.len()), Some(7));
+
+        for key in [
+            "access_token",
+            "refresh_token",
+            "cookie",
+            "cookies",
+            "secret",
+            "arbitrary_upstream_field",
+        ] {
+            assert!(summary.get(key).is_none(), "summary leaked {key}");
+            assert!(credit.get(key).is_none(), "credit leaked {key}");
+        }
     }
 }
 
