@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Preparing IO Gateway">
+  <defs>
+    <filter id="gateway-glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="2.8" />
+    </filter>
+    <path id="gateway-in" d="M31 64h24" />
+    <path id="gateway-gate" d="M55 39v50h28V39H55" />
+    <path id="gateway-out" d="M83 64h14" />
+  </defs>
+  <style>
+    .base { fill: none; stroke: #f6f9ff; stroke-linecap: round; stroke-linejoin: round; stroke-width: 8; opacity: .2; }
+    .trace { fill: none; stroke-linecap: round; stroke-linejoin: round; }
+    .in { stroke: #f6f9ff; stroke-width: 8; stroke-dasharray: 18 28; animation: scan-in 1.7s linear infinite; }
+    .gate { stroke: #60a5fa; stroke-width: 8; stroke-dasharray: 38 154; animation: scan-gate 1.7s linear infinite; }
+    .out { stroke: #93c5fd; stroke-width: 8; stroke-dasharray: 12 28; animation: scan-out 1.7s linear infinite; }
+    .glow { opacity: .64; filter: url(#gateway-glow); }
+    @keyframes scan-in { to { stroke-dashoffset: -46; } }
+    @keyframes scan-gate { to { stroke-dashoffset: 192; } }
+    @keyframes scan-out { to { stroke-dashoffset: -40; } }
+    @media (prefers-reduced-motion: reduce) {
+      .trace { animation: none; stroke-dasharray: none; }
+    }
+  </style>
+  <circle cx="20" cy="64" r="5" fill="#60a5fa" opacity=".24" />
+  <circle cx="108" cy="64" r="5" fill="#60a5fa" opacity=".24" />
+  <g class="base">
+    <use href="#gateway-in" />
+    <use href="#gateway-gate" />
+    <use href="#gateway-out" />
+  </g>
+  <g class="glow">
+    <use class="trace in" href="#gateway-in" stroke-width="15" />
+    <use class="trace gate" href="#gateway-gate" stroke-width="15" />
+    <use class="trace out" href="#gateway-out" stroke-width="15" />
+  </g>
+  <circle cx="20" cy="64" r="5" fill="#60a5fa" />
+  <circle cx="108" cy="64" r="5" fill="#60a5fa" />
+  <use class="trace in" href="#gateway-in" />
+  <use class="trace gate" href="#gateway-gate" />
+  <use class="trace out" href="#gateway-out" />
+</svg>

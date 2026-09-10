@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 const outputDir = "site/docs";
 const docsVersion = "v0.1.11+";
 const updated = "September 4, 2026";
-const assetVersion = "20260908a";
+const assetVersion = "20260910a";
 
 const groups = [
   { title: "Tutorials", slug: "tutorials", description: "First-run paths that take an operator from zero to a working gateway." },
@@ -729,9 +729,10 @@ function renderHeader(active = "docs") {
     <header class="site-header">
       <div class="site-header-inner">
         <a class="brand" href="/" aria-label="IO Gateway home">
-          <span class="brand-mark">IO</span>
+          <img class="brand-signal" src="/brand-mark.svg?v=${assetVersion}" alt="">
           <span>IO Gateway</span>
         </a>
+        <span class="docs-header-kicker"><i aria-hidden="true"></i>Documentation</span>
         <div class="site-header-actions">
           <nav aria-label="Site navigation">
             <a href="/">Home</a>
@@ -740,8 +741,8 @@ function renderHeader(active = "docs") {
             <a class="nav-action" href="https://github.com/giofahreza/io-gateway/releases">Releases</a>
           </nav>
           <button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false" aria-label="Switch theme">
-            <span class="theme-toggle-mark" aria-hidden="true">◐</span>
-            <span data-theme-label>Theme</span>
+            <span class="theme-toggle-led" aria-hidden="true"></span>
+            <span data-theme-label>Dark</span>
           </button>
         </div>
       </div>
@@ -845,15 +846,26 @@ function renderShell({ title, description, canonicalPath, activeSlug = "", artic
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
-    <meta name="theme-color" content="#ebe8df">
+    <meta name="theme-color" content="#080d18" data-theme-color-light="#18375f" data-theme-color-dark="#080d18">
     <meta name="description" content="${escapeHtml(description)}">
     <title>${escapeHtml(title)}</title>
-    <link rel="icon" href="data:,">
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="icon" href="/icon.svg" type="image/svg+xml">
     <link rel="canonical" href="https://gateway.giofahreza.com${canonicalPath}">
+    <link rel="preload" href="/brand-loader.svg?v=${assetVersion}" as="image" type="image/svg+xml">
+    <link rel="preload" href="/assets/fonts/ibm-plex-sans-latin.woff2?v=${assetVersion}" as="font" type="font/woff2" crossorigin>
+    <link rel="preload" href="/assets/fonts/ibm-plex-mono-latin.woff2?v=${assetVersion}" as="font" type="font/woff2" crossorigin>
     <script src="/theme.js?v=${assetVersion}"></script>
+    <link rel="stylesheet" href="/brand.css?v=${assetVersion}">
     <link rel="stylesheet" href="/docs.css?v=${assetVersion}">
   </head>
   <body>
+    <div class="brand-loader" data-brand-loader role="status" aria-live="polite" aria-label="Opening IO Gateway">
+      <div class="brand-loader__inner">
+        <img class="brand-loader__mark" src="/brand-loader.svg?v=${assetVersion}" alt="">
+        <span class="brand-loader__label">Opening IO Gateway</span>
+      </div>
+    </div>
 ${renderHeader("docs")}
     <main class="docs-page-shell">
       <div class="docs-layout">
@@ -863,8 +875,17 @@ ${renderRightOutline()}
       </div>
     </main>
     <footer class="site-footer">
-      <span>IO Gateway Docs</span>
-      <span>giofahreza.com</span>
+      <div class="site-footer-inner">
+        <a class="site-footer-brand" href="/" aria-label="IO Gateway home">
+          <img class="brand-signal" src="/brand-mark.svg?v=${assetVersion}" alt="">
+          <span><strong>IO Gateway</strong><small>Operator routebook</small></span>
+        </a>
+        <p>Keep provider credentials on the host. Keep client routes deliberate.</p>
+        <nav class="site-footer-links" aria-label="Footer navigation">
+          <a href="/">Product</a>
+          <a href="https://github.com/giofahreza/io-gateway">GitHub <span aria-hidden="true">↗</span></a>
+        </nav>
+      </div>
     </footer>
     <script src="/docs.js?v=${assetVersion}" defer></script>
   </body>

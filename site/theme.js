@@ -31,8 +31,8 @@
   function updateThemeColor() {
     const meta = document.querySelector('meta[name="theme-color"]');
     if (meta) {
-      const light = meta.dataset.themeColorLight || "#ebe8df";
-      const dark = meta.dataset.themeColorDark || "#1b211c";
+      const light = meta.dataset.themeColorLight || "#18375f";
+      const dark = meta.dataset.themeColorDark || "#080d18";
       meta.setAttribute("content", resolvedTheme() === "dark" ? dark : light);
     }
   }
@@ -71,6 +71,31 @@
     refresh();
   }
 
+  let loaderReleased = false;
+
+  function releaseBrandLoader() {
+    if (loaderReleased) return;
+    loaderReleased = true;
+    root.classList.add("brand-ready");
+
+    const loader = document.querySelector("[data-brand-loader]");
+    if (!loader) return;
+    loader.setAttribute("aria-hidden", "true");
+    window.setTimeout(() => loader.remove(), 380);
+  }
+
+  function installBrandLoader() {
+    const releaseAfterLoad = () => window.setTimeout(releaseBrandLoader, 120);
+    if (document.readyState === "complete") {
+      releaseAfterLoad();
+    } else {
+      window.addEventListener("load", releaseAfterLoad, { once: true });
+    }
+
+    // A stalled resource must never leave the public site unavailable.
+    window.setTimeout(releaseBrandLoader, 4800);
+  }
+
   const savedTheme = readStoredTheme();
   if (savedTheme) root.dataset.theme = savedTheme;
   updateThemeColor();
@@ -80,6 +105,8 @@
   } else {
     installControls();
   }
+
+  installBrandLoader();
 
   const handleSystemThemeChange = () => {
     if (!root.dataset.theme) refresh();
