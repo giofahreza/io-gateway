@@ -420,7 +420,7 @@ pub(crate) fn backup(cfg: &crate::Config, destination: &Path) -> Result<(), Stri
             "format": "io-gateway-api-key-policy-backup-v1",
             "database_id": database_id,
             "created_at": Utc::now().to_rfc3339(),
-            "includes": ["managed_key_hashes_and_rules", "quota_balances_and_reservations", "policy_audit"],
+            "includes": ["managed_key_hashes_and_rules", "quota_balances_and_reservations", "policy_audit", "codex_reset_credit_policies_and_actions"],
             "excludes": ["provider_credentials", "gateway_configuration", "reporting_history"],
             "restore_requires_usage_reconciliation": true
         });
@@ -1590,6 +1590,11 @@ pub(crate) fn open_connection_at_path(path: &Path) -> Result<Connection, String>
     // Pin renewable schema existence in this same initialization transaction.
     // Reads must never recreate a dropped usage table and restore allowance.
     crate::api_key_quota::initialize(&transaction)?;
+    // The reset-credit action ledger carries an upstream spending idempotency
+    // key.  Its initialized bit makes a missing established table a hard
+    // failure rather than an opportunity to create an empty ledger and spend
+    // a credit twice after restart.
+    crate::codex_reset_credit::initialize(&transaction)?;
     transaction
         .commit()
         .map_err(|err| format!("failed to commit API-key database identity: {err}"))?;
@@ -1633,7 +1638,8 @@ fn initialize_connection(connection: &Connection) -> Result<(), String> {
                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                 database_id TEXT NOT NULL,
                 keys_initialized INTEGER NOT NULL DEFAULT 0 CHECK(keys_initialized IN (0, 1)),
-                renewable_initialized INTEGER NOT NULL DEFAULT 0 CHECK(renewable_initialized IN (0, 1))
+                renewable_initialized INTEGER NOT NULL DEFAULT 0 CHECK(renewable_initialized IN (0, 1)),
+                codex_reset_credits_initialized INTEGER NOT NULL DEFAULT 0 CHECK(codex_reset_credits_initialized IN (0, 1))
              );
              CREATE TABLE IF NOT EXISTS managed_api_keys (
                 id TEXT PRIMARY KEY,

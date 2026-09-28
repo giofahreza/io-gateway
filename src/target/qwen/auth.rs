@@ -1376,6 +1376,7 @@ mod tests {
                 upstream_read_timeout_seconds: crate::default_upstream_read_timeout_seconds(),
                 upstream_first_event_timeout_seconds:
                     crate::default_upstream_first_event_timeout_seconds(),
+                codex_reset_credit_app_server: crate::CodexResetCreditAppServerConfig::default(),
                 oauth: super::super::super::oauth::OAuthConfig {
                     providers: super::super::super::oauth::OAuthProvidersConfig {
                         qwen: super::super::super::oauth::OAuthProviderOverride {
@@ -1465,6 +1466,7 @@ mod tests {
                 persistence_tx: std::sync::mpsc::channel().0,
                 account_router: Arc::new(Mutex::new(HashMap::new())),
                 account_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
+                codex_reset_credit_wake: Arc::new(tokio::sync::Notify::new()),
             };
 
             Self { auth_dir, state }

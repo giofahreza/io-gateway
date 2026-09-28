@@ -4,7 +4,7 @@ use axum::{
     extract::{Form, OriginalUri, Path, Query, State},
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::any,
+    routing::{any, post},
     Json, Router,
 };
 use bytes::{Bytes, BytesMut};
@@ -32,6 +32,7 @@ mod api_key_quota;
 mod api_key_quota_runtime;
 mod api_key_request_audit;
 mod api_keys;
+mod codex_reset_credit;
 mod custom_models;
 mod input_assessment;
 mod notifications;
@@ -205,6 +206,10 @@ struct AppState {
     persistence_tx: mpsc::Sender<PersistenceEvent>,
     account_router: Arc<Mutex<HashMap<String, AccountRuntimeState>>>,
     account_refresh_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Wakes the local durable reset-credit reconciler after an administrator
+    /// enables or edits a policy. SQLite remains authoritative across
+    /// restarts and other gateway processes.
+    codex_reset_credit_wake: Arc<tokio::sync::Notify>,
 }
 
 /// Optional peer information for the administrator login limiter.
@@ -451,6 +456,7 @@ mod api_key_registry_tests {
             disabled_files: None,
             admin_auth: admin_auth::AdminAuthConfig::default(),
             oauth: target::oauth::OAuthConfig::default(),
+            codex_reset_credit_app_server: CodexResetCreditAppServerConfig::default(),
             request_body_limit_enabled: default_request_body_limit_enabled(),
             max_request_body_bytes: default_max_request_body_bytes(),
             max_concurrent_requests: default_max_concurrent_requests(),
@@ -1104,6 +1110,11 @@ struct Config {
     admin_auth: admin_auth::AdminAuthConfig,
     #[serde(default)]
     oauth: target::oauth::OAuthConfig,
+    /// Explicit configuration for the experimental local Codex App Server
+    /// reset-credit adapter. Leaving it unset keeps automation disabled
+    /// rather than falling back to an undocumented direct backend call.
+    #[serde(default)]
+    codex_reset_credit_app_server: CodexResetCreditAppServerConfig,
     #[serde(default = "default_request_body_limit_enabled")]
     request_body_limit_enabled: bool,
     #[serde(default = "default_max_request_body_bytes")]
@@ -1122,6 +1133,39 @@ struct Config {
     upstream_read_timeout_seconds: u64,
     #[serde(default = "default_upstream_first_event_timeout_seconds")]
     upstream_first_event_timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodexResetCreditAppServerConfig {
+    /// An absolute path to the trusted `codex` executable. Arguments are
+    /// intentionally not configurable: the gateway always invokes
+    /// `app-server --stdio` and never shells out.
+    command: Option<PathBuf>,
+    /// Absolute parent directory containing one administrator-created,
+    /// managed-login `CODEX_HOME` profile per stable ChatGPT account.
+    profile_root: Option<PathBuf>,
+    /// The official App Server documentation labels the App Server
+    /// experimental/unsupported for production workloads.  Make that choice
+    /// explicit so merely adding a command/profile cannot spend a credit.
+    #[serde(default)]
+    experimental_opt_in: bool,
+    #[serde(default)]
+    profiles: Vec<CodexResetCreditAppServerProfile>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodexResetCreditAppServerProfile {
+    /// Stable IO Gateway identity, never a label or filename.
+    account_key: String,
+    /// A simple directory name below `profile_root`; it is not a path.
+    profile: String,
+    /// Required when this profile is used for enabled reset-credit automation.
+    /// It binds the local managed ChatGPT profile's `account/read` email; the
+    /// stable upstream identity remains `account_key`.
+    #[serde(default)]
+    expected_email: Option<String>,
 }
 
 fn default_request_body_limit_enabled() -> bool {
@@ -2150,6 +2194,7 @@ async fn main() {
         persistence_tx,
         account_router: Arc::new(Mutex::new(HashMap::new())),
         account_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
+        codex_reset_credit_wake: Arc::new(tokio::sync::Notify::new()),
     };
     migrate_qwen_usage_keys(&state);
     migrate_grok_usage_keys(&state);
@@ -2171,6 +2216,10 @@ async fn main() {
         .route("/admin/api-keys/create", any(admin_api_keys_create_route))
         .route("/admin/api-keys/access", any(admin_api_keys_access_route))
         .route("/admin/api-keys/revoke", any(admin_api_keys_revoke_route))
+        .route(
+            "/admin/codex/reset-credit-automation",
+            any(admin_codex_reset_credit_automation_route),
+        )
         .route("/admin/account-routing", any(admin_account_routing_route))
         .route(
             "/admin/account-routing/priority",
@@ -2183,7 +2232,7 @@ async fn main() {
         .route("/models/refresh", any(model_catalog_refresh_route))
         .route(
             "/codex/rate-limit-reset-credit/consume",
-            any(codex_rate_limit_reset_consume_route),
+            post(codex_rate_limit_reset_consume_route),
         )
         .route("/credentials/delete", any(delete_credential_route))
         .route("/credentials/toggle", any(toggle_credential_route))
@@ -2252,6 +2301,7 @@ async fn main() {
 
     let quota_refresh = tokio::spawn(background_quota_refresh(state.clone()));
     let maintenance = tokio::spawn(background_maintenance(state.clone()));
+    let reset_credit_worker = tokio::spawn(codex_reset_credit::background_worker(state.clone()));
 
     let addr: SocketAddr = state.cfg.listen.parse().expect("invalid listen address");
     info!("listening on {}", addr);
@@ -2271,6 +2321,7 @@ async fn main() {
 
     quota_refresh.abort();
     maintenance.abort();
+    reset_credit_worker.abort();
     let (flushed_tx, flushed_rx) = mpsc::sync_channel(0);
     if state
         .persistence_tx
@@ -5231,6 +5282,7 @@ async fn dashboard() -> impl IntoResponse {
         testApiModelOptions: [],
         providerSettings: readProviderDashboardSettings(),
         notificationSettings: null,
+        codexResetCreditAutomation: null,
         accountRouting: { providers: {} },
         apiKeys: [],
         apiKeyAccounts: [],
@@ -5462,6 +5514,8 @@ async fn dashboard() -> impl IntoResponse {
       function setAppSettingsTab(tab) {
         var target = tab === 'notifications'
           ? 'notifications'
+          : tab === 'reset-credits'
+            ? 'reset-credits'
           : tab === 'api-keys'
             ? 'api-keys'
             : tab === 'test-api'
@@ -5483,6 +5537,7 @@ async fn dashboard() -> impl IntoResponse {
           }, 0);
         }
         if (target === 'test-api') prepareTestApiPanel();
+        if (target === 'reset-credits') loadCodexResetCreditAutomation();
       }
       async function loadNotificationSettings() {
         setText('notificationStatus', 'Loading notification settings...');
@@ -5664,6 +5719,189 @@ async fn dashboard() -> impl IntoResponse {
         if (!res) return;
         const data = await res.json();
         updateNotificationStatusText(data.message || (data.ok ? 'Test notification sent' : 'Test notification failed'));
+      }
+      function codexResetCreditAutomationDefaults() {
+        var state = dashboardState.codexResetCreditAutomation || {};
+        var defaults = state.defaults || {};
+        return {
+          scanIntervalMinutes: Number(defaults.scan_interval_minutes) || 30,
+          minimumExpiryLeadMinutes: Number(defaults.minimum_expiry_lead_minutes) || 30,
+          expiryWindowMinutes: Number(defaults.expiry_window_minutes) || 60,
+          finalAttemptMinutes: Number(defaults.final_attempt_minutes) || 5,
+          minNaturalResetRemainingMinutes: Number(defaults.min_natural_reset_remaining_minutes) || 10
+        };
+      }
+      function codexResetCreditAutomationAccounts() {
+        var state = dashboardState.codexResetCreditAutomation || {};
+        return Array.isArray(state.accounts) ? state.accounts.filter(function(account) {
+          return account && account.eligible === true && String(account.account_key || '').trim();
+        }) : [];
+      }
+      function codexResetCreditAutomationPolicy(accountKey) {
+        var state = dashboardState.codexResetCreditAutomation || {};
+        return (Array.isArray(state.policies) ? state.policies : []).find(function(policy) {
+          return String(policy && policy.account_key || '') === String(accountKey || '');
+        }) || null;
+      }
+      function formatCodexResetCreditAutomationAction(action) {
+        var parts = [];
+        if (action.credit_expires_at) parts.push('Expires ' + formatSettingsDateTime(action.credit_expires_at, 'Unknown'));
+        if (action.next_attempt_at) parts.push('Next check ' + formatSettingsDateTime(action.next_attempt_at, 'Unknown'));
+        var count = Number(action.attempt_count);
+        if (Number.isFinite(count)) parts.push(count + (count === 1 ? ' attempt' : ' attempts'));
+        if (action.last_outcome) parts.push('Last: ' + String(action.last_outcome).replace(/_/g, ' '));
+        return parts.join(' · ');
+      }
+      function renderCodexResetCreditAutomationActions(accountKey) {
+        var list = document.getElementById('codexResetCreditAutomationActions');
+        if (!list) return;
+        var state = dashboardState.codexResetCreditAutomation || {};
+        var actions = (Array.isArray(state.actions) ? state.actions : []).filter(function(action) {
+          return String(action && action.account_key || '') === String(accountKey || '');
+        });
+        if (!actions.length) {
+          list.innerHTML = '<div class="empty-state inline">No automatic or coordinated reset actions recorded for this account.</div>';
+          return;
+        }
+        list.innerHTML = actions.map(function(action) {
+          var stateLabel = String(action.state || 'unknown').replace(/_/g, ' ');
+          var credit = String(action.credit_id || 'reset credit');
+          var trigger = String(action.trigger || 'automatic').replace(/_/g, ' ');
+          return '<div class="reset-credit-item">'
+            + '<div class="reset-credit-main">'
+            + '<div class="reset-credit-title">' + escapeHtml(stateLabel) + ' · ' + escapeHtml(trigger) + '</div>'
+            + '<div class="reset-credit-meta">' + escapeHtml(formatCodexResetCreditAutomationAction(action)) + '</div>'
+            + '<div class="reset-credit-id-row"><code title="' + escapeHtml(credit) + '">' + escapeHtml(compactMiddle(credit, 48)) + '</code></div>'
+            + '</div></div>';
+        }).join('');
+      }
+      function updateCodexResetCreditAutomationStatus(message) {
+        if (message) {
+          setText('codexResetCreditAutomationStatus', message);
+          return;
+        }
+        var select = document.getElementById('codexResetCreditAutomationAccountInput');
+        var accountKey = select && select.value || '';
+        var policy = codexResetCreditAutomationPolicy(accountKey);
+        if (!accountKey) {
+          setText('codexResetCreditAutomationStatus', 'No enabled, uniquely identified Codex account is eligible for unattended reset-credit redemption.');
+          return;
+        }
+        if (!policy || policy.enabled !== true) {
+          setText('codexResetCreditAutomationStatus', 'Automatic redemption is disabled for this account.');
+          return;
+        }
+        var next = policy.next_scan_at
+          ? ' Next scan ' + formatSettingsDateTime(policy.next_scan_at, 'scheduled soon') + '.'
+          : '';
+        setText('codexResetCreditAutomationStatus', 'Automatic redemption is enabled.' + next);
+      }
+      function renderCodexResetCreditAutomation() {
+        var select = document.getElementById('codexResetCreditAutomationAccountInput');
+        var enabled = document.getElementById('codexResetCreditAutomationEnabledInput');
+        var scan = document.getElementById('codexResetCreditAutomationScanInput');
+        var expiry = document.getElementById('codexResetCreditAutomationExpiryInput');
+        var finalAttempt = document.getElementById('codexResetCreditAutomationFinalAttemptInput');
+        var naturalReset = document.getElementById('codexResetCreditAutomationNaturalResetInput');
+        var save = document.getElementById('saveCodexResetCreditAutomationBtn');
+        if (!select || !enabled || !scan || !expiry || !finalAttempt || !naturalReset) return;
+
+        var previous = String(select.value || '');
+        var accounts = codexResetCreditAutomationAccounts();
+        select.innerHTML = accounts.map(function(account) {
+          var title = String(account.label || account.account_id || account.account_key);
+          var accountId = String(account.account_id || '');
+          var label = accountId && title !== accountId ? title + ' · ' + accountId : title;
+          return '<option value="' + escapeHtml(String(account.account_key)) + '">' + escapeHtml(label) + '</option>';
+        }).join('');
+        var selected = accounts.some(function(account) { return String(account.account_key) === previous; })
+          ? previous
+          : (accounts[0] && String(accounts[0].account_key) || '');
+        select.value = selected;
+
+        var defaults = codexResetCreditAutomationDefaults();
+        var policy = codexResetCreditAutomationPolicy(selected);
+        enabled.checked = policy && policy.enabled === true;
+        scan.value = String(policy && policy.scan_interval_minutes || defaults.scanIntervalMinutes);
+        expiry.value = String(policy && policy.expiry_window_minutes || defaults.expiryWindowMinutes);
+        finalAttempt.value = String(policy && policy.final_attempt_minutes != null
+          ? policy.final_attempt_minutes
+          : defaults.finalAttemptMinutes);
+        naturalReset.value = String(policy && policy.min_natural_reset_remaining_minutes != null
+          ? policy.min_natural_reset_remaining_minutes
+          : defaults.minNaturalResetRemainingMinutes);
+        var unavailable = !selected;
+        [enabled, scan, expiry, finalAttempt, naturalReset].forEach(function(input) { input.disabled = unavailable; });
+        if (save) save.disabled = unavailable;
+        renderCodexResetCreditAutomationActions(selected);
+        updateCodexResetCreditAutomationStatus();
+      }
+      function codexResetCreditAutomationInteger(input, label, minimum, maximum) {
+        var value = Number(input && input.value);
+        if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+          throw new Error(label + ' must be a whole number between ' + minimum + ' and ' + maximum + '.');
+        }
+        return value;
+      }
+      async function loadCodexResetCreditAutomation() {
+        setText('codexResetCreditAutomationStatus', 'Loading Codex reset-credit automation...');
+        const res = await adminFetch('/admin/codex/reset-credit-automation');
+        if (!res) return;
+        const data = await res.json();
+        if (!data.ok) {
+          updateCodexResetCreditAutomationStatus(data.message || 'Could not load Codex reset-credit automation');
+          return;
+        }
+        dashboardState.codexResetCreditAutomation = data;
+        renderCodexResetCreditAutomation();
+      }
+      async function saveCodexResetCreditAutomation() {
+        var select = document.getElementById('codexResetCreditAutomationAccountInput');
+        var accountKey = String(select && select.value || '').trim();
+        var defaults = codexResetCreditAutomationDefaults();
+        if (!accountKey) {
+          updateCodexResetCreditAutomationStatus('Select an eligible Codex account first.');
+          return;
+        }
+        var scan;
+        var expiry;
+        var finalAttempt;
+        var naturalReset;
+        try {
+          scan = codexResetCreditAutomationInteger(document.getElementById('codexResetCreditAutomationScanInput'), 'Scan interval', 1, 1440);
+          expiry = codexResetCreditAutomationInteger(document.getElementById('codexResetCreditAutomationExpiryInput'), 'Expiry window', defaults.minimumExpiryLeadMinutes, 10080);
+          finalAttempt = codexResetCreditAutomationInteger(document.getElementById('codexResetCreditAutomationFinalAttemptInput'), 'Final check', 1, 10079);
+          naturalReset = codexResetCreditAutomationInteger(document.getElementById('codexResetCreditAutomationNaturalResetInput'), 'Natural-reset threshold', 0, 10080);
+          if (finalAttempt >= expiry) throw new Error('Final check must be earlier than the expiry window.');
+        } catch (err) {
+          updateCodexResetCreditAutomationStatus(err && err.message ? err.message : String(err));
+          return;
+        }
+        var body = {
+          account_key: accountKey,
+          enabled: document.getElementById('codexResetCreditAutomationEnabledInput').checked,
+          scan_interval_minutes: scan,
+          expiry_window_minutes: expiry,
+          final_attempt_minutes: finalAttempt,
+          min_natural_reset_remaining_minutes: naturalReset
+        };
+        setText('codexResetCreditAutomationStatus', 'Saving Codex reset-credit automation...');
+        const res = await adminFetch('/admin/codex/reset-credit-automation', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        if (!res) return;
+        const data = await res.json();
+        if (!data.ok) {
+          updateCodexResetCreditAutomationStatus(data.message || 'Could not save Codex reset-credit automation');
+          return;
+        }
+        dashboardState.codexResetCreditAutomation = data;
+        renderCodexResetCreditAutomation();
+        updateCodexResetCreditAutomationStatus(body.enabled
+          ? 'Automatic redemption saved. A fresh scan is scheduled immediately.'
+          : 'Automatic redemption disabled for this account.');
       }
       function testApiModelEntries() {
         var entries = [];
@@ -7555,8 +7793,7 @@ async fn dashboard() -> impl IntoResponse {
         if (!credits.length) {
           return html
             + '<div class="reset-credit-list"><div class="reset-credit-item">'
-            + '<div class="reset-credit-main"><div class="reset-credit-title">Next available reset credit</div><div class="reset-credit-meta">Credit details are not available from the upstream summary.</div></div>'
-            + '<button type="button" class="mini-btn secondary-button" onclick="redeemCodexReset(' + fileArg + ', ' + labelArg + ', ' + accountArg + ', \'\', \'next available reset\')">Reset limit</button>'
+            + '<div class="reset-credit-main"><div class="reset-credit-title">Next available reset credit</div><div class="reset-credit-meta">Credit details are not available from the upstream response. A concrete credit ID is required to redeem safely.</div></div>'
             + '</div></div></details>';
         }
         html += '<div class="reset-credit-list">';
@@ -7570,10 +7807,13 @@ async fn dashboard() -> impl IntoResponse {
               + '<code title="' + escapeHtml(id) + '">' + escapeHtml(compactMiddle(id, 34)) + '</code>'
               + '<button type="button" class="mini-btn secondary-button" onclick="copyTextToClipboard(' + idArg + ', \'Reset credit ID copied\')">Copy ID</button>'
               + '</div>'
+            : '<div class="reset-credit-meta">A concrete credit ID is required to redeem safely.</div>';
+          var redeemControl = id
+            ? '<button type="button" class="mini-btn secondary-button" onclick="redeemCodexReset(' + fileArg + ', ' + labelArg + ', ' + accountArg + ', ' + escapeHtml(jsString(id)) + ', ' + escapeHtml(jsString(title)) + ')">Reset limit</button>'
             : '';
           return '<div class="reset-credit-item">'
             + '<div class="reset-credit-main"><div class="reset-credit-title">' + escapeHtml(title) + '</div><div class="reset-credit-meta">' + escapeHtml(expiry) + '</div>' + idHtml + '</div>'
-            + '<button type="button" class="mini-btn secondary-button" onclick="redeemCodexReset(' + fileArg + ', ' + labelArg + ', ' + accountArg + ', ' + escapeHtml(jsString(credit.id || '')) + ', ' + escapeHtml(jsString(title)) + ')">Reset limit</button>'
+            + redeemControl
             + '</div>';
         }).join('');
         if (count > credits.length) {
@@ -9741,6 +9981,7 @@ async fn dashboard() -> impl IntoResponse {
           <button type="button" class="settings-tab is-active" role="tab" aria-selected="true" aria-controls="settingsDashboardPanel" data-settings-tab="dashboard">Dashboard</button>
           <button type="button" class="settings-tab" role="tab" aria-selected="false" aria-controls="settingsTestApiPanel" data-settings-tab="test-api">Test API</button>
           <button type="button" class="settings-tab" role="tab" aria-selected="false" aria-controls="settingsApiKeysPanel" data-settings-tab="api-keys">API Keys</button>
+          <button type="button" class="settings-tab" role="tab" aria-selected="false" aria-controls="settingsResetCreditsPanel" data-settings-tab="reset-credits">Reset credits</button>
           <button type="button" class="settings-tab" role="tab" aria-selected="false" aria-controls="settingsNotificationsPanel" data-settings-tab="notifications">Notifications</button>
         </div>
         <div id="settingsDashboardPanel" class="settings-panel" role="tabpanel" data-settings-panel="dashboard">
@@ -9862,6 +10103,47 @@ async fn dashboard() -> impl IntoResponse {
             </div>
             <div id="apiKeysList" class="api-key-list"></div>
             <div id="apiKeyStatus" class="muted" style="margin-top:10px;"></div>
+          </div>
+        </div>
+        <div id="settingsResetCreditsPanel" class="settings-panel" role="tabpanel" data-settings-panel="reset-credits" hidden>
+          <div class="settings-block">
+            <div class="settings-block-title">
+              <span>Automatic Codex reset credits</span>
+              <label class="check-row" for="codexResetCreditAutomationEnabledInput">
+                <input id="codexResetCreditAutomationEnabledInput" type="checkbox">
+                Enabled for this account
+              </label>
+            </div>
+            <div class="settings-help">Every account has its own durable policy. The gateway checks fresh upstream data, never the dashboard cache, and can only redeem a listed Codex reset credit with a concrete ID. It keeps the same idempotency key after a retry or restart.</div>
+            <div class="custom-model-form-row" style="margin-top:12px;">
+              <label for="codexResetCreditAutomationAccountInput">Eligible Codex account</label>
+              <select id="codexResetCreditAutomationAccountInput" class="test-api-model-input"></select>
+            </div>
+            <div class="api-key-limit-row" style="margin-top:12px;">
+              <label for="codexResetCreditAutomationScanInput">Scan interval (minutes)</label>
+              <input id="codexResetCreditAutomationScanInput" type="number" min="1" max="1440" step="1" inputmode="numeric" value="30">
+            </div>
+            <div class="api-key-limit-row" style="margin-top:10px;">
+              <label for="codexResetCreditAutomationExpiryInput">Upper expiry window (minutes)</label>
+              <input id="codexResetCreditAutomationExpiryInput" type="number" min="30" max="10080" step="1" inputmode="numeric" value="60">
+            </div>
+            <div class="api-key-limit-row" style="margin-top:10px;">
+              <label for="codexResetCreditAutomationFinalAttemptInput">Final pre-expiry check (minutes before expiry)</label>
+              <input id="codexResetCreditAutomationFinalAttemptInput" type="number" min="1" max="10079" step="1" inputmode="numeric" value="5">
+            </div>
+            <div class="api-key-limit-row" style="margin-top:10px;">
+              <label for="codexResetCreditAutomationNaturalResetInput">Do not spend if the normal limit resets within (minutes)</label>
+              <input id="codexResetCreditAutomationNaturalResetInput" type="number" min="0" max="10080" step="1" inputmode="numeric" value="10">
+            </div>
+            <div class="settings-help">New automatic actions only select credits expiring at least 30 minutes away and no later than this upper window. For the requested 30-minute schedule, use 60 minutes. The final check can still act on an already selected credit nearer expiry after a retry or temporary upstream failure.</div>
+            <div class="modal-actions" style="margin-top:12px;">
+              <button type="button" id="saveCodexResetCreditAutomationBtn">Save automatic reset policy</button>
+            </div>
+            <div id="codexResetCreditAutomationStatus" class="muted" style="margin-top:10px;"></div>
+          </div>
+          <div class="settings-block">
+            <div class="settings-block-title"><span>Recent coordinated actions</span></div>
+            <div id="codexResetCreditAutomationActions" class="reset-credit-list"></div>
           </div>
         </div>
         <div id="settingsNotificationsPanel" class="settings-panel" role="tabpanel" data-settings-panel="notifications" hidden>
@@ -10036,6 +10318,8 @@ async fn dashboard() -> impl IntoResponse {
       document.getElementById('sendTestApiBtn').addEventListener('click', sendTestApi);
       document.getElementById('clearTestApiBtn').addEventListener('click', clearTestApi);
       document.getElementById('copyTestApiOutputBtn').addEventListener('click', copyTestApiOutput);
+      document.getElementById('codexResetCreditAutomationAccountInput').addEventListener('change', renderCodexResetCreditAutomation);
+      document.getElementById('saveCodexResetCreditAutomationBtn').addEventListener('click', saveCodexResetCreditAutomation);
       document.getElementById('notificationChannelInput').addEventListener('change', updateNotificationChannelUi);
       document.getElementById('saveNotificationSettingsBtn').addEventListener('click', saveNotificationSettings);
       document.getElementById('testNotificationBtn').addEventListener('click', sendTestNotification);
@@ -10873,9 +11157,6 @@ async fn dashboard() -> impl IntoResponse {
         if (label) body.set('label', label);
         if (accountId) body.set('account_id', accountId);
         if (creditId) body.set('credit_id', creditId);
-        if (window.crypto && typeof window.crypto.randomUUID === 'function') {
-          body.set('idempotency_key', window.crypto.randomUUID());
-        }
         const res = await adminFetch('/codex/rate-limit-reset-credit/consume', {
           method: 'POST',
           headers: {
@@ -11457,6 +11738,189 @@ async fn admin_api_keys_revoke_route(
         "accounts": notification_account_options(&state)
     }))
     .into_response()
+}
+
+/// Read or update the durable, per-account policy for expiry-driven Codex
+/// reset-credit redemption.  This is deliberately an administrator-only
+/// surface: a reset credit is owned by the upstream ChatGPT account rather
+/// than by the caller that happens to observe it in a quota response.
+async fn admin_codex_reset_credit_automation_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    method: Method,
+    body: Bytes,
+) -> Response {
+    if let Some(response) = require_admin_session_json(&state, &headers) {
+        return response;
+    }
+
+    match method {
+        Method::GET => codex_reset_credit_automation_response(&state),
+        Method::POST => {
+            let update: codex_reset_credit::CodexResetCreditPolicyUpdate =
+                match serde_json::from_slice(&body) {
+                    Ok(update) => update,
+                    Err(err) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "ok": false,
+                                "message": format!(
+                                    "invalid Codex reset-credit automation JSON: {}",
+                                    err
+                                )
+                            })),
+                        )
+                            .into_response();
+                    }
+                };
+
+            // An enabled policy must resolve to exactly one currently enabled
+            // credential.  Disabling remains available after a credential was
+            // removed or disabled, but the selector is still restricted to a
+            // stable Codex account identity.
+            let account_validation = if update.enabled {
+                codex_reset_credit::validate_automation_account_key(&state, &update.account_key)
+            } else {
+                codex_reset_credit::validate_automation_policy_account_key(&update.account_key)
+            };
+            if let Err(err) = account_validation {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "message": err
+                    })),
+                )
+                    .into_response();
+            }
+
+            if let Err(err) = codex_reset_credit::upsert_policy(state.cfg.as_ref(), &update) {
+                error!(
+                    "failed to save Codex reset-credit automation policy: {}",
+                    err
+                );
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "message": "Codex reset-credit automation state is unavailable"
+                    })),
+                )
+                    .into_response();
+            }
+
+            // The durable deadline handles restarts and other processes;
+            // wake this process as well so an enabled/edit policy is not
+            // delayed by the ordinary one-minute scheduler tick.
+            if update.enabled {
+                state.codex_reset_credit_wake.notify_one();
+            }
+
+            codex_reset_credit_automation_response(&state)
+        }
+        _ => (
+            StatusCode::METHOD_NOT_ALLOWED,
+            Json(serde_json::json!({
+                "ok": false,
+                "message": "Codex reset-credit automation supports GET and POST"
+            })),
+        )
+            .into_response(),
+    }
+}
+
+fn codex_reset_credit_automation_response(state: &AppState) -> Response {
+    match codex_reset_credit_automation_json(state) {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => {
+            error!(
+                "failed to read Codex reset-credit automation state: {}",
+                err
+            );
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "message": "Codex reset-credit automation state is unavailable"
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Produces the browser-safe automation snapshot.  In particular, the
+/// durable idempotency key is intentionally absent: it is an internal
+/// recovery credential and must never be copied into dashboard JavaScript.
+fn codex_reset_credit_automation_json(state: &AppState) -> Result<serde_json::Value, String> {
+    let policies = codex_reset_credit::list_policies(state.cfg.as_ref())?;
+    let actions = codex_reset_credit::list_actions(state.cfg.as_ref())?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "defaults": {
+            "scan_interval_minutes": codex_reset_credit::DEFAULT_SCAN_INTERVAL_MINUTES,
+            "minimum_expiry_lead_minutes": codex_reset_credit::MIN_AUTOMATIC_EXPIRY_LEAD_MINUTES,
+            "expiry_window_minutes": codex_reset_credit::DEFAULT_EXPIRY_WINDOW_MINUTES,
+            "final_attempt_minutes": codex_reset_credit::DEFAULT_FINAL_ATTEMPT_MINUTES,
+            "min_natural_reset_remaining_minutes": codex_reset_credit::DEFAULT_MIN_NATURAL_RESET_REMAINING_MINUTES
+        },
+        "accounts": codex_reset_credit_automation_accounts(state),
+        "policies": policies,
+        "actions": actions.into_iter().map(|action| serde_json::json!({
+            "id": action.id,
+            "account_key": action.account_key,
+            "credit_id": action.credit_id,
+            "reset_type": action.reset_type,
+            "credit_expires_at": action.credit_expires_at,
+            "state": action.state,
+            "trigger": action.trigger,
+            "next_attempt_at": action.next_attempt_at,
+            "attempt_count": action.attempt_count,
+            "last_outcome": action.last_outcome,
+            "created_at": action.created_at,
+            "updated_at": action.updated_at,
+            "submitted_at": action.submitted_at,
+            "verified_at": action.verified_at
+        })).collect::<Vec<_>>()
+    }))
+}
+
+/// Only active, uniquely-resolved ChatGPT account IDs are eligible for
+/// unattended redemption.  File names and display labels can change, and are
+/// therefore deliberately not accepted as policy selectors.
+fn codex_reset_credit_automation_accounts(state: &AppState) -> Vec<serde_json::Value> {
+    // Drop the token lock before calling the shared validator, which takes
+    // its own short snapshot to detect duplicate enabled credentials.
+    let tokens = state.tokens.lock().unwrap().clone();
+    let mut accounts = tokens
+        .iter()
+        .filter_map(|token| {
+            let account_id = token.account_id.as_deref()?.trim();
+            (!account_id.is_empty()).then(|| {
+                let account_key = codex_stats_key(token);
+                let eligible =
+                    codex_reset_credit::validate_automation_account_key(state, &account_key)
+                        .is_ok();
+                serde_json::json!({
+                    "account_key": account_key,
+                    "label": token.label.clone(),
+                    "account_id": account_id,
+                    "file_name": token.file_name.clone(),
+                    "enabled": token.enabled,
+                    "eligible": eligible
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    accounts.sort_by(|left, right| {
+        left["account_key"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["account_key"].as_str().unwrap_or_default())
+    });
+    accounts.dedup_by(|left, right| left["account_key"] == right["account_key"]);
+    accounts
 }
 
 async fn admin_account_routing_route(
@@ -12784,14 +13248,7 @@ async fn codex_rate_limit_reset_consume_route(
     if let Some(response) = require_admin_session_json(&state, &headers) {
         return response;
     }
-    let fallback_idempotency_key = Uuid::new_v4().to_string();
-    match target::codex::quota::consume_rate_limit_reset_credit(
-        &state,
-        form,
-        fallback_idempotency_key,
-    )
-    .await
-    {
+    match codex_reset_credit::consume_manually(&state, form).await {
         Ok(value) => axum::Json(value).into_response(),
         Err(err) => axum::Json(serde_json::json!({
             "ok": false,

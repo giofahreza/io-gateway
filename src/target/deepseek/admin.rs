@@ -271,6 +271,7 @@ mod tests {
                 disabled_files: None,
                 admin_auth: crate::admin_auth::AdminAuthConfig::default(),
                 oauth: crate::target::oauth::OAuthConfig::default(),
+                codex_reset_credit_app_server: crate::CodexResetCreditAppServerConfig::default(),
                 request_body_limit_enabled: crate::default_request_body_limit_enabled(),
                 max_request_body_bytes: crate::default_max_request_body_bytes(),
                 max_concurrent_requests: crate::default_max_concurrent_requests(),
@@ -347,6 +348,7 @@ mod tests {
                 persistence_tx: std::sync::mpsc::channel().0,
                 account_router: Arc::new(Mutex::new(HashMap::new())),
                 account_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
+                codex_reset_credit_wake: Arc::new(tokio::sync::Notify::new()),
             };
 
             let _ = base_url;

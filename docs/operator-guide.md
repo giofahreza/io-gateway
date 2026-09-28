@@ -286,6 +286,51 @@ not the process working directory.
 - Upstream connect, per-read/stream-idle, and first SSE event timeouts default to 10, 120, and 45 seconds.
 - Usage history is stored in SQLite WAL mode. Existing `gateway-usage-history.jsonl` data is imported once, then bounded by the configured retention and entry limits.
 - OAuth provider configs are optional; built-in defaults are used when omitted.
+- `codex_reset_credit_app_server` is optional and off by default. It is the
+  explicit local Codex App Server integration used only for earned
+  reset-credit automation and manual redemption; it does not use
+  `upstream_base`. See [Codex reset-credit automation](codex-reset-credit-automation.md)
+  before enabling it.
+
+### Codex reset-credit App Server
+
+Codex App Server is experimental and unsupported for production workloads. The
+gateway will not redeem a reset credit through a direct HTTP fallback. To enable
+this optional integration, configure an absolute trusted Codex executable and
+one pre-created private managed-login profile for every stable Codex account:
+
+```json
+{
+  "codex_reset_credit_app_server": {
+    "experimental_opt_in": true,
+    "command": "/usr/local/bin/codex",
+    "profile_root": "/var/lib/io-gateway/codex-app-server-profiles",
+    "profiles": [
+      {
+        "account_key": "codex:account_id:org_123",
+        "profile": "org_123",
+        "expected_email": "ops@example.com"
+      }
+    ]
+  }
+}
+```
+
+The gateway invokes only `codex app-server --stdio -c
+cli_auth_credentials_store="file"`, with a scrubbed environment whose `HOME`,
+`CODEX_HOME`, and `CODEX_SQLITE_HOME` point to the mapped profile. It never
+sends its stored gateway bearer credential to the child. The command, profile
+root, and each profile must be existing absolute non-symlink paths; profiles use
+simple names only and must be private (`0700` or stricter on Unix). Each profile
+also needs its own private regular `auth.json`; a profile `config.toml` may not
+set `sqlite_home` and may select only the `file` credential store. Each
+`account_key` and profile directory is unique. The account must already be
+logged in through Codex's managed ChatGPT authentication, not an API key or
+externally supplied tokens. Every enabled profile binding must provide
+`expected_email`, and it must match the email returned by App Server's
+`account/read` check. That check confirms the managed profile's ChatGPT email;
+it does not prove the upstream stable account ID, which is established by the
+`account_key` mapping.
 
 ### Environment variable overrides
 
@@ -530,6 +575,7 @@ All client requests use `Authorization: Bearer <IO_GATEWAY_KEY>`.
 | `GET /dashboard.json` | Full dashboard data JSON |
 | `GET /quota.json` | Codex account quota data |
 | `POST /codex/rate-limit-reset-credit/consume` | Redeem an available Codex usage-limit reset credit |
+| `GET/POST /admin/codex/reset-credit-automation` | Read or configure durable per-account Codex reset-credit automation |
 | `POST /credentials/delete` | Delete a credential file |
 | `POST /credentials/toggle` | Enable or disable a credential |
 | `GET /admin/api-keys` | List managed API keys and selectable provider accounts |
@@ -778,6 +824,11 @@ curl http://127.0.0.1:8319/login/codex/submit \
 }
 ```
 
+`GET /quota.json` is an informational dashboard cache. Reset-credit automation
+and manual redemption re-read the selected credit and rate-limit state through
+the mapped App Server profile; a displayed cached credit is never by itself
+authorization to spend.
+
 Redeem one reset credit for a saved Codex credential:
 
 ```bash
@@ -785,11 +836,87 @@ curl -sS -X POST 'http://127.0.0.1:8319/codex/rate-limit-reset-credit/consume' \
   -b "$ADMIN_COOKIE" \
   -H "Content-Type: application/x-www-form-urlencoded" \
   -d "file_name=my-codex-account.json" \
-  -d "credit_id=credit_..." \
-  -d "idempotency_key=$(uuidgen)"
+  -d "credit_id=credit_..."
 ```
 
-`credit_id` is optional; when omitted, ChatGPT selects the next available reset credit. A reset is only possible when the account has an available earned reset credit and a current Codex rate-limit window is eligible for reset.
+`credit_id` is required. The gateway records the exact opaque credit ID and a
+server-managed idempotency key before any upstream redemption, so manual and
+automatic redemption cannot race or accidentally consume different credits.
+Do not supply a client idempotency key or ask upstream to choose the next
+available credit. The mapped App Server profile must revalidate the selected
+credit and a current Codex rate-limit window before a reset is possible.
+
+#### Expiry-driven reset-credit automation
+
+Automatic redemption is disabled by default and is configured per stable Codex
+account ID, not by a label or filename. The durable configuration and action
+ledger live in `api-key-policy.sqlite3` under `auth_dir`; they contain account
+keys, opaque credit IDs, action state, timestamps, and idempotency keys, but no
+provider token, prompt, request body, or raw upstream response.
+
+Reset-credit reads and consumes use the configured local Codex App Server
+JSON-RPC account API: `account/rateLimits/read` and
+`account/rateLimitResetCredit/consume`. They do not use `upstream_base` or the
+gateway's direct Wham HTTP quota adapter. App Server configuration is required,
+explicitly experimental, and has no direct-backend fallback.
+
+The default policy scans every 30 minutes and creates a new automatic action
+only when `30 minutes <= expires_at - now <= 60 minutes`. The background worker
+wakes once per minute only to honor persisted action deadlines; it does not turn
+the scan into a one-minute polling loop. An already selected durable action may
+still be rechecked closer to expiry after a deferral, retry, or temporary
+upstream failure, but a newly discovered credit under 30 minutes away is never
+selected automatically. When an eligible credit has a durable action, a final
+check is normally scheduled five minutes before expiry. `expiry_window_minutes`
+must be 30 through 10,080 and `final_attempt_minutes` must be 1 through one
+minute less than the expiry window. A restart preserves that deadline, but an
+outage that lasts past the credit's expiry cannot be recovered automatically.
+
+For each scan, the gateway uses fresh Codex rate-limit and credit reads rather
+than the dashboard cache. It selects the earliest-expiring explicit
+Codex-rate-limits credit (the App Server form is `codexRateLimits`), then
+requires a fresh reached-limit check immediately before it sends a consume
+request. It preserves the credit when the ordinary
+rate-limit reset is near (10 minutes by default), when upstream does not expose
+a safe reset time, or when a credit count/details mismatch cannot safely prove
+the selected credit. It re-reads rate limits after a successful or idempotent
+consume result. Network timeouts retain the same stored credit ID and idempotency
+key for retry; they never select a second credit. Ambiguous post-consume
+verification is stopped in `manual_review` rather than spending another credit.
+
+List current policies and safe action status:
+
+```bash
+curl -sS 'http://127.0.0.1:8319/admin/codex/reset-credit-automation' \
+  -b "$ADMIN_COOKIE"
+```
+
+Enable the default policy for a displayed stable account key:
+
+```bash
+curl -sS -X POST 'http://127.0.0.1:8319/admin/codex/reset-credit-automation' \
+  -b "$ADMIN_COOKIE" \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "account_key": "codex:account_id:org_123",
+    "enabled": true,
+    "scan_interval_minutes": 30,
+    "expiry_window_minutes": 60,
+    "final_attempt_minutes": 5,
+    "min_natural_reset_remaining_minutes": 10
+  }'
+```
+
+Only a currently enabled, uniquely resolved `codex:account_id:<id>` account can
+be enabled. The endpoint redacts the persisted idempotency key from its action
+status response. Disable the policy with the same body and `"enabled": false`;
+disabling remains allowed even after that stable account's credential disappears.
+Existing submitted actions remain durable for safe reconciliation and are never
+silently replaced by another credit.
+
+See [Codex reset-credit automation](codex-reset-credit-automation.md) for the
+exact App Server/profile setup, eligibility rules, policy validation, action
+states, legacy-action migration, manual behavior, and durable-storage guidance.
 
 #### Codex CLI config
 

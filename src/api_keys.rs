@@ -1209,6 +1209,7 @@ mod tests {
             disabled_files: None,
             admin_auth: crate::admin_auth::AdminAuthConfig::default(),
             oauth: crate::target::oauth::OAuthConfig::default(),
+            codex_reset_credit_app_server: crate::CodexResetCreditAppServerConfig::default(),
             request_body_limit_enabled: crate::default_request_body_limit_enabled(),
             max_request_body_bytes: crate::default_max_request_body_bytes(),
             max_concurrent_requests: crate::default_max_concurrent_requests(),
