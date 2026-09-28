@@ -4,6 +4,7 @@
   "proxy_api_key": "your-shared-proxy-key",
   "tokens": [],
   "auth_dir": "./auths",
+  "request_body_limit_enabled": false,
   "max_request_body_bytes": 16777216,
   "max_concurrent_requests": 128,
   "upstream_connect_timeout_seconds": 10,

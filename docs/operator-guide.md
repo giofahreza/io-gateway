@@ -226,6 +226,7 @@ not the process working directory.
   "tokens": [],
   "auth_dir": "./auths",
   "disabled_files": [],
+  "request_body_limit_enabled": false,
   "max_request_body_bytes": 16777216,
   "max_concurrent_requests": 128,
   "upstream_connect_timeout_seconds": 10,
@@ -276,7 +277,12 @@ not the process working directory.
 - `admin_auth.session_ttl_seconds` defaults to 43200 (12 hours), min 300, max 604800 (7 days).
 - Set `admin_auth.secure_cookies` to `true` when the dashboard is served over HTTPS.
 - Set `trusted_proxy` only when a configured reverse proxy sanitizes forwarded IP headers.
-- Request bodies default to 16 MiB and concurrent requests default to 128.
+- `request_body_limit_enabled` controls the gateway's request payload cap. Set it to
+  `false` to disable the cap, or `true` to enforce `max_request_body_bytes` (16 MiB by
+  default). Omitting the toggle preserves the existing enabled behavior; the example
+  config explicitly disables it. Restart the gateway after changing these settings.
+- With the cap disabled, request bodies are still buffered in memory. Provider and
+  reverse-proxy limits apply independently. Concurrent requests default to 128.
 - Upstream connect, per-read/stream-idle, and first SSE event timeouts default to 10, 120, and 45 seconds.
 - Usage history is stored in SQLite WAL mode. Existing `gateway-usage-history.jsonl` data is imported once, then bounded by the configured retention and entry limits.
 - OAuth provider configs are optional; built-in defaults are used when omitted.

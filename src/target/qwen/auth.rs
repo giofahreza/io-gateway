@@ -1366,6 +1366,7 @@ mod tests {
                 auth_dir: Some(auth_dir.to_string_lossy().to_string()),
                 disabled_files: None,
                 admin_auth: crate::admin_auth::AdminAuthConfig::default(),
+                request_body_limit_enabled: crate::default_request_body_limit_enabled(),
                 max_request_body_bytes: crate::default_max_request_body_bytes(),
                 max_concurrent_requests: crate::default_max_concurrent_requests(),
                 trusted_proxy: false,

@@ -229,6 +229,8 @@ struct Config {
     admin_auth: admin_auth::AdminAuthConfig,
     #[serde(default)]
     oauth: target::oauth::OAuthConfig,
+    #[serde(default = "default_request_body_limit_enabled")]
+    request_body_limit_enabled: bool,
     #[serde(default = "default_max_request_body_bytes")]
     max_request_body_bytes: usize,
     #[serde(default = "default_max_concurrent_requests")]
@@ -245,6 +247,10 @@ struct Config {
     upstream_read_timeout_seconds: u64,
     #[serde(default = "default_upstream_first_event_timeout_seconds")]
     upstream_first_event_timeout_seconds: u64,
+}
+
+fn default_request_body_limit_enabled() -> bool {
+    true
 }
 
 fn default_max_request_body_bytes() -> usize {
@@ -701,9 +707,7 @@ async fn main() {
         .route("/api-docs/openapi.json", any(source::openapi::openapi_json))
         .route("/*path", any(proxy))
         .with_state(state.clone())
-        .layer(axum::extract::DefaultBodyLimit::max(
-            state.cfg.max_request_body_bytes,
-        ))
+        .layer(request_body_limit_layer(&state.cfg))
         .layer(tower::limit::ConcurrencyLimitLayer::new(
             state.cfg.max_concurrent_requests,
         ));
@@ -713,6 +717,11 @@ async fn main() {
 
     let addr: SocketAddr = state.cfg.listen.parse().expect("invalid listen address");
     info!("listening on {}", addr);
+    info!(
+        enabled = state.cfg.request_body_limit_enabled,
+        max_request_body_bytes = state.cfg.max_request_body_bytes,
+        "request body limit configuration"
+    );
     axum::serve(tokio::net::TcpListener::bind(addr).await.unwrap(), app)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -12773,43 +12782,11 @@ async fn proxy(
     let mut state = state;
     state.request_api_key_id = authenticated.id.clone();
 
-    let content_length = valid_content_length(&headers);
-    if content_length.is_some_and(|length| length > state.cfg.max_request_body_bytes as u64) {
-        warn!(
-            path = %raw_path,
-            content_length,
-            max_request_body_bytes = state.cfg.max_request_body_bytes,
-            "rejecting oversized request body from Content-Length"
-        );
-        return oversized_request_body_response(
-            source_api,
-            state.cfg.max_request_body_bytes,
-            content_length,
-        );
-    }
-
-    // Read full body (small/simple proxy)
-    let body_bytes = match axum::body::to_bytes(body, state.cfg.max_request_body_bytes).await {
-        Ok(b) => b,
-        Err(err) => {
-            if is_length_limit_error(&err) {
-                warn!(
-                    path = %raw_path,
-                    content_length,
-                    max_request_body_bytes = state.cfg.max_request_body_bytes,
-                    "rejecting request body that exceeded the streaming limit"
-                );
-                return oversized_request_body_response(
-                    source_api,
-                    state.cfg.max_request_body_bytes,
-                    content_length,
-                );
-            } else {
-                warn!(path = %raw_path, error = %err, "request body read failed");
-                return invalid_request_body_response(source_api);
-            }
-        }
-    };
+    let body_bytes =
+        match read_request_body(&state.cfg, source_api, &raw_path, &headers, body).await {
+            Ok(bytes) => bytes,
+            Err(response) => return response,
+        };
 
     let routed = match route_request(&raw_path, &uri, &method, &headers, body_bytes) {
         Ok(r) => r,
@@ -13511,6 +13488,65 @@ async fn proxy(
     (status, out_headers, body).into_response()
 }
 
+fn request_body_limit_layer(cfg: &Config) -> axum::extract::DefaultBodyLimit {
+    if cfg.request_body_limit_enabled {
+        axum::extract::DefaultBodyLimit::max(cfg.max_request_body_bytes)
+    } else {
+        axum::extract::DefaultBodyLimit::disable()
+    }
+}
+
+async fn read_request_body(
+    cfg: &Config,
+    source_api: SourceApi,
+    path: &str,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<Bytes, Response> {
+    let content_length = valid_content_length(headers);
+    if cfg.request_body_limit_enabled
+        && content_length.is_some_and(|length| length > cfg.max_request_body_bytes as u64)
+    {
+        warn!(
+            path,
+            content_length,
+            max_request_body_bytes = cfg.max_request_body_bytes,
+            "rejecting oversized request body from Content-Length"
+        );
+        return Err(oversized_request_body_response(
+            source_api,
+            cfg.max_request_body_bytes,
+            content_length,
+        ));
+    }
+
+    let limit = if cfg.request_body_limit_enabled {
+        cfg.max_request_body_bytes
+    } else {
+        usize::MAX
+    };
+    match axum::body::to_bytes(body, limit).await {
+        Ok(bytes) => Ok(bytes),
+        Err(err) if cfg.request_body_limit_enabled && is_length_limit_error(&err) => {
+            warn!(
+                path,
+                content_length,
+                max_request_body_bytes = cfg.max_request_body_bytes,
+                "rejecting request body that exceeded the streaming limit"
+            );
+            Err(oversized_request_body_response(
+                source_api,
+                cfg.max_request_body_bytes,
+                content_length,
+            ))
+        }
+        Err(err) => {
+            warn!(path, error = %err, "request body read failed");
+            Err(invalid_request_body_response(source_api))
+        }
+    }
+}
+
 fn valid_content_length(headers: &HeaderMap) -> Option<u64> {
     let mut parsed = None;
     for value in headers.get_all(axum::http::header::CONTENT_LENGTH).iter() {
@@ -13610,12 +13646,149 @@ fn invalid_request_body_response(source_api: SourceApi) -> Response {
 mod request_body_limit_tests {
     use super::{
         invalid_request_body_response, is_length_limit_error, oversized_request_body_response,
-        valid_content_length, SourceApi,
+        read_request_body, request_body_limit_layer, valid_content_length, Config, SourceApi,
     };
     use axum::{
-        body::{to_bytes, Body},
-        http::{header::CONTENT_LENGTH, HeaderMap, HeaderValue, StatusCode},
+        body::{to_bytes, Body, Bytes},
+        http::{header::CONTENT_LENGTH, HeaderMap, HeaderValue, Request, StatusCode},
+        routing::post,
+        Router,
     };
+    use tower::ServiceExt;
+
+    fn config() -> Config {
+        serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1:0",
+            "upstream_base": "https://example.test",
+            "proxy_api_key": "test",
+            "tokens": [],
+            "max_request_body_bytes": 8
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn omitted_toggle_preserves_existing_limit_and_false_disables_it() {
+        assert!(config().request_body_limit_enabled);
+        let disabled: Config = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1:0",
+            "upstream_base": "https://example.test",
+            "proxy_api_key": "test",
+            "tokens": [],
+            "request_body_limit_enabled": false,
+            "max_request_body_bytes": 8
+        }))
+        .unwrap();
+        assert!(!disabled.request_body_limit_enabled);
+        assert_eq!(disabled.max_request_body_bytes, 8);
+    }
+
+    #[tokio::test]
+    async fn enabled_limit_rejects_declared_and_chunked_overflow() {
+        let cfg = config();
+        let headers = HeaderMap::new();
+        let bytes = read_request_body(
+            &cfg,
+            SourceApi::V1,
+            "/v1/responses",
+            &headers,
+            Body::from(vec![0; 8]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes.len(), 8);
+
+        for declared_length in [None, Some("9")] {
+            let mut headers = HeaderMap::new();
+            if let Some(length) = declared_length {
+                headers.insert(CONTENT_LENGTH, HeaderValue::from_static(length));
+            }
+            let chunks = futures_util::stream::iter([
+                Ok::<_, std::io::Error>(Bytes::from_static(b"12345")),
+                Ok(Bytes::from_static(b"6789")),
+            ]);
+            let response = read_request_body(
+                &cfg,
+                SourceApi::V1,
+                "/v1/responses",
+                &headers,
+                Body::from_stream(chunks),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_limit_accepts_declared_and_chunked_overflow() {
+        let mut cfg = config();
+        cfg.request_body_limit_enabled = false;
+        for declared_length in [None, Some("9")] {
+            let mut headers = HeaderMap::new();
+            if let Some(length) = declared_length {
+                headers.insert(CONTENT_LENGTH, HeaderValue::from_static(length));
+            }
+            let chunks = futures_util::stream::iter([
+                Ok::<_, std::io::Error>(Bytes::from_static(b"12345")),
+                Ok(Bytes::from_static(b"6789")),
+            ]);
+            let bytes = read_request_body(
+                &cfg,
+                SourceApi::V1,
+                "/v1/responses",
+                &headers,
+                Body::from_stream(chunks),
+            )
+            .await
+            .unwrap();
+            assert_eq!(&bytes[..], b"123456789");
+        }
+    }
+
+    #[tokio::test]
+    async fn extractor_layer_obeys_toggle_including_axum_default_limit() {
+        for enabled in [true, false] {
+            let mut cfg = config();
+            cfg.request_body_limit_enabled = enabled;
+            let app = Router::new()
+                .route(
+                    "/",
+                    post(|body: Bytes| async move { body.len().to_string() }),
+                )
+                .layer(request_body_limit_layer(&cfg));
+            let size = 2 * 1024 * 1024 + 1;
+            let request = Request::post("/").body(Body::from(vec![0; size])).unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            if enabled {
+                assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            } else {
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                assert_eq!(bytes, size.to_string());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn disabling_size_limit_preserves_body_read_errors() {
+        let mut cfg = config();
+        cfg.request_body_limit_enabled = false;
+        let chunks = futures_util::stream::iter([Err::<Bytes, _>(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "body read failed",
+        ))]);
+        let response = read_request_body(
+            &cfg,
+            SourceApi::V1,
+            "/v1/responses",
+            &HeaderMap::new(),
+            Body::from_stream(chunks),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn content_length_is_used_only_when_valid_and_unambiguous() {

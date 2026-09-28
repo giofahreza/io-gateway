@@ -486,6 +486,7 @@ mod tests {
             disabled_files: None,
             admin_auth: Default::default(),
             oauth: Default::default(),
+            request_body_limit_enabled: crate::default_request_body_limit_enabled(),
             max_request_body_bytes: crate::default_max_request_body_bytes(),
             max_concurrent_requests: crate::default_max_concurrent_requests(),
             trusted_proxy: false,
