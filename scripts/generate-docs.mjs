@@ -80,7 +80,7 @@ IO_GATEWAY_START_NOW=no \\
 IO_GATEWAY_INTERACTIVE=no \\
 bash -c 'set -o pipefail; curl -fsSL https://github.com/giofahreza/io-gateway/releases/latest/download/install.sh | sh'</code></pre>
       <p>The same cross-platform environment variables are available with values <code>auto</code>, <code>yes</code>, or <code>no</code> where applicable: <code>IO_GATEWAY_INSTALL_IOGW</code>, <code>IO_GATEWAY_AUTOSTART</code>, <code>IO_GATEWAY_START_NOW</code>, and <code>IO_GATEWAY_INTERACTIVE</code>; <code>IO_GATEWAY_PORT</code> selects the port. Explicit command-line choices take precedence. <code>--start-now</code> / <code>-StartNow</code> starts the gateway immediately without changing autostart; <code>--no-start</code> / <code>-NoStart</code> skips that launch while preserving an existing service or task. Combine <code>--autostart --no-start</code> for a next-sign-in-only service, or <code>--no-autostart --start-now</code> for a one-off local background process.</p>
-      <div class="docs-note warning"><strong>Secure before exposing</strong><p>Admin authentication is initially disabled only for local setup. Configure a TOTP secret and enable <code>admin_auth</code> before changing <code>listen</code> to a LAN or public address.</p></div>
+      <div class="docs-note warning"><strong>Secure before exposing</strong><p>Admin authentication is initially disabled only for local setup. Configure a separate admin API key, a TOTP secret, and <code>admin_auth</code> before changing <code>listen</code> to a LAN or public address. The client-facing <code>proxy_api_key</code> is never a dashboard credential.</p></div>
       <h2>Finish setup</h2>
       <ol class="docs-steps">
         <li><span>1</span><div><strong>Open the local dashboard.</strong><p>If you chose <em>Start now</em>, visit <code>http://127.0.0.1:&lt;selected-port&gt;/</code> after the gateway becomes healthy (the default is <code>http://127.0.0.1:8319/</code>). Otherwise, use the printed command to start it now or sign in again when autostart is enabled.</p></div></li>
@@ -102,7 +102,7 @@ cp config.example.json config.json
       <h2>Next steps</h2>
       <ul class="docs-list">
         <li><strong>Secure dashboard access</strong> Configure admin auth before exposing the service.</li>
-        <li><strong>Create managed API keys</strong> Replace broad shared-key access with scoped keys and prompt-token limits.</li>
+        <li><strong>Create managed API keys</strong> Replace broad shared-key access with provider/account scopes, per-request input caps, and optional input-token budgets.</li>
         <li><strong>Plan routing</strong> Use priority routing or custom models when traffic should prefer specific accounts.</li>
       </ul>
     `,
@@ -124,7 +124,7 @@ cp config.example.json config.json
       <h2>What you need</h2>
       <ul class="docs-list">
         <li><strong>A ready gateway</strong> Confirm <code>/ready</code> returns successfully before configuring a client.</li>
-        <li><strong>A client key</strong> Use the shared <code>proxy_api_key</code> or a managed key with access to the provider or alias you intend to call.</li>
+        <li><strong>A client key</strong> Use the shared <code>proxy_api_key</code> or a managed key with access to the provider/account target it may call. Custom aliases are authorized through their concrete targets, not through alias-specific key scopes.</li>
         <li><strong>An enabled model</strong> Ask the gateway for its catalog instead of guessing a provider model name.</li>
       </ul>
       <h2>Read the catalog first</h2>
@@ -133,7 +133,7 @@ export IO_GATEWAY_KEY='replace-with-your-client-key'
 
 curl -sS "$IO_GATEWAY_URL/v1/models" \\
   -H "Authorization: Bearer $IO_GATEWAY_KEY"</code></pre>
-      <p>Choose a model returned by <code>/v1/models</code>. A model name can select a provider naturally, a three-letter prefix can force a provider, and a <code>ctm:</code> alias can apply a route policy you created.</p>
+      <p>Choose a model returned by <code>/v1/models</code>. For a managed key, the catalog is filtered to its permitted provider/account routes. A model name can select a provider naturally, a three-letter prefix can force one, and a <code>ctm:</code> alias can apply a route policy you created.</p>
       <h2>Send one response</h2>
       <pre><code>curl -sS "$IO_GATEWAY_URL/v1/responses" \\
   -H "Authorization: Bearer $IO_GATEWAY_KEY" \\
@@ -147,9 +147,9 @@ curl -sS "$IO_GATEWAY_URL/v1/models" \\
       <ol class="docs-steps compact">
         <li><span>1</span><div><strong>Confirm the client response.</strong><p>A successful response proves the request cleared client authentication and reached an eligible route.</p></div></li>
         <li><span>2</span><div><strong>Check usage history.</strong><p>Confirm the selected provider and account match the route policy you expected.</p></div></li>
-        <li><span>3</span><div><strong>Repeat with a managed key.</strong><p>Use the real key your client will receive to prove that its scope and prompt limits behave as intended.</p></div></li>
+        <li><span>3</span><div><strong>Repeat with a managed key.</strong><p>Use the real key your client will receive to prove its provider/account scope, per-request input cap, and input-token budget behave as intended.</p></div></li>
       </ol>
-      <div class="docs-note"><strong>If the route is rejected</strong><p>Check the key scope, model spelling or prefix, custom-model state, and provider-account eligibility before changing the client. The <a class="docs-inline-link" href="/docs/test-api/">Test API</a> is useful for separating an operator route problem from a client-key problem.</p></div>
+      <div class="docs-note"><strong>If the route is rejected</strong><p>Check the key's provider/account scope, model spelling or prefix, custom-model state, and provider-account eligibility before changing the client. The <a class="docs-inline-link" href="/docs/test-api/">Test API</a> can isolate an operator route problem in its default bypass mode, or validate a selected managed-key profile without entering that key's secret.</p></div>
     `,
   },
   {
@@ -174,13 +174,13 @@ curl -sS "$IO_GATEWAY_URL/v1/models" \\
         <li><span>1</span><div><strong>Add provider accounts.</strong><p>Open the provider account section and add OAuth or API-key credentials for each upstream provider.</p></div></li>
         <li><span>2</span><div><strong>Test a model route.</strong><p>Use <a class="docs-inline-link" href="/docs/test-api/">Test API</a> after adding credentials or changing route rules.</p></div></li>
         <li><span>3</span><div><strong>Create custom models.</strong><p>Build <code>ctm:</code> aliases when clients need stable names, weights, account targeting, or fallback chains.</p></div></li>
-        <li><span>4</span><div><strong>Manage API keys.</strong><p>Scope keys by provider, account, or alias and set prompt-token limits.</p></div></li>
+        <li><span>4</span><div><strong>Manage API keys.</strong><p>Scope keys by provider and account, then set per-request input caps or optional input-token budgets.</p></div></li>
       </ol>
       <h2>Operator checks</h2>
       <div class="docs-grid">
         <article><h3>Account health</h3><p>Look for disabled, cooling-down, failed, and quota-exhausted accounts before blaming client requests.</p></article>
         <article><h3>Usage history</h3><p>Use provider and account history to confirm routing behavior after changes.</p></article>
-        <article><h3>Custom aliases</h3><p>Confirm aliases appear in the model catalog before publishing them to clients.</p></article>
+        <article><h3>Custom aliases</h3><p>Confirm an alias appears in the catalog returned to the intended client key before publishing it to clients.</p></article>
         <article><h3>Notifications</h3><p>Send a notification test after changing Telegram or Google Chat settings.</p></article>
       </div>
       <h2>Verify changes</h2>
@@ -199,7 +199,7 @@ curl -sS "$IO_GATEWAY_URL/v1/models" \\
     categories: ["How-to guides", "Accounts"],
     keywords: "provider accounts codex gemini claude qwen glm grok copilot oauth api key auth_dir disable refresh reauth",
     summary: "Add, enable, refresh, re-auth, and test upstream provider accounts.",
-    seeAlso: ["dashboard", "priority-routing", "usage-and-quota"],
+    seeAlso: ["dashboard", "priority-routing", "usage-and-quota", "codex-reset-credit-automation"],
     body: `
       <p class="docs-lead">Provider accounts are the upstream identities IO Gateway uses when routing model requests. Add at least one healthy account before exposing an API key to clients.</p>
       ${docsFigure("docs-provider-accounts.png", "Provider account cards with enabled, disabled, priority, quota, reset limit, and attention states.", "Provider cards make routing eligibility visible before traffic reaches the account pool.")}
@@ -224,6 +224,98 @@ curl -sS "$IO_GATEWAY_URL/v1/models" \\
       </tbody></table></div>
       <h2>Verify routing</h2>
       <p>Use <a class="docs-inline-link" href="/docs/usage-and-quota/">usage history</a> to confirm that traffic reaches the expected account. For deliberate account draining, enable <a class="docs-inline-link" href="/docs/priority-routing/">priority routing</a>.</p>
+    `,
+  },
+  {
+    slug: "codex-reset-credit-automation",
+    title: "Codex reset-credit automation",
+    group: "How-to guides",
+    type: "How-to guide",
+    appliesTo: "Preserving expiring Codex reset credits",
+    storage: "<auth_dir>/api-key-policy.sqlite3",
+    introduced: docsVersion,
+    updated: "September 21, 2026",
+    categories: ["How-to guides", "Accounts", "Limits", "Operations"],
+    keywords: "codex chatgpt app server json rpc rate limit reset credit expiry automatic redeem idempotency account profile policy sqlite action ledger",
+    summary: "Safely preserve an expiring Codex reset credit through a managed local App Server profile when an account limit is reached.",
+    seeAlso: ["provider-accounts", "usage-and-quota", "configuration"],
+    body: `
+      <p class="docs-lead">Codex reset-credit automation is an opt-in, per-account safety net for an earned ChatGPT usage-limit reset credit that is nearing expiry. It is deliberately conservative: it never treats a dashboard cache, a renamed credential, or an ambiguous network result as authority to spend a credit.</p>
+      <h2>What the policy does</h2>
+      <ol class="docs-steps compact">
+        <li><span>1</span><div><strong>Read fresh App Server state.</strong><p>The worker reads Codex rate limits and reset-credit details through the mapped local App Server profile; the dashboard quota cache is not used to authorize redemption.</p></div></li>
+        <li><span>2</span><div><strong>Select one concrete credit.</strong><p>It chooses the earliest-expiring available Codex-rate-limits credit (the App Server form is <code>codexRateLimits</code>) with an explicit ID and a known expiry at least 30 minutes and no later than the configured upper window from the fresh read.</p></div></li>
+        <li><span>3</span><div><strong>Prove it is needed.</strong><p>Immediately before the POST, another fresh read must show a reached Codex limit, the same credit still available, and a natural reset that is not already near.</p></div></li>
+        <li><span>4</span><div><strong>Persist, redeem, verify.</strong><p>The exact credit ID and a gateway-generated idempotency key are durable before the POST. A successful or idempotent answer needs a final fresh read proving the limit cleared.</p></div></li>
+      </ol>
+      <h2>Use managed local App Server profiles</h2>
+      <p>Reset-credit work uses the documented Codex App Server JSON-RPC account API, not <code>upstream_base</code> or the gateway's direct HTTP/Wham quota adapter. It launches a short-lived local <code>codex app-server --stdio</code> child for <code>account/rateLimits/read</code> and <code>account/rateLimitResetCredit/consume</code>. Codex App Server is experimental and unsupported for production workloads, so this feature remains off unless its configuration explicitly opts in; there is no direct-backend fallback.</p>
+      <pre><code>{
+  "codex_reset_credit_app_server": {
+    "experimental_opt_in": true,
+    "command": "/usr/local/bin/codex",
+    "profile_root": "/var/lib/io-gateway/codex-app-server-profiles",
+    "profiles": [{
+      "account_key": "codex:account_id:org_123",
+      "profile": "org_123",
+      "expected_email": "ops@example.com"
+    }]
+  }
+}</code></pre>
+      <p>The executable and profile root must be absolute existing paths. Each simple profile directory is private and uniquely bound to one stable account, and must already contain its own private <code>auth.json</code> from a Codex-managed ChatGPT login. IO Gateway verifies the managed account and its required configured email on launch, clears ambient environment values, supplies no gateway bearer credential to the child, and fixes a file-backed credential-store override. A profile <code>config.toml</code> may not set <code>sqlite_home</code>; an explicit <code>cli_auth_credentials_store</code> is allowed only when it is <code>"file"</code>.</p>
+      <h2>Before enabling it</h2>
+      <ul class="docs-list">
+        <li><strong>Keep the dashboard private.</strong> This is an administrator-only operation on an upstream ChatGPT account.</li>
+        <li><strong>Use a stable identity and profile.</strong> The account must be an enabled, uniquely resolved <code>codex:account_id:&lt;id&gt;</code> with a matching configured managed App Server profile. Labels, filenames, and anonymous <code>manual-N</code> identities are rejected for unattended use.</li>
+        <li><strong>Expect fail-closed behavior.</strong> A count/details state that cannot prove the exact selected credit, unknown expiry, unavailable fresh state, or unknown natural reset time means no automatic spend; an existing automatic action is deferred for a later fresh check.</li>
+      </ul>
+      <h2>Default timing</h2>
+      <div class="docs-table-wrap"><table class="docs-table"><thead><tr><th>Setting</th><th>Default</th><th>Effect</th></tr></thead><tbody>
+        <tr><td><code>scan_interval_minutes</code></td><td>30</td><td>Per-account cadence for newly eligible credits; enabling or editing an enabled policy also schedules one immediate scan.</td></tr>
+        <tr><td><code>expiry_window_minutes</code></td><td>60</td><td>Upper selection bound: a new automatic action requires <code>30 minutes &lt;= expires_at - now &lt;= window</code>.</td></tr>
+        <tr><td><code>final_attempt_minutes</code></td><td>5</td><td>Schedule a deferred action's final pre-expiry check this many minutes before expiry when possible.</td></tr>
+        <tr><td><code>min_natural_reset_remaining_minutes</code></td><td>10</td><td>Retain the credit when the ordinary reached window will reset at or within this time.</td></tr>
+      </tbody></table></div>
+      <p>The worker wakes every minute only to honor durable action deadlines; it does not scan every account every minute. Policy scans remain on their configured cadence. With the default 30-minute cadence and 60-minute upper window, new credits are selected only in the intended 30–60 minute interval before expiry. An already selected durable action may be rechecked closer to expiry after a deferral, retry, or temporary upstream failure; that never makes a newly discovered credit under 30 minutes old eligible. <code>expiry_window_minutes</code> must be 30 through 10,080, and <code>final_attempt_minutes</code> must be 1 through one minute less than that window. A restart preserves scan and action deadlines, but an outage that lasts beyond credit expiry cannot be recovered automatically.</p>
+      <h2>Enable and inspect</h2>
+      <p>Read the eligible account keys, defaults, policies, and browser-safe action status:</p>
+      <pre><code>curl -sS http://127.0.0.1:8319/admin/codex/reset-credit-automation \\
+  -b "$ADMIN_COOKIE"</code></pre>
+      <p>Enable the default policy for an account marked eligible:</p>
+      <pre><code>curl -sS -X POST http://127.0.0.1:8319/admin/codex/reset-credit-automation \\
+  -b "$ADMIN_COOKIE" \\
+  -H 'Content-Type: application/json' \\
+  --data '{
+    "account_key":"codex:account_id:org_123",
+    "enabled":true,
+    "scan_interval_minutes":30,
+    "expiry_window_minutes":60,
+    "final_attempt_minutes":5,
+    "min_natural_reset_remaining_minutes":10
+  }'</code></pre>
+      <p>Disabling the same stable account key stops future automatic work and remains allowed even after its credential is disabled or removed. Existing actions remain durable for audit and safe recovery; disabling does not make the worker choose another credit. The write endpoint rejects unknown fields and never returns its internal idempotency keys.</p>
+      <h2>Read action state safely</h2>
+      <div class="docs-table-wrap"><table class="docs-table"><thead><tr><th>State</th><th>Meaning</th></tr></thead><tbody>
+        <tr><td><code>pending</code></td><td>A specific credit is waiting for its first durable attempt.</td></tr>
+        <tr><td><code>deferred</code></td><td>The credit is being retained for a later check: no reached limit, nearby/unknown natural reset, a disabled policy, or a safe retry time.</td></tr>
+        <tr><td><code>submitted</code></td><td>The exact credit and idempotency key were stored before a POST; any retry uses those same values.</td></tr>
+        <tr><td><code>verified</code></td><td>A fresh post-consume read confirmed the reached rate limit cleared.</td></tr>
+        <tr><td><code>no_credit</code>, <code>expired</code></td><td>The selected credit is no longer usable.</td></tr>
+        <tr><td><code>manual_review</code></td><td>The outcome is ambiguous, or a legacy direct-HTTP submission needs review. Automation stops rather than spending another credit.</td></tr>
+      </tbody></table></div>
+      <p>Opaque credit IDs, timing, and safe outcome metadata are stored, but provider credentials, prompts, raw request bodies, raw upstream responses, and idempotency keys are not exposed through the browser endpoint.</p>
+      <h2>Manual redemption shares the ledger</h2>
+      <p>Manual reset requests require a concrete <code>credit_id</code> and the same matching managed App Server profile; the gateway generates and persists the idempotency key. The dashboard quota view is informational only: the endpoint re-reads the selected credit and rate-limit state through App Server before spending. Do not ask upstream to select the next credit or send a client idempotency key.</p>
+      <pre><code>curl -sS -X POST http://127.0.0.1:8319/codex/rate-limit-reset-credit/consume \\
+  -b "$ADMIN_COOKIE" \\
+  -H 'Content-Type: application/x-www-form-urlencoded' \\
+  -d 'file_name=my-codex-account.json' \\
+  -d 'credit_id=credit_...'</code></pre>
+      <div class="docs-note"><strong>Operate from durable evidence</strong><p>Only <code>verified</code> proves that a reset completed. A timeout after submission retains the exact credit and idempotency key for recovery. Treat <code>manual_review</code> as an operator task, not a reason to send another redemption request with a different credit.</p></div>
+      <h2>Legacy transport migration</h2>
+      <p>Older direct-HTTP/Wham actions are migrated safely. A legacy action already marked <code>submitted</code> becomes <code>manual_review</code>; its old idempotency key is never replayed through App Server. A legacy <code>pending</code> or <code>deferred</code> action is retained and must pass fresh App Server checks before it can proceed.</p>
+      <h2>Persistence and backup</h2>
+      <p>Policies and actions live in <code>&lt;auth_dir&gt;/api-key-policy.sqlite3</code> with managed API-key policy and quota accounting. Keep that directory on persistent local storage, retain its identity file, and use <code>io-gateway --config /absolute/config.json --backup-policy /backups/new-policy-snapshot</code> for a WAL-consistent policy snapshot. Do not share the live SQLite database across hosts or over NFS.</p>
     `,
   },
   {
@@ -283,7 +375,7 @@ curl -sS "$IO_GATEWAY_URL/v1/models" \\
       <p class="docs-lead">Custom models create stable <code>ctm:</code> aliases that can route to one or more provider models, specific accounts, weighted target sets, or fallback chains.</p>
       ${docsFigure("docs-custom-models.png", "Custom model cards showing ctm aliases with weighted provider targets and fallback steps.", "A custom model is shown as a route card: stable alias, route steps, target count, and provider/account targets.")}
       <h2>Before you start</h2>
-      <p>Confirm the target provider accounts are healthy and visible in the <a class="docs-inline-link" href="/docs/dashboard/">dashboard</a>. If the alias will be exposed to clients, decide which <a class="docs-inline-link" href="/docs/api-keys/">API keys</a> may call it.</p>
+      <p>Confirm the target provider accounts are healthy and visible in the <a class="docs-inline-link" href="/docs/dashboard/">dashboard</a>. If the alias will be exposed to clients, make sure each target provider/account is allowed by the relevant <a class="docs-inline-link" href="/docs/api-keys/">API keys</a>; keys do not have alias-specific allow-lists.</p>
       <h2>Create an alias</h2>
       <ol class="docs-steps">
         <li><span>1</span><div><strong>Open Custom Models in the dashboard.</strong><p>This section manages aliases that clients call as <code>ctm:name</code>.</p></div></li>
@@ -320,18 +412,18 @@ curl -sS "$IO_GATEWAY_URL/v1/models" \\
     introduced: docsVersion,
     updated,
     categories: ["How-to guides", "API access"],
-    keywords: "test api dashboard settings model validate route prompt admin session smoke test",
-    summary: "Validate models and routes from the dashboard without creating a separate client API key.",
+    keywords: "test api dashboard settings model validate route managed key policy prompt admin session smoke test",
+    summary: "Validate upstream routes in operator-bypass mode or against a selected managed-key policy.",
     seeAlso: ["dashboard", "custom-models", "usage-and-quota"],
     body: `
-      <p class="docs-lead">Test API sends a dashboard-authenticated prompt through the same routing layer used by clients. Use it after account, custom-model, API-key, or priority-routing changes.</p>
+      <p class="docs-lead">Test API sends a dashboard-authenticated prompt through the provider-routing layer. Use its default operator-bypass mode to validate an upstream account, model, or custom route; select a managed-key profile to validate that key's policy too.</p>
       ${docsFigure("docs-test-api.png", "Test API panel showing a custom model request and a successful response with HTTP status, latency, selected model, and raw response details.", "Use Test API to validate route behavior before giving the route to client keys.")}
       <h2>Before you start</h2>
-      <p>Sign in to the <a class="docs-inline-link" href="/docs/dashboard/">dashboard</a> with an operator session. Test API validates routing without requiring a separate managed client key.</p>
+      <p>Sign in to the <a class="docs-inline-link" href="/docs/dashboard/">dashboard</a> with an operator session. The default selection is operator bypass, which does not apply a managed key's scope, per-request cap, or budget. Select an active managed API-key profile to apply those controls before dispatch; only its ID is sent, never its plaintext secret.</p>
       <h2>Run a test</h2>
       <ol class="docs-steps">
         <li><span>1</span><div><strong>Open Test API.</strong><p>Use the dashboard action near account and model management.</p></div></li>
-        <li><span>2</span><div><strong>Select a model.</strong><p>Choose a provider model or a <code>ctm:</code> alias.</p></div></li>
+        <li><span>2</span><div><strong>Select a model and policy mode.</strong><p>Choose a provider model or a <code>ctm:</code> alias; keep operator bypass for a route-only check or choose an active managed-key profile to test its policy.</p></div></li>
         <li><span>3</span><div><strong>Send a short prompt.</strong><p>Use a small request when validating credentials, quota, or routing behavior.</p></div></li>
         <li><span>4</span><div><strong>Inspect the result.</strong><p>Check response status, account selection, and provider error details.</p></div></li>
       </ol>
@@ -339,9 +431,10 @@ curl -sS "$IO_GATEWAY_URL/v1/models" \\
       <ul class="docs-list">
         <li><strong>Credentials work</strong> The selected provider account can authenticate upstream.</li>
         <li><strong>Route exists</strong> The selected model or custom alias is known to IO Gateway.</li>
-        <li><strong>Limits allow the prompt</strong> Prompt-token and scope checks did not reject the request.</li>
+        <li><strong>Operator route works</strong> In bypass mode, the gateway can choose an eligible upstream account and send the operator test.</li>
+        <li><strong>Managed policy works</strong> With a selected profile, provider/account scope, per-request caps, and the cumulative input-token budget are checked before dispatch.</li>
       </ul>
-      <div class="docs-note"><strong>Client keys are still separate</strong><p>Test API proves the route works for operators. To prove a client integration, send a request with the actual managed API key and inspect usage history.</p></div>
+      <div class="docs-note"><strong>Choose the right mode</strong><p>Operator bypass proves the route without client-key restrictions. A selected managed profile validates policy without exposing its secret; send a request with the actual client key as the final integration check.</p></div>
     `,
   },
   {
@@ -390,8 +483,8 @@ curl -sS "$IO_GATEWAY_URL/v1/models" \\
     introduced: docsVersion,
     updated,
     categories: ["Reference", "Configuration"],
-    keywords: "config json env admin auth proxy api key totp secure cookies trusted proxy",
-    summary: "Core config.json fields, environment overrides, dashboard auth, and proxy safety settings.",
+    keywords: "config json env admin auth proxy api key totp secure cookies trusted proxy codex app server reset credit profiles",
+    summary: "Core config.json fields, environment overrides, dashboard auth, proxy safety, and optional Codex App Server reset-credit profiles.",
     seeAlso: ["quick-start", "deployment", "troubleshooting"],
     body: `
       <p class="docs-lead">Configuration controls the HTTP listener, upstream defaults, credential directory, dashboard authentication, proxy trust, and retention settings.</p>
@@ -410,10 +503,26 @@ curl -sS "$IO_GATEWAY_URL/v1/models" \\
         <tr><td><code>proxy_api_key</code></td><td>Shared key for client API requests unless managed API keys are used.</td></tr>
         <tr><td><code>auth_dir</code></td><td>Directory where provider credential files are stored.</td></tr>
         <tr><td><code>disabled_files</code></td><td>Credential files that should load but start disabled.</td></tr>
-        <tr><td><code>admin_auth</code></td><td>Dashboard key, TOTP secret, cookie security, and session lifetime.</td></tr>
+        <tr><td><code>codex_reset_credit_app_server</code></td><td>Optional explicit local Codex App Server configuration for reset-credit automation and manual redemption.</td></tr>
+        <tr><td><code>admin_auth</code></td><td>Dashboard authentication: a TOTP secret, optional separate admin API key, cookie security, and session lifetime.</td></tr>
         <tr><td><code>trusted_proxy</code></td><td>Enable only behind a reverse proxy that sanitizes forwarded IP headers.</td></tr>
         <tr><td><code>history_retention_days</code></td><td>How long usage history remains available for charts and summaries.</td></tr>
       </tbody></table></div>
+      <h2>Codex reset-credit App Server</h2>
+      <p>Reset-credit automation uses the documented local Codex App Server JSON-RPC account API, not <code>upstream_base</code> or the direct HTTP quota adapter. It is experimental and off until an administrator explicitly opts in with a trusted executable and a private managed profile for each stable account.</p>
+      <pre><code>{
+  "codex_reset_credit_app_server": {
+    "experimental_opt_in": true,
+    "command": "/usr/local/bin/codex",
+    "profile_root": "/var/lib/io-gateway/codex-app-server-profiles",
+    "profiles": [{
+      "account_key": "codex:account_id:org_123",
+      "profile": "org_123",
+      "expected_email": "ops@example.com"
+    }]
+  }
+}</code></pre>
+      <p>The command and profile root are absolute existing paths. Profile names are simple directory names below the root, are unique per stable account, and must already hold a private file-backed Codex-managed ChatGPT login in <code>auth.json</code>. Every enabled profile binding must provide <code>expected_email</code>, which must match App Server's <code>account/read</code> email. This confirms the managed profile's ChatGPT email; it does not prove the upstream stable account ID, which remains the <code>account_key</code> mapping. On Unix, the root and profile directories must be private (<code>0700</code> or stricter) and not symlinks. IO Gateway runs only <code>codex app-server --stdio -c cli_auth_credentials_store="file"</code> with a scrubbed profile-specific environment; it never passes the gateway credential to the child. A profile <code>config.toml</code> may not set <code>sqlite_home</code> and may select only the <code>file</code> credential store. See <a class="docs-inline-link" href="/docs/codex-reset-credit-automation/">Codex reset-credit automation</a> for the safety model and migration behavior.</p>
       <h2>Admin auth environment overrides</h2>
       <pre><code>ADMIN_AUTH_ENABLED=true
 ADMIN_AUTH_API_KEY=your-admin-key
@@ -421,6 +530,7 @@ ADMIN_AUTH_TOTP_SECRET=BASE32_SECRET
 ADMIN_AUTH_SESSION_TTL_SECONDS=43200
 ADMIN_AUTH_SECURE_COOKIES=true</code></pre>
       <h2>Security notes</h2>
+      <div class="docs-note"><strong>Dashboard and client credentials are separate</strong><p>When <code>admin_auth.api_key</code> or <code>ADMIN_AUTH_API_KEY</code> is configured, dashboard login requires it in addition to TOTP. It never falls back to <code>proxy_api_key</code>.</p></div>
       <div class="docs-note warning"><strong>Public binding is a separate deployment decision</strong><p>Do not change <code>listen</code> to <code>0.0.0.0:8319</code> until dashboard authentication is enabled, client keys are protected, and the proxy in front of the gateway sanitizes forwarded headers.</p></div>
       <div class="docs-note warning"><strong>Use secure cookies behind HTTPS</strong><p>Set <code>ADMIN_AUTH_SECURE_COOKIES=true</code> when the dashboard is served through HTTPS.</p></div>
     `,
@@ -434,33 +544,50 @@ ADMIN_AUTH_SECURE_COOKIES=true</code></pre>
     introduced: docsVersion,
     updated,
     categories: ["Reference", "API access", "Limits"],
-    keywords: "api keys managed scopes provider account prompt token limits whole key custom aliases access rules",
-    summary: "Create managed keys with provider/account scopes and prompt-token limits at whole, provider, and account levels.",
+    keywords: "api keys managed scopes provider account estimated input tokens per request input token budget custom aliases access rules",
+    summary: "Create managed keys with scopes, input caps, and durable first-use daily, weekly, or monthly token/request quotas.",
     seeAlso: ["dashboard", "routing-and-models", "usage-and-quota"],
     body: `
-      <p class="docs-lead">Managed API keys let operators expose only the model routes a client should use and enforce prompt-token limits at the whole-key, provider, and account levels.</p>
-      ${docsFigure("docs-api-key-limits.png", "API key settings showing whole-key, provider-level, and account-level prompt token limits.", "Managed keys can combine route scope with prompt ceilings before any upstream account is selected.")}
+      <p class="docs-lead">Managed API keys restrict clients by provider and account. Add per-request input caps, legacy input budgets, or independent renewable request and token quotas. Rules and usage are persisted in SQLite across restarts.</p>
+      ${docsFigure("docs-api-key-limits.png", "API key settings showing whole-key, provider-level, and account-level input-token controls.", "Managed keys combine provider/account access with per-request input caps before upstream dispatch.")}
       <h2>Access model</h2>
       <ul class="docs-list">
-        <li><strong>Whole key</strong> Global limit across every provider and model the key may call.</li>
-        <li><strong>Provider</strong> Limit usage for one upstream provider such as Claude, Gemini, or Codex.</li>
-        <li><strong>Account</strong> Limit usage for a specific provider account.</li>
-        <li><strong>Model scope</strong> Allow raw provider prefixes or specific <code>ctm:</code> aliases.</li>
+        <li><strong>Provider</strong> Allow one or more upstream providers such as Claude, Gemini, or Codex.</li>
+        <li><strong>Account</strong> Within an allowed provider, allow every account or selected accounts only.</li>
+        <li><strong>Custom models</strong> A <code>ctm:</code> request is authorized against each resolved target's provider and account. There is no model-name or alias-specific allow-list.</li>
       </ul>
       <h2>Create a managed key</h2>
       <ol class="docs-steps compact">
         <li><span>1</span><div><strong>Open API Keys in the dashboard.</strong><p>Use an authenticated operator session.</p></div></li>
-        <li><span>2</span><div><strong>Choose route scope.</strong><p>Select providers, accounts, model prefixes, or custom aliases.</p></div></li>
-        <li><span>3</span><div><strong>Set prompt-token limits.</strong><p>Use whole-key, provider, and account limits where needed.</p></div></li>
+        <li><span>2</span><div><strong>Choose route scope.</strong><p>Select providers and, for each provider, every account or selected accounts.</p></div></li>
+        <li><span>3</span><div><strong>Set input controls.</strong><p>Set a per-request input cap at whole-key, provider, or account level; optionally set a whole-key cumulative input-token budget.</p></div></li>
         <li><span>4</span><div><strong>Test with the client key.</strong><p>Send a request with the generated key and verify usage history.</p></div></li>
       </ol>
-      <h2>Limit fields</h2>
+      <h2>Input controls</h2>
       <div class="docs-table-wrap"><table class="docs-table"><thead><tr><th>Limit</th><th>Meaning</th></tr></thead><tbody>
-        <tr><td>Whole prompt-token limit</td><td>Maximum prompt tokens the key may spend across all allowed routes.</td></tr>
-        <tr><td>Provider prompt-token limit</td><td>Maximum prompt tokens the key may spend on one provider.</td></tr>
-        <tr><td>Account prompt-token limit</td><td>Maximum prompt tokens the key may spend on one upstream account.</td></tr>
-        <tr><td>Scope allow-list</td><td>Providers, models, accounts, or aliases this key can call.</td></tr>
+        <tr><td><code>max_estimated_input_tokens_per_request</code></td><td>A positive maximum for estimated input tokens in one request. Set it at whole-key, provider, or account level; the smallest matching cap applies. Omit it for no per-request cap.</td></tr>
+        <tr><td><code>prompt_token_limit</code></td><td>Deprecated input alias for <code>max_estimated_input_tokens_per_request</code>, retained for migration.</td></tr>
+        <tr><td><code>input_token_budget</code></td><td>Optional whole-key cumulative input-token control: <code>{"limit": positive_integer, "period": "lifetime" | "calendar_month"}</code>. It does not cap output tokens or monetary cost.</td></tr>
+        <tr><td>Scope allow-list</td><td>Providers and accounts this key can call; it is not a model or alias allow-list.</td></tr>
       </tbody></table></div>
+      <p>A per-request cap is a guardrail, not a spending counter. Use <code>input_token_budget</code> when cumulative input-token usage needs a lifetime or calendar-month boundary.</p>
+      <p>Neither legacy input control is a request-count quota. Cap-only keys can make repeated requests that each fit their cap. Legacy budget estimates are conservative, not exact provider billing counts; each upstream retry or fallback needs its own reservation, and settlement retains at least that amount.</p>
+      <h2>Renewable request and token quotas</h2>
+      <p>Set <code>access.quota</code> to a <code>timezone</code> (default <code>UTC</code>) and a <code>rules</code> array. Each rule contains <code>metric</code>, <code>period</code>, and a positive integer <code>limit</code>. Periods are <code>daily</code>, <code>weekly</code>, or <code>monthly</code>. Multiple rules apply atomically.</p>
+      <pre><code>{"all":true,"quota":{"timezone":"Asia/Jakarta","rules":[{"metric":"requests","period":"daily","limit":100},{"metric":"input_tokens","period":"weekly","limit":100000},{"metric":"output_tokens","period":"monthly","limit":50000}]}}</code></pre>
+      <p>Metrics: <code>requests</code>, <code>input_tokens</code>, <code>uncached_input_tokens</code>, <code>output_tokens</code>, <code>cache_read_tokens</code>, <code>cache_write_tokens</code>, and <code>cache_tokens</code>. Input includes cached input; output includes reasoning. Do not add those subsets again to token totals. Missing provider usage is unknown, not zero.</p>
+      <p>The first accepted generation starts the common anchor. Daily is 24 hours; weekly is 168 hours; monthly follows the original calendar date/time in the chosen timezone, clamping short months. January 31 renews February 28/29 then March 31. Creation, rejected requests, catalog queries, inactivity, and server restarts do not reset usage or move an established anchor.</p>
+      <p>One admitted client generation consumes one request; retries/fallbacks consume additional tokens, not another logical request. All dimensions are reserved before upstream dispatch and settled to trustworthy actual usage. Interrupted or missing reports retain uncertain conservative charges. Requests-per-day is not a burst/concurrency rate limiter.</p>
+      <p>Use <strong>Add quota rule</strong> in the dashboard. Inspect confirmed, reserved, uncertain, and remaining amounts through <code>GET /admin/api-keys/quotas?id=KEY_ID</code> or <code>iogw keys quotas --id KEY_ID</code>. Exhaustion returns protocol-native <code>429 quota_exceeded</code> with renewal/retry headers. Ordinary allowance edits preserve balances; activated schedule changes are rejected instead of silently resetting them.</p>
+      <p>Dashboard balances refresh after managed-key Test API calls and every 10 seconds while Settings is open. These read-only refreshes preserve unsaved policy edits and account selections. If a per-key accounting summary fails, <code>/admin/api-keys/quotas</code> returns <code>503</code> with <code>ok: false</code>, retaining available summaries and an <code>{"error":true}</code> entry for each failed key. Unavailable accounting never means zero usage or a renewed allowance.</p>
+      <p>Renewable quota limits support positive signed-64-bit integers through <code>9223372036854775807</code>. The dashboard safely edits integers only through <code>9007199254740991</code>; it refuses to edit a policy with larger limits instead of rounding or removing them. Use <code>iogw keys update KEY_ID --access-json @access.json</code> or the admin API for those policies, and <code>iogw keys quotas --id KEY_ID</code> or the API for exact large balances.</p>
+      <p>Admin create/update requests reject unknown fields in the outer payload and access, provider, account-limit, input-budget, and quota objects. Typos such as <code>acess</code> or <code>quotas</code> cannot silently create an unlimited key. The canonical cap name and deprecated <code>prompt_token_limit</code> alias remain accepted. An empty create payload deliberately creates an unrestricted key; updates require an <code>access</code> object. Persisted legacy metadata remains compatible with migration.</p>
+      <div class="docs-note"><strong>Strict provider capability checks</strong><p>Set a small explicit output maximum for output quotas. A provider/model without a defensible bound is rejected before dispatch with <code>quota_measurement_required</code>; Codex, Grok, and native MiniMax Responses strict output quotas are currently unsupported. Unknown usage can reduce usable allowance conservatively. Request-only quotas do not require token measurement.</p></div>
+      <h2>Restart-safe accounting</h2>
+      <p>Managed key authority and quota ledgers live in <code>&lt;auth_dir&gt;/api-key-policy.sqlite3</code>. Legacy JSON is imported with a private recovery backup and an old-binary migration sentinel. Preserve the database, its identity file, and the persistent local volume. Missing or damaged established accounting fails closed; a legacy budget whose accounting database is missing cannot be migrated to a fresh allowance. Pin an explicit persistent <code>auth_dir</code> before upgrading.</p>
+      <pre><code>io-gateway --config /absolute/config.json --backup-policy /backups/new-policy-snapshot</code></pre>
+      <p>This command creates a consistent private SQLite snapshot with matching identity metadata and exits. The destination must be new; provider credentials, configuration and reporting history need separate backups. Copying just a live main database can lose committed WAL data. Restoring an old backup requires reconciling the missing usage interval.</p>
+      <p>Keys with input controls reject unmeasurable media, encrypted or retained context, and provider-hosted retrieval or execution tools with <code>400 prompt_measurement_required</code>. Ordinary function definitions and JSON schemas remain measurable. Policy history includes dispatches and outcomes for cap-only keys as well as budgeted keys.</p>
       <h2>Operational advice</h2>
       <div class="docs-note"><strong>Prefer managed keys for clients</strong><p>Use managed keys instead of the broad shared proxy key when exposing IO Gateway to applications or users.</p></div>
     `,
@@ -496,7 +623,7 @@ ADMIN_AUTH_SECURE_COOKIES=true</code></pre>
       </tbody></table></div>
       <h2>Investigate unexpected usage</h2>
       <ol class="docs-steps compact">
-        <li><span>1</span><div><strong>Check the managed API key.</strong><p>Confirm the key allows the provider, account, or alias being used.</p></div></li>
+        <li><span>1</span><div><strong>Check the managed API key.</strong><p>Confirm the key allows the resolved provider and account. A custom alias is authorized through its concrete targets, not as a separate scope entry.</p></div></li>
         <li><span>2</span><div><strong>Check priority routing.</strong><p>Priority accounts should receive traffic before normal accounts while eligible.</p></div></li>
         <li><span>3</span><div><strong>Check fallback behavior.</strong><p>Provider failures can move traffic to another target in a custom model.</p></div></li>
       </ol>
@@ -518,7 +645,7 @@ ADMIN_AUTH_SECURE_COOKIES=true</code></pre>
       <p class="docs-lead">A request crosses several deliberate boundaries before it reaches an upstream account: client key, requested model or alias, account eligibility, priority policy, and fallback. This page makes that route inspectable.</p>
       <h2>Choose the client surface</h2>
       <div class="docs-table-wrap"><table class="docs-table"><thead><tr><th>Client need</th><th>Gateway route</th></tr></thead><tbody>
-        <tr><td>Discover enabled models</td><td><code>GET /v1/models</code></td></tr>
+        <tr><td>Discover models available to the caller</td><td><code>GET /v1/models</code></td></tr>
         <tr><td>OpenAI Responses API</td><td><code>POST /v1/responses</code></td></tr>
         <tr><td>OpenAI Chat Completions API</td><td><code>POST /v1/chat/completions</code></td></tr>
         <tr><td>Anthropic Messages API</td><td><code>POST /claude/v1/messages</code> or <code>POST /claude/messages</code></td></tr>
@@ -529,7 +656,7 @@ ADMIN_AUTH_SECURE_COOKIES=true</code></pre>
       <ol class="docs-steps compact">
         <li><span>1</span><div><strong>Accept the client key.</strong><p>The request must pass the shared gateway key or the managed API-key rules before any provider is contacted.</p></div></li>
         <li><span>2</span><div><strong>Resolve the requested model.</strong><p>A natural model name selects its provider, a three-letter prefix forces one, and <code>ctm:</code> resolves a custom alias.</p></div></li>
-        <li><span>3</span><div><strong>Apply the boundary.</strong><p>Managed-key provider, account, alias, and prompt-token rules reject requests outside the client’s allowed route.</p></div></li>
+        <li><span>3</span><div><strong>Apply the boundary.</strong><p>Managed-key provider/account rules and input controls are applied to each concrete route target. Aliases are routing policies, not independent key-scope entries.</p></div></li>
         <li><span>4</span><div><strong>Build an eligible account pool.</strong><p>Disabled, failed, cooling-down, and quota-exhausted accounts are excluded before selection.</p></div></li>
         <li><span>5</span><div><strong>Use priority where present.</strong><p>Eligible priority accounts are selected before the normal pool for that provider.</p></div></li>
         <li><span>6</span><div><strong>Fail over and leave evidence.</strong><p>A custom alias may try another target; usage history records the resulting route so the decision can be checked.</p></div></li>
@@ -648,7 +775,7 @@ const journeys = [
     number: "02",
     title: "Connect capacity",
     description: "Add provider accounts, understand their state, and use the dashboard as the place to see what can serve traffic.",
-    pageSlugs: ["provider-accounts", "dashboard"],
+    pageSlugs: ["provider-accounts", "codex-reset-credit-automation", "dashboard"],
   },
   {
     number: "03",
@@ -672,8 +799,8 @@ const journeys = [
 
 const topicCategories = [
   { title: "Routing", slug: "routing", description: "Priority routing, custom models, model prefixes, fallback, and account selection." },
-  { title: "Accounts", slug: "accounts", description: "Upstream provider credentials, account health, quota use, and priority membership." },
-  { title: "Limits", slug: "limits", description: "Prompt-token limits, usage history, quota views, and managed API-key controls." },
+  { title: "Accounts", slug: "accounts", description: "Upstream provider credentials, account health, quota use, reset credits, and priority membership." },
+  { title: "Limits", slug: "limits", description: "Per-request input caps, input-token budgets, usage history, quota views, and managed API-key controls." },
   { title: "Deployment", slug: "deployment", description: "Release tags, production service updates, GitHub Pages deployment, and rollback." },
   { title: "Notifications", slug: "notifications", description: "Telegram and Google Chat alerts for provider, quota, and operational events." },
   { title: "Configuration", slug: "configuration", description: "Config files, environment overrides, dashboard auth, and proxy safety." },

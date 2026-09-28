@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
     <meta name="theme-color" content="#080d18" data-theme-color-light="#18375f" data-theme-color-dark="#080d18">
-    <meta name="description" content="Core config.json fields, environment overrides, dashboard auth, and proxy safety settings.">
+    <meta name="description" content="Core config.json fields, environment overrides, dashboard auth, proxy safety, and optional Codex App Server reset-credit profiles.">
     <title>Configuration - IO Gateway Docs</title>
     <link rel="manifest" href="/manifest.webmanifest">
     <link rel="icon" href="/icon.svg" type="image/svg+xml">
@@ -72,9 +72,9 @@
                 <small>Build, configure, run, and smoke-test IO Gateway for the first time.</small>
               </a>
 
-              <a href="/docs/configuration/" data-title="Configuration" data-category="Reference" data-summary="Core config.json fields, environment overrides, dashboard auth, and proxy safety settings." data-keywords="config json env admin auth proxy api key totp secure cookies trusted proxy" aria-current="page" class="is-active">
+              <a href="/docs/configuration/" data-title="Configuration" data-category="Reference" data-summary="Core config.json fields, environment overrides, dashboard auth, proxy safety, and optional Codex App Server reset-credit profiles." data-keywords="config json env admin auth proxy api key totp secure cookies trusted proxy codex app server reset credit profiles" aria-current="page" class="is-active">
                 <span>Configuration</span>
-                <small>Core config.json fields, environment overrides, dashboard auth, and proxy safety settings.</small>
+                <small>Core config.json fields, environment overrides, dashboard auth, proxy safety, and optional Codex App Server reset-credit profiles.</small>
               </a>
             </div>
 
@@ -86,6 +86,11 @@
                 <small>Add, enable, refresh, re-auth, and test upstream provider accounts.</small>
               </a>
 
+              <a href="/docs/codex-reset-credit-automation/" data-title="Codex reset-credit automation" data-category="How-to guides" data-summary="Safely preserve an expiring Codex reset credit through a managed local App Server profile when an account limit is reached." data-keywords="codex chatgpt app server json rpc rate limit reset credit expiry automatic redeem idempotency account profile policy sqlite action ledger">
+                <span>Codex reset-credit automation</span>
+                <small>Safely preserve an expiring Codex reset credit through a managed local App Server profile when an account limit is reached.</small>
+              </a>
+
               <a href="/docs/dashboard/" data-title="Dashboard" data-category="How-to guides" data-summary="Use the operator dashboard for accounts, testing, custom models, keys, and history." data-keywords="dashboard login providers settings overview custom models api keys usage history admin">
                 <span>Dashboard</span>
                 <small>Use the operator dashboard for accounts, testing, custom models, keys, and history.</small>
@@ -95,9 +100,9 @@
             <div class="docs-nav-group docs-journey-nav">
               <p class="docs-toc-label docs-journey-label"><span>03</span>Set route policy</p>
 
-              <a href="/docs/api-keys/" data-title="API keys" data-category="Reference" data-summary="Create managed keys with provider/account scopes and prompt-token limits at whole, provider, and account levels." data-keywords="api keys managed scopes provider account prompt token limits whole key custom aliases access rules">
+              <a href="/docs/api-keys/" data-title="API keys" data-category="Reference" data-summary="Create managed keys with scopes, input caps, and durable first-use daily, weekly, or monthly token/request quotas." data-keywords="api keys managed scopes provider account estimated input tokens per request input token budget custom aliases access rules">
                 <span>API keys</span>
-                <small>Create managed keys with provider/account scopes and prompt-token limits at whole, provider, and account levels.</small>
+                <small>Create managed keys with scopes, input caps, and durable first-use daily, weekly, or monthly token/request quotas.</small>
               </a>
 
               <a href="/docs/routing-and-models/" data-title="Routing and models" data-category="Explanation" data-summary="Understand gateway endpoints, model prefixes, custom aliases, failover, and routing rules." data-keywords="routing models v1 responses chat completions claude messages prefix ctm alias failover">
@@ -124,9 +129,9 @@
                 <small>Point a client at IO Gateway, inspect its model catalog, and prove a request reaches an upstream account.</small>
               </a>
 
-              <a href="/docs/test-api/" data-title="Test API" data-category="How-to guides" data-summary="Validate models and routes from the dashboard without creating a separate client API key." data-keywords="test api dashboard settings model validate route prompt admin session smoke test">
+              <a href="/docs/test-api/" data-title="Test API" data-category="How-to guides" data-summary="Validate upstream routes in operator-bypass mode or against a selected managed-key policy." data-keywords="test api dashboard settings model validate route managed key policy prompt admin session smoke test">
                 <span>Test API</span>
-                <small>Validate models and routes from the dashboard without creating a separate client API key.</small>
+                <small>Validate upstream routes in operator-bypass mode or against a selected managed-key policy.</small>
               </a>
 
               <a href="/docs/usage-and-quota/" data-title="Usage and quota" data-category="Reference" data-summary="Read usage history, context-token charts, account health, provider quota, and useful admin endpoints." data-keywords="usage quota history context tokens account health endpoints dashboard json account-routing">
@@ -179,10 +184,26 @@
         <tr><td><code>proxy_api_key</code></td><td>Shared key for client API requests unless managed API keys are used.</td></tr>
         <tr><td><code>auth_dir</code></td><td>Directory where provider credential files are stored.</td></tr>
         <tr><td><code>disabled_files</code></td><td>Credential files that should load but start disabled.</td></tr>
-        <tr><td><code>admin_auth</code></td><td>Dashboard key, TOTP secret, cookie security, and session lifetime.</td></tr>
+        <tr><td><code>codex_reset_credit_app_server</code></td><td>Optional explicit local Codex App Server configuration for reset-credit automation and manual redemption.</td></tr>
+        <tr><td><code>admin_auth</code></td><td>Dashboard authentication: a TOTP secret, optional separate admin API key, cookie security, and session lifetime.</td></tr>
         <tr><td><code>trusted_proxy</code></td><td>Enable only behind a reverse proxy that sanitizes forwarded IP headers.</td></tr>
         <tr><td><code>history_retention_days</code></td><td>How long usage history remains available for charts and summaries.</td></tr>
       </tbody></table></div>
+      <h2>Codex reset-credit App Server</h2>
+      <p>Reset-credit automation uses the documented local Codex App Server JSON-RPC account API, not <code>upstream_base</code> or the direct HTTP quota adapter. It is experimental and off until an administrator explicitly opts in with a trusted executable and a private managed profile for each stable account.</p>
+      <pre><code>{
+  "codex_reset_credit_app_server": {
+    "experimental_opt_in": true,
+    "command": "/usr/local/bin/codex",
+    "profile_root": "/var/lib/io-gateway/codex-app-server-profiles",
+    "profiles": [{
+      "account_key": "codex:account_id:org_123",
+      "profile": "org_123",
+      "expected_email": "ops@example.com"
+    }]
+  }
+}</code></pre>
+      <p>The command and profile root are absolute existing paths. Profile names are simple directory names below the root, are unique per stable account, and must already hold a private file-backed Codex-managed ChatGPT login in <code>auth.json</code>. Every enabled profile binding must provide <code>expected_email</code>, which must match App Server's <code>account/read</code> email. This confirms the managed profile's ChatGPT email; it does not prove the upstream stable account ID, which remains the <code>account_key</code> mapping. On Unix, the root and profile directories must be private (<code>0700</code> or stricter) and not symlinks. IO Gateway runs only <code>codex app-server --stdio -c cli_auth_credentials_store="file"</code> with a scrubbed profile-specific environment; it never passes the gateway credential to the child. A profile <code>config.toml</code> may not set <code>sqlite_home</code> and may select only the <code>file</code> credential store. See <a class="docs-inline-link" href="/docs/codex-reset-credit-automation/">Codex reset-credit automation</a> for the safety model and migration behavior.</p>
       <h2>Admin auth environment overrides</h2>
       <pre><code>ADMIN_AUTH_ENABLED=true
 ADMIN_AUTH_API_KEY=your-admin-key
@@ -190,6 +211,7 @@ ADMIN_AUTH_TOTP_SECRET=BASE32_SECRET
 ADMIN_AUTH_SESSION_TTL_SECONDS=43200
 ADMIN_AUTH_SECURE_COOKIES=true</code></pre>
       <h2>Security notes</h2>
+      <div class="docs-note"><strong>Dashboard and client credentials are separate</strong><p>When <code>admin_auth.api_key</code> or <code>ADMIN_AUTH_API_KEY</code> is configured, dashboard login requires it in addition to TOTP. It never falls back to <code>proxy_api_key</code>.</p></div>
       <div class="docs-note warning"><strong>Public binding is a separate deployment decision</strong><p>Do not change <code>listen</code> to <code>0.0.0.0:8319</code> until dashboard authentication is enabled, client keys are protected, and the proxy in front of the gateway sanitizes forwarded headers.</p></div>
       <div class="docs-note warning"><strong>Use secure cookies behind HTTPS</strong><p>Set <code>ADMIN_AUTH_SECURE_COOKIES=true</code> when the dashboard is served through HTTPS.</p></div>
 

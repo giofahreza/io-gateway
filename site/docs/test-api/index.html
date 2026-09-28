@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
     <meta name="theme-color" content="#080d18" data-theme-color-light="#18375f" data-theme-color-dark="#080d18">
-    <meta name="description" content="Validate models and routes from the dashboard without creating a separate client API key.">
+    <meta name="description" content="Validate upstream routes in operator-bypass mode or against a selected managed-key policy.">
     <title>Test API - IO Gateway Docs</title>
     <link rel="manifest" href="/manifest.webmanifest">
     <link rel="icon" href="/icon.svg" type="image/svg+xml">
@@ -72,9 +72,9 @@
                 <small>Build, configure, run, and smoke-test IO Gateway for the first time.</small>
               </a>
 
-              <a href="/docs/configuration/" data-title="Configuration" data-category="Reference" data-summary="Core config.json fields, environment overrides, dashboard auth, and proxy safety settings." data-keywords="config json env admin auth proxy api key totp secure cookies trusted proxy">
+              <a href="/docs/configuration/" data-title="Configuration" data-category="Reference" data-summary="Core config.json fields, environment overrides, dashboard auth, proxy safety, and optional Codex App Server reset-credit profiles." data-keywords="config json env admin auth proxy api key totp secure cookies trusted proxy codex app server reset credit profiles">
                 <span>Configuration</span>
-                <small>Core config.json fields, environment overrides, dashboard auth, and proxy safety settings.</small>
+                <small>Core config.json fields, environment overrides, dashboard auth, proxy safety, and optional Codex App Server reset-credit profiles.</small>
               </a>
             </div>
 
@@ -86,6 +86,11 @@
                 <small>Add, enable, refresh, re-auth, and test upstream provider accounts.</small>
               </a>
 
+              <a href="/docs/codex-reset-credit-automation/" data-title="Codex reset-credit automation" data-category="How-to guides" data-summary="Safely preserve an expiring Codex reset credit through a managed local App Server profile when an account limit is reached." data-keywords="codex chatgpt app server json rpc rate limit reset credit expiry automatic redeem idempotency account profile policy sqlite action ledger">
+                <span>Codex reset-credit automation</span>
+                <small>Safely preserve an expiring Codex reset credit through a managed local App Server profile when an account limit is reached.</small>
+              </a>
+
               <a href="/docs/dashboard/" data-title="Dashboard" data-category="How-to guides" data-summary="Use the operator dashboard for accounts, testing, custom models, keys, and history." data-keywords="dashboard login providers settings overview custom models api keys usage history admin">
                 <span>Dashboard</span>
                 <small>Use the operator dashboard for accounts, testing, custom models, keys, and history.</small>
@@ -95,9 +100,9 @@
             <div class="docs-nav-group docs-journey-nav">
               <p class="docs-toc-label docs-journey-label"><span>03</span>Set route policy</p>
 
-              <a href="/docs/api-keys/" data-title="API keys" data-category="Reference" data-summary="Create managed keys with provider/account scopes and prompt-token limits at whole, provider, and account levels." data-keywords="api keys managed scopes provider account prompt token limits whole key custom aliases access rules">
+              <a href="/docs/api-keys/" data-title="API keys" data-category="Reference" data-summary="Create managed keys with scopes, input caps, and durable first-use daily, weekly, or monthly token/request quotas." data-keywords="api keys managed scopes provider account estimated input tokens per request input token budget custom aliases access rules">
                 <span>API keys</span>
-                <small>Create managed keys with provider/account scopes and prompt-token limits at whole, provider, and account levels.</small>
+                <small>Create managed keys with scopes, input caps, and durable first-use daily, weekly, or monthly token/request quotas.</small>
               </a>
 
               <a href="/docs/routing-and-models/" data-title="Routing and models" data-category="Explanation" data-summary="Understand gateway endpoints, model prefixes, custom aliases, failover, and routing rules." data-keywords="routing models v1 responses chat completions claude messages prefix ctm alias failover">
@@ -124,9 +129,9 @@
                 <small>Point a client at IO Gateway, inspect its model catalog, and prove a request reaches an upstream account.</small>
               </a>
 
-              <a href="/docs/test-api/" data-title="Test API" data-category="How-to guides" data-summary="Validate models and routes from the dashboard without creating a separate client API key." data-keywords="test api dashboard settings model validate route prompt admin session smoke test" aria-current="page" class="is-active">
+              <a href="/docs/test-api/" data-title="Test API" data-category="How-to guides" data-summary="Validate upstream routes in operator-bypass mode or against a selected managed-key policy." data-keywords="test api dashboard settings model validate route managed key policy prompt admin session smoke test" aria-current="page" class="is-active">
                 <span>Test API</span>
-                <small>Validate models and routes from the dashboard without creating a separate client API key.</small>
+                <small>Validate upstream routes in operator-bypass mode or against a selected managed-key policy.</small>
               </a>
 
               <a href="/docs/usage-and-quota/" data-title="Usage and quota" data-category="Reference" data-summary="Read usage history, context-token charts, account health, provider quota, and useful admin endpoints." data-keywords="usage quota history context tokens account health endpoints dashboard json account-routing">
@@ -163,7 +168,7 @@
             <dl class="docs-meta"><div><dt>Use when</dt><dd>Dashboard route validation</dd></div><div><dt>Updated</dt><dd>September 4, 2026</dd></div></dl>
           </div>
 
-      <p class="docs-lead">Test API sends a dashboard-authenticated prompt through the same routing layer used by clients. Use it after account, custom-model, API-key, or priority-routing changes.</p>
+      <p class="docs-lead">Test API sends a dashboard-authenticated prompt through the provider-routing layer. Use its default operator-bypass mode to validate an upstream account, model, or custom route; select a managed-key profile to validate that key's policy too.</p>
 
       <figure class="docs-figure">
         <div class="docs-figure-frame">
@@ -172,11 +177,11 @@
         <figcaption>Use Test API to validate route behavior before giving the route to client keys.</figcaption>
       </figure>
       <h2>Before you start</h2>
-      <p>Sign in to the <a class="docs-inline-link" href="/docs/dashboard/">dashboard</a> with an operator session. Test API validates routing without requiring a separate managed client key.</p>
+      <p>Sign in to the <a class="docs-inline-link" href="/docs/dashboard/">dashboard</a> with an operator session. The default selection is operator bypass, which does not apply a managed key's scope, per-request cap, or budget. Select an active managed API-key profile to apply those controls before dispatch; only its ID is sent, never its plaintext secret.</p>
       <h2>Run a test</h2>
       <ol class="docs-steps">
         <li><span>1</span><div><strong>Open Test API.</strong><p>Use the dashboard action near account and model management.</p></div></li>
-        <li><span>2</span><div><strong>Select a model.</strong><p>Choose a provider model or a <code>ctm:</code> alias.</p></div></li>
+        <li><span>2</span><div><strong>Select a model and policy mode.</strong><p>Choose a provider model or a <code>ctm:</code> alias; keep operator bypass for a route-only check or choose an active managed-key profile to test its policy.</p></div></li>
         <li><span>3</span><div><strong>Send a short prompt.</strong><p>Use a small request when validating credentials, quota, or routing behavior.</p></div></li>
         <li><span>4</span><div><strong>Inspect the result.</strong><p>Check response status, account selection, and provider error details.</p></div></li>
       </ol>
@@ -184,9 +189,10 @@
       <ul class="docs-list">
         <li><strong>Credentials work</strong> The selected provider account can authenticate upstream.</li>
         <li><strong>Route exists</strong> The selected model or custom alias is known to IO Gateway.</li>
-        <li><strong>Limits allow the prompt</strong> Prompt-token and scope checks did not reject the request.</li>
+        <li><strong>Operator route works</strong> In bypass mode, the gateway can choose an eligible upstream account and send the operator test.</li>
+        <li><strong>Managed policy works</strong> With a selected profile, provider/account scope, per-request caps, and the cumulative input-token budget are checked before dispatch.</li>
       </ul>
-      <div class="docs-note"><strong>Client keys are still separate</strong><p>Test API proves the route works for operators. To prove a client integration, send a request with the actual managed API key and inspect usage history.</p></div>
+      <div class="docs-note"><strong>Choose the right mode</strong><p>Operator bypass proves the route without client-key restrictions. A selected managed profile validates policy without exposing its secret; send a request with the actual client key as the final integration check.</p></div>
 
 
           <section class="docs-related" aria-labelledby="continue-the-route">

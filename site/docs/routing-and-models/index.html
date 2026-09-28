@@ -72,9 +72,9 @@
                 <small>Build, configure, run, and smoke-test IO Gateway for the first time.</small>
               </a>
 
-              <a href="/docs/configuration/" data-title="Configuration" data-category="Reference" data-summary="Core config.json fields, environment overrides, dashboard auth, and proxy safety settings." data-keywords="config json env admin auth proxy api key totp secure cookies trusted proxy">
+              <a href="/docs/configuration/" data-title="Configuration" data-category="Reference" data-summary="Core config.json fields, environment overrides, dashboard auth, proxy safety, and optional Codex App Server reset-credit profiles." data-keywords="config json env admin auth proxy api key totp secure cookies trusted proxy codex app server reset credit profiles">
                 <span>Configuration</span>
-                <small>Core config.json fields, environment overrides, dashboard auth, and proxy safety settings.</small>
+                <small>Core config.json fields, environment overrides, dashboard auth, proxy safety, and optional Codex App Server reset-credit profiles.</small>
               </a>
             </div>
 
@@ -86,6 +86,11 @@
                 <small>Add, enable, refresh, re-auth, and test upstream provider accounts.</small>
               </a>
 
+              <a href="/docs/codex-reset-credit-automation/" data-title="Codex reset-credit automation" data-category="How-to guides" data-summary="Safely preserve an expiring Codex reset credit through a managed local App Server profile when an account limit is reached." data-keywords="codex chatgpt app server json rpc rate limit reset credit expiry automatic redeem idempotency account profile policy sqlite action ledger">
+                <span>Codex reset-credit automation</span>
+                <small>Safely preserve an expiring Codex reset credit through a managed local App Server profile when an account limit is reached.</small>
+              </a>
+
               <a href="/docs/dashboard/" data-title="Dashboard" data-category="How-to guides" data-summary="Use the operator dashboard for accounts, testing, custom models, keys, and history." data-keywords="dashboard login providers settings overview custom models api keys usage history admin">
                 <span>Dashboard</span>
                 <small>Use the operator dashboard for accounts, testing, custom models, keys, and history.</small>
@@ -95,9 +100,9 @@
             <div class="docs-nav-group docs-journey-nav">
               <p class="docs-toc-label docs-journey-label"><span>03</span>Set route policy</p>
 
-              <a href="/docs/api-keys/" data-title="API keys" data-category="Reference" data-summary="Create managed keys with provider/account scopes and prompt-token limits at whole, provider, and account levels." data-keywords="api keys managed scopes provider account prompt token limits whole key custom aliases access rules">
+              <a href="/docs/api-keys/" data-title="API keys" data-category="Reference" data-summary="Create managed keys with scopes, input caps, and durable first-use daily, weekly, or monthly token/request quotas." data-keywords="api keys managed scopes provider account estimated input tokens per request input token budget custom aliases access rules">
                 <span>API keys</span>
-                <small>Create managed keys with provider/account scopes and prompt-token limits at whole, provider, and account levels.</small>
+                <small>Create managed keys with scopes, input caps, and durable first-use daily, weekly, or monthly token/request quotas.</small>
               </a>
 
               <a href="/docs/routing-and-models/" data-title="Routing and models" data-category="Explanation" data-summary="Understand gateway endpoints, model prefixes, custom aliases, failover, and routing rules." data-keywords="routing models v1 responses chat completions claude messages prefix ctm alias failover" aria-current="page" class="is-active">
@@ -124,9 +129,9 @@
                 <small>Point a client at IO Gateway, inspect its model catalog, and prove a request reaches an upstream account.</small>
               </a>
 
-              <a href="/docs/test-api/" data-title="Test API" data-category="How-to guides" data-summary="Validate models and routes from the dashboard without creating a separate client API key." data-keywords="test api dashboard settings model validate route prompt admin session smoke test">
+              <a href="/docs/test-api/" data-title="Test API" data-category="How-to guides" data-summary="Validate upstream routes in operator-bypass mode or against a selected managed-key policy." data-keywords="test api dashboard settings model validate route managed key policy prompt admin session smoke test">
                 <span>Test API</span>
-                <small>Validate models and routes from the dashboard without creating a separate client API key.</small>
+                <small>Validate upstream routes in operator-bypass mode or against a selected managed-key policy.</small>
               </a>
 
               <a href="/docs/usage-and-quota/" data-title="Usage and quota" data-category="Reference" data-summary="Read usage history, context-token charts, account health, provider quota, and useful admin endpoints." data-keywords="usage quota history context tokens account health endpoints dashboard json account-routing">
@@ -166,7 +171,7 @@
       <p class="docs-lead">A request crosses several deliberate boundaries before it reaches an upstream account: client key, requested model or alias, account eligibility, priority policy, and fallback. This page makes that route inspectable.</p>
       <h2>Choose the client surface</h2>
       <div class="docs-table-wrap"><table class="docs-table"><thead><tr><th>Client need</th><th>Gateway route</th></tr></thead><tbody>
-        <tr><td>Discover enabled models</td><td><code>GET /v1/models</code></td></tr>
+        <tr><td>Discover models available to the caller</td><td><code>GET /v1/models</code></td></tr>
         <tr><td>OpenAI Responses API</td><td><code>POST /v1/responses</code></td></tr>
         <tr><td>OpenAI Chat Completions API</td><td><code>POST /v1/chat/completions</code></td></tr>
         <tr><td>Anthropic Messages API</td><td><code>POST /claude/v1/messages</code> or <code>POST /claude/messages</code></td></tr>
@@ -177,7 +182,7 @@
       <ol class="docs-steps compact">
         <li><span>1</span><div><strong>Accept the client key.</strong><p>The request must pass the shared gateway key or the managed API-key rules before any provider is contacted.</p></div></li>
         <li><span>2</span><div><strong>Resolve the requested model.</strong><p>A natural model name selects its provider, a three-letter prefix forces one, and <code>ctm:</code> resolves a custom alias.</p></div></li>
-        <li><span>3</span><div><strong>Apply the boundary.</strong><p>Managed-key provider, account, alias, and prompt-token rules reject requests outside the client’s allowed route.</p></div></li>
+        <li><span>3</span><div><strong>Apply the boundary.</strong><p>Managed-key provider/account rules and input controls are applied to each concrete route target. Aliases are routing policies, not independent key-scope entries.</p></div></li>
         <li><span>4</span><div><strong>Build an eligible account pool.</strong><p>Disabled, failed, cooling-down, and quota-exhausted accounts are excluded before selection.</p></div></li>
         <li><span>5</span><div><strong>Use priority where present.</strong><p>Eligible priority accounts are selected before the normal pool for that provider.</p></div></li>
         <li><span>6</span><div><strong>Fail over and leave evidence.</strong><p>A custom alias may try another target; usage history records the resulting route so the decision can be checked.</p></div></li>
@@ -206,7 +211,7 @@
             <ul class="docs-link-list">
               <li><a href="/docs/custom-models/">Custom models</a> - Create ctm: aliases with provider targets, specific accounts, weights, and fallback chains.</li>
 <li><a href="/docs/priority-routing/">Priority routing</a> - Prioritize one or more provider accounts so they are used first until unavailable or fully drained.</li>
-<li><a href="/docs/api-keys/">API keys</a> - Create managed keys with provider/account scopes and prompt-token limits at whole, provider, and account levels.</li>
+<li><a href="/docs/api-keys/">API keys</a> - Create managed keys with scopes, input caps, and durable first-use daily, weekly, or monthly token/request quotas.</li>
             </ul>
           </section>
         </article>

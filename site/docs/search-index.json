@@ -86,6 +86,26 @@
       "excerpt": "Provider accounts are the upstream identities IO Gateway uses when routing model requests. Add at least one healthy account before exposing an API key to clients. Provider cards make routing eligibility visible before traffic reaches the account pool. Before you start Credential storage Confirm auth_dir points to the directory where provider credentials shou"
     },
     {
+      "title": "Codex reset-credit automation",
+      "category": "How-to guides",
+      "type": "How-to guide",
+      "summary": "Safely preserve an expiring Codex reset credit through a managed local App Server profile when an account limit is reached.",
+      "href": "/docs/codex-reset-credit-automation/",
+      "keywords": "codex chatgpt app server json rpc rate limit reset credit expiry automatic redeem idempotency account profile policy sqlite action ledger",
+      "headings": [
+        "What the policy does",
+        "Use managed local App Server profiles",
+        "Before enabling it",
+        "Default timing",
+        "Enable and inspect",
+        "Read action state safely",
+        "Manual redemption shares the ledger",
+        "Legacy transport migration",
+        "Persistence and backup"
+      ],
+      "excerpt": "Codex reset-credit automation is an opt-in, per-account safety net for an earned ChatGPT usage-limit reset credit that is nearing expiry. It is deliberately conservative: it never treats a dashboard cache, a renamed credential, or an ambiguous network result as authority to spend a credit. What the policy does 1 Read fresh App Server state. The worker reads "
+    },
+    {
       "title": "Priority routing",
       "category": "How-to guides",
       "type": "How-to guide",
@@ -119,15 +139,15 @@
       "title": "Test API",
       "category": "How-to guides",
       "type": "How-to guide",
-      "summary": "Validate models and routes from the dashboard without creating a separate client API key.",
+      "summary": "Validate upstream routes in operator-bypass mode or against a selected managed-key policy.",
       "href": "/docs/test-api/",
-      "keywords": "test api dashboard settings model validate route prompt admin session smoke test",
+      "keywords": "test api dashboard settings model validate route managed key policy prompt admin session smoke test",
       "headings": [
         "Before you start",
         "Run a test",
         "What a passing result proves"
       ],
-      "excerpt": "Test API sends a dashboard-authenticated prompt through the same routing layer used by clients. Use it after account, custom-model, API-key, or priority-routing changes. Use Test API to validate route behavior before giving the route to client keys. Before you start Sign in to the dashboard with an operator session. Test API validates routing without requiri"
+      "excerpt": "Test API sends a dashboard-authenticated prompt through the provider-routing layer. Use its default operator-bypass mode to validate an upstream account, model, or custom route; select a managed-key profile to validate that key's policy too. Use Test API to validate route behavior before giving the route to client keys. Before you start Sign in to the dashbo"
     },
     {
       "title": "Notifications",
@@ -148,12 +168,13 @@
       "title": "Configuration",
       "category": "Reference",
       "type": "Reference",
-      "summary": "Core config.json fields, environment overrides, dashboard auth, and proxy safety settings.",
+      "summary": "Core config.json fields, environment overrides, dashboard auth, proxy safety, and optional Codex App Server reset-credit profiles.",
       "href": "/docs/configuration/",
-      "keywords": "config json env admin auth proxy api key totp secure cookies trusted proxy",
+      "keywords": "config json env admin auth proxy api key totp secure cookies trusted proxy codex app server reset credit profiles",
       "headings": [
         "Start local",
         "Important fields",
+        "Codex reset-credit App Server",
         "Admin auth environment overrides",
         "Security notes"
       ],
@@ -163,16 +184,18 @@
       "title": "API keys",
       "category": "Reference",
       "type": "Reference",
-      "summary": "Create managed keys with provider/account scopes and prompt-token limits at whole, provider, and account levels.",
+      "summary": "Create managed keys with scopes, input caps, and durable first-use daily, weekly, or monthly token/request quotas.",
       "href": "/docs/api-keys/",
-      "keywords": "api keys managed scopes provider account prompt token limits whole key custom aliases access rules",
+      "keywords": "api keys managed scopes provider account estimated input tokens per request input token budget custom aliases access rules",
       "headings": [
         "Access model",
         "Create a managed key",
-        "Limit fields",
+        "Input controls",
+        "Renewable request and token quotas",
+        "Restart-safe accounting",
         "Operational advice"
       ],
-      "excerpt": "Managed API keys let operators expose only the model routes a client should use and enforce prompt-token limits at the whole-key, provider, and account levels. Managed keys can combine route scope with prompt ceilings before any upstream account is selected. Access model Whole key Global limit across every provider and model the key may call. Provider Limit "
+      "excerpt": "Managed API keys restrict clients by provider and account. Add per-request input caps, legacy input budgets, or independent renewable request and token quotas. Rules and usage are persisted in SQLite across restarts. Managed keys combine provider/account access with per-request input caps before upstream dispatch. Access model Provider Allow one or more upst"
     },
     {
       "title": "Usage and quota",
@@ -205,7 +228,7 @@
         "Force a provider when the name is ambiguous",
         "Choose the right control"
       ],
-      "excerpt": "A request crosses several deliberate boundaries before it reaches an upstream account: client key, requested model or alias, account eligibility, priority policy, and fallback. This page makes that route inspectable. Choose the client surface Client need Gateway route Discover enabled models GET /v1/models OpenAI Responses API POST /v1/responses OpenAI Chat "
+      "excerpt": "A request crosses several deliberate boundaries before it reaches an upstream account: client key, requested model or alias, account eligibility, priority policy, and fallback. This page makes that route inspectable. Choose the client surface Client need Gateway route Discover models available to the caller GET /v1/models OpenAI Responses API POST /v1/respon"
     },
     {
       "title": "Deployment",
@@ -332,27 +355,27 @@
       "title": "Accounts",
       "category": "Topic",
       "type": "Category",
-      "summary": "Upstream provider credentials, account health, quota use, and priority membership.",
+      "summary": "Upstream provider credentials, account health, quota use, reset credits, and priority membership.",
       "href": "/docs/category/accounts/",
       "keywords": "Accounts Topic",
       "headings": [
         "Pages in this category",
         "Related categories"
       ],
-      "excerpt": "Upstream provider credentials, account health, quota use, and priority membership."
+      "excerpt": "Upstream provider credentials, account health, quota use, reset credits, and priority membership."
     },
     {
       "title": "Limits",
       "category": "Topic",
       "type": "Category",
-      "summary": "Prompt-token limits, usage history, quota views, and managed API-key controls.",
+      "summary": "Per-request input caps, input-token budgets, usage history, quota views, and managed API-key controls.",
       "href": "/docs/category/limits/",
       "keywords": "Limits Topic",
       "headings": [
         "Pages in this category",
         "Related categories"
       ],
-      "excerpt": "Prompt-token limits, usage history, quota views, and managed API-key controls."
+      "excerpt": "Per-request input caps, input-token budgets, usage history, quota views, and managed API-key controls."
     },
     {
       "title": "Deployment",

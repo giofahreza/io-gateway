@@ -5,11 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
     <meta name="theme-color" content="#080d18" data-theme-color-light="#18375f" data-theme-color-dark="#080d18">
-    <meta name="description" content="Point a client at IO Gateway, inspect its model catalog, and prove a request reaches an upstream account.">
-    <title>First client request - IO Gateway Docs</title>
+    <meta name="description" content="Safely preserve an expiring Codex reset credit through a managed local App Server profile when an account limit is reached.">
+    <title>Codex reset-credit automation - IO Gateway Docs</title>
     <link rel="manifest" href="/manifest.webmanifest">
     <link rel="icon" href="/icon.svg" type="image/svg+xml">
-    <link rel="canonical" href="https://gateway.giofahreza.com/docs/first-client-request/">
+    <link rel="canonical" href="https://gateway.giofahreza.com/docs/codex-reset-credit-automation/">
     <link rel="preload" href="/brand-loader.svg?v=20260910a" as="image" type="image/svg+xml">
     <link rel="preload" href="/assets/fonts/ibm-plex-sans-latin.woff2?v=20260910a" as="font" type="font/woff2" crossorigin>
     <link rel="preload" href="/assets/fonts/ibm-plex-mono-latin.woff2?v=20260910a" as="font" type="font/woff2" crossorigin>
@@ -86,7 +86,7 @@
                 <small>Add, enable, refresh, re-auth, and test upstream provider accounts.</small>
               </a>
 
-              <a href="/docs/codex-reset-credit-automation/" data-title="Codex reset-credit automation" data-category="How-to guides" data-summary="Safely preserve an expiring Codex reset credit through a managed local App Server profile when an account limit is reached." data-keywords="codex chatgpt app server json rpc rate limit reset credit expiry automatic redeem idempotency account profile policy sqlite action ledger">
+              <a href="/docs/codex-reset-credit-automation/" data-title="Codex reset-credit automation" data-category="How-to guides" data-summary="Safely preserve an expiring Codex reset credit through a managed local App Server profile when an account limit is reached." data-keywords="codex chatgpt app server json rpc rate limit reset credit expiry automatic redeem idempotency account profile policy sqlite action ledger" aria-current="page" class="is-active">
                 <span>Codex reset-credit automation</span>
                 <small>Safely preserve an expiring Codex reset credit through a managed local App Server profile when an account limit is reached.</small>
               </a>
@@ -124,7 +124,7 @@
             <div class="docs-nav-group docs-journey-nav">
               <p class="docs-toc-label docs-journey-label"><span>04</span>Prove and observe</p>
 
-              <a href="/docs/first-client-request/" data-title="First client request" data-category="Tutorials" data-summary="Point a client at IO Gateway, inspect its model catalog, and prove a request reaches an upstream account." data-keywords="client request curl responses api chat completions base url bearer key models first request openai claude" aria-current="page" class="is-active">
+              <a href="/docs/first-client-request/" data-title="First client request" data-category="Tutorials" data-summary="Point a client at IO Gateway, inspect its model catalog, and prove a request reaches an upstream account." data-keywords="client request curl responses api chat completions base url bearer key models first request openai claude">
                 <span>First client request</span>
                 <small>Point a client at IO Gateway, inspect its model catalog, and prove a request reaches an upstream account.</small>
               </a>
@@ -161,52 +161,97 @@
           </div>
         </aside>
 
-        <article id="docs-content" class="docs-content docs-article" data-page-slug="first-client-request">
+        <article id="docs-content" class="docs-content docs-article" data-page-slug="codex-reset-credit-automation">
           <div class="docs-heading">
-            <p class="eyebrow">Tutorials</p>
-            <h1>First client request</h1>
-            <dl class="docs-meta"><div><dt>Use when</dt><dd>A running gateway with one enabled provider account</dd></div><div><dt>Updated</dt><dd>September 4, 2026</dd></div></dl>
+            <p class="eyebrow">How-to guides</p>
+            <h1>Codex reset-credit automation</h1>
+            <dl class="docs-meta"><div><dt>Use when</dt><dd>Preserving expiring Codex reset credits</dd></div><div><dt>Storage</dt><dd><code>&lt;auth_dir&gt;/api-key-policy.sqlite3</code></dd></div><div><dt>Updated</dt><dd>September 21, 2026</dd></div></dl>
           </div>
 
-      <p class="docs-lead">Use this path after the gateway is healthy and at least one provider account is enabled. It proves the client-facing boundary: base URL, bearer key, model selection, and the receipt left in usage history.</p>
-      <h2>What you need</h2>
-      <ul class="docs-list">
-        <li><strong>A ready gateway</strong> Confirm <code>/ready</code> returns successfully before configuring a client.</li>
-        <li><strong>A client key</strong> Use the shared <code>proxy_api_key</code> or a managed key with access to the provider/account target it may call. Custom aliases are authorized through their concrete targets, not through alias-specific key scopes.</li>
-        <li><strong>An enabled model</strong> Ask the gateway for its catalog instead of guessing a provider model name.</li>
-      </ul>
-      <h2>Read the catalog first</h2>
-      <pre><code>export IO_GATEWAY_URL=http://127.0.0.1:8319
-export IO_GATEWAY_KEY='replace-with-your-client-key'
-
-curl -sS "$IO_GATEWAY_URL/v1/models" \
-  -H "Authorization: Bearer $IO_GATEWAY_KEY"</code></pre>
-      <p>Choose a model returned by <code>/v1/models</code>. For a managed key, the catalog is filtered to its permitted provider/account routes. A model name can select a provider naturally, a three-letter prefix can force one, and a <code>ctm:</code> alias can apply a route policy you created.</p>
-      <h2>Send one response</h2>
-      <pre><code>curl -sS "$IO_GATEWAY_URL/v1/responses" \
-  -H "Authorization: Bearer $IO_GATEWAY_KEY" \
-  -H "Content-Type: application/json" \
-  --data '{
-    "model": "gpt-5.2",
-    "input": "Reply with one short line."
-  }'</code></pre>
-      <p>Replace <code>gpt-5.2</code> with a model from your own catalog. The Responses API is the primary OpenAI-compatible route; existing OpenAI Chat Completions clients can use <code>POST /v1/chat/completions</code>, and Anthropic clients can use <code>POST /claude/v1/messages</code>.</p>
-      <h2>Read the receipt</h2>
+      <p class="docs-lead">Codex reset-credit automation is an opt-in, per-account safety net for an earned ChatGPT usage-limit reset credit that is nearing expiry. It is deliberately conservative: it never treats a dashboard cache, a renamed credential, or an ambiguous network result as authority to spend a credit.</p>
+      <h2>What the policy does</h2>
       <ol class="docs-steps compact">
-        <li><span>1</span><div><strong>Confirm the client response.</strong><p>A successful response proves the request cleared client authentication and reached an eligible route.</p></div></li>
-        <li><span>2</span><div><strong>Check usage history.</strong><p>Confirm the selected provider and account match the route policy you expected.</p></div></li>
-        <li><span>3</span><div><strong>Repeat with a managed key.</strong><p>Use the real key your client will receive to prove its provider/account scope, per-request input cap, and input-token budget behave as intended.</p></div></li>
+        <li><span>1</span><div><strong>Read fresh App Server state.</strong><p>The worker reads Codex rate limits and reset-credit details through the mapped local App Server profile; the dashboard quota cache is not used to authorize redemption.</p></div></li>
+        <li><span>2</span><div><strong>Select one concrete credit.</strong><p>It chooses the earliest-expiring available Codex-rate-limits credit (the App Server form is <code>codexRateLimits</code>) with an explicit ID and a known expiry at least 30 minutes and no later than the configured upper window from the fresh read.</p></div></li>
+        <li><span>3</span><div><strong>Prove it is needed.</strong><p>Immediately before the POST, another fresh read must show a reached Codex limit, the same credit still available, and a natural reset that is not already near.</p></div></li>
+        <li><span>4</span><div><strong>Persist, redeem, verify.</strong><p>The exact credit ID and a gateway-generated idempotency key are durable before the POST. A successful or idempotent answer needs a final fresh read proving the limit cleared.</p></div></li>
       </ol>
-      <div class="docs-note"><strong>If the route is rejected</strong><p>Check the key's provider/account scope, model spelling or prefix, custom-model state, and provider-account eligibility before changing the client. The <a class="docs-inline-link" href="/docs/test-api/">Test API</a> can isolate an operator route problem in its default bypass mode, or validate a selected managed-key profile without entering that key's secret.</p></div>
+      <h2>Use managed local App Server profiles</h2>
+      <p>Reset-credit work uses the documented Codex App Server JSON-RPC account API, not <code>upstream_base</code> or the gateway's direct HTTP/Wham quota adapter. It launches a short-lived local <code>codex app-server --stdio</code> child for <code>account/rateLimits/read</code> and <code>account/rateLimitResetCredit/consume</code>. Codex App Server is experimental and unsupported for production workloads, so this feature remains off unless its configuration explicitly opts in; there is no direct-backend fallback.</p>
+      <pre><code>{
+  "codex_reset_credit_app_server": {
+    "experimental_opt_in": true,
+    "command": "/usr/local/bin/codex",
+    "profile_root": "/var/lib/io-gateway/codex-app-server-profiles",
+    "profiles": [{
+      "account_key": "codex:account_id:org_123",
+      "profile": "org_123",
+      "expected_email": "ops@example.com"
+    }]
+  }
+}</code></pre>
+      <p>The executable and profile root must be absolute existing paths. Each simple profile directory is private and uniquely bound to one stable account, and must already contain its own private <code>auth.json</code> from a Codex-managed ChatGPT login. IO Gateway verifies the managed account and its required configured email on launch, clears ambient environment values, supplies no gateway bearer credential to the child, and fixes a file-backed credential-store override. A profile <code>config.toml</code> may not set <code>sqlite_home</code>; an explicit <code>cli_auth_credentials_store</code> is allowed only when it is <code>"file"</code>.</p>
+      <h2>Before enabling it</h2>
+      <ul class="docs-list">
+        <li><strong>Keep the dashboard private.</strong> This is an administrator-only operation on an upstream ChatGPT account.</li>
+        <li><strong>Use a stable identity and profile.</strong> The account must be an enabled, uniquely resolved <code>codex:account_id:&lt;id&gt;</code> with a matching configured managed App Server profile. Labels, filenames, and anonymous <code>manual-N</code> identities are rejected for unattended use.</li>
+        <li><strong>Expect fail-closed behavior.</strong> A count/details state that cannot prove the exact selected credit, unknown expiry, unavailable fresh state, or unknown natural reset time means no automatic spend; an existing automatic action is deferred for a later fresh check.</li>
+      </ul>
+      <h2>Default timing</h2>
+      <div class="docs-table-wrap"><table class="docs-table"><thead><tr><th>Setting</th><th>Default</th><th>Effect</th></tr></thead><tbody>
+        <tr><td><code>scan_interval_minutes</code></td><td>30</td><td>Per-account cadence for newly eligible credits; enabling or editing an enabled policy also schedules one immediate scan.</td></tr>
+        <tr><td><code>expiry_window_minutes</code></td><td>60</td><td>Upper selection bound: a new automatic action requires <code>30 minutes &lt;= expires_at - now &lt;= window</code>.</td></tr>
+        <tr><td><code>final_attempt_minutes</code></td><td>5</td><td>Schedule a deferred action's final pre-expiry check this many minutes before expiry when possible.</td></tr>
+        <tr><td><code>min_natural_reset_remaining_minutes</code></td><td>10</td><td>Retain the credit when the ordinary reached window will reset at or within this time.</td></tr>
+      </tbody></table></div>
+      <p>The worker wakes every minute only to honor durable action deadlines; it does not scan every account every minute. Policy scans remain on their configured cadence. With the default 30-minute cadence and 60-minute upper window, new credits are selected only in the intended 30–60 minute interval before expiry. An already selected durable action may be rechecked closer to expiry after a deferral, retry, or temporary upstream failure; that never makes a newly discovered credit under 30 minutes old eligible. <code>expiry_window_minutes</code> must be 30 through 10,080, and <code>final_attempt_minutes</code> must be 1 through one minute less than that window. A restart preserves scan and action deadlines, but an outage that lasts beyond credit expiry cannot be recovered automatically.</p>
+      <h2>Enable and inspect</h2>
+      <p>Read the eligible account keys, defaults, policies, and browser-safe action status:</p>
+      <pre><code>curl -sS http://127.0.0.1:8319/admin/codex/reset-credit-automation \
+  -b "$ADMIN_COOKIE"</code></pre>
+      <p>Enable the default policy for an account marked eligible:</p>
+      <pre><code>curl -sS -X POST http://127.0.0.1:8319/admin/codex/reset-credit-automation \
+  -b "$ADMIN_COOKIE" \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "account_key":"codex:account_id:org_123",
+    "enabled":true,
+    "scan_interval_minutes":30,
+    "expiry_window_minutes":60,
+    "final_attempt_minutes":5,
+    "min_natural_reset_remaining_minutes":10
+  }'</code></pre>
+      <p>Disabling the same stable account key stops future automatic work and remains allowed even after its credential is disabled or removed. Existing actions remain durable for audit and safe recovery; disabling does not make the worker choose another credit. The write endpoint rejects unknown fields and never returns its internal idempotency keys.</p>
+      <h2>Read action state safely</h2>
+      <div class="docs-table-wrap"><table class="docs-table"><thead><tr><th>State</th><th>Meaning</th></tr></thead><tbody>
+        <tr><td><code>pending</code></td><td>A specific credit is waiting for its first durable attempt.</td></tr>
+        <tr><td><code>deferred</code></td><td>The credit is being retained for a later check: no reached limit, nearby/unknown natural reset, a disabled policy, or a safe retry time.</td></tr>
+        <tr><td><code>submitted</code></td><td>The exact credit and idempotency key were stored before a POST; any retry uses those same values.</td></tr>
+        <tr><td><code>verified</code></td><td>A fresh post-consume read confirmed the reached rate limit cleared.</td></tr>
+        <tr><td><code>no_credit</code>, <code>expired</code></td><td>The selected credit is no longer usable.</td></tr>
+        <tr><td><code>manual_review</code></td><td>The outcome is ambiguous, or a legacy direct-HTTP submission needs review. Automation stops rather than spending another credit.</td></tr>
+      </tbody></table></div>
+      <p>Opaque credit IDs, timing, and safe outcome metadata are stored, but provider credentials, prompts, raw request bodies, raw upstream responses, and idempotency keys are not exposed through the browser endpoint.</p>
+      <h2>Manual redemption shares the ledger</h2>
+      <p>Manual reset requests require a concrete <code>credit_id</code> and the same matching managed App Server profile; the gateway generates and persists the idempotency key. The dashboard quota view is informational only: the endpoint re-reads the selected credit and rate-limit state through App Server before spending. Do not ask upstream to select the next credit or send a client idempotency key.</p>
+      <pre><code>curl -sS -X POST http://127.0.0.1:8319/codex/rate-limit-reset-credit/consume \
+  -b "$ADMIN_COOKIE" \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'file_name=my-codex-account.json' \
+  -d 'credit_id=credit_...'</code></pre>
+      <div class="docs-note"><strong>Operate from durable evidence</strong><p>Only <code>verified</code> proves that a reset completed. A timeout after submission retains the exact credit and idempotency key for recovery. Treat <code>manual_review</code> as an operator task, not a reason to send another redemption request with a different credit.</p></div>
+      <h2>Legacy transport migration</h2>
+      <p>Older direct-HTTP/Wham actions are migrated safely. A legacy action already marked <code>submitted</code> becomes <code>manual_review</code>; its old idempotency key is never replayed through App Server. A legacy <code>pending</code> or <code>deferred</code> action is retained and must pass fresh App Server checks before it can proceed.</p>
+      <h2>Persistence and backup</h2>
+      <p>Policies and actions live in <code>&lt;auth_dir&gt;/api-key-policy.sqlite3</code> with managed API-key policy and quota accounting. Keep that directory on persistent local storage, retain its identity file, and use <code>io-gateway --config /absolute/config.json --backup-policy /backups/new-policy-snapshot</code> for a WAL-consistent policy snapshot. Do not share the live SQLite database across hosts or over NFS.</p>
 
 
           <section class="docs-related" aria-labelledby="continue-the-route">
             <h2 id="continue-the-route">Continue the route</h2>
             <ul class="docs-link-list">
-              <li><a href="/docs/quick-start/">Quick start</a> - Build, configure, run, and smoke-test IO Gateway for the first time.</li>
-<li><a href="/docs/api-keys/">API keys</a> - Create managed keys with scopes, input caps, and durable first-use daily, weekly, or monthly token/request quotas.</li>
-<li><a href="/docs/routing-and-models/">Routing and models</a> - Understand gateway endpoints, model prefixes, custom aliases, failover, and routing rules.</li>
+              <li><a href="/docs/provider-accounts/">Provider accounts</a> - Add, enable, refresh, re-auth, and test upstream provider accounts.</li>
 <li><a href="/docs/usage-and-quota/">Usage and quota</a> - Read usage history, context-token charts, account health, provider quota, and useful admin endpoints.</li>
+<li><a href="/docs/configuration/">Configuration</a> - Core config.json fields, environment overrides, dashboard auth, proxy safety, and optional Codex App Server reset-credit profiles.</li>
             </ul>
           </section>
         </article>

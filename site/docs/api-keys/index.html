@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
     <meta name="theme-color" content="#080d18" data-theme-color-light="#18375f" data-theme-color-dark="#080d18">
-    <meta name="description" content="Create managed keys with provider/account scopes and prompt-token limits at whole, provider, and account levels.">
+    <meta name="description" content="Create managed keys with scopes, input caps, and durable first-use daily, weekly, or monthly token/request quotas.">
     <title>API keys - IO Gateway Docs</title>
     <link rel="manifest" href="/manifest.webmanifest">
     <link rel="icon" href="/icon.svg" type="image/svg+xml">
@@ -72,9 +72,9 @@
                 <small>Build, configure, run, and smoke-test IO Gateway for the first time.</small>
               </a>
 
-              <a href="/docs/configuration/" data-title="Configuration" data-category="Reference" data-summary="Core config.json fields, environment overrides, dashboard auth, and proxy safety settings." data-keywords="config json env admin auth proxy api key totp secure cookies trusted proxy">
+              <a href="/docs/configuration/" data-title="Configuration" data-category="Reference" data-summary="Core config.json fields, environment overrides, dashboard auth, proxy safety, and optional Codex App Server reset-credit profiles." data-keywords="config json env admin auth proxy api key totp secure cookies trusted proxy codex app server reset credit profiles">
                 <span>Configuration</span>
-                <small>Core config.json fields, environment overrides, dashboard auth, and proxy safety settings.</small>
+                <small>Core config.json fields, environment overrides, dashboard auth, proxy safety, and optional Codex App Server reset-credit profiles.</small>
               </a>
             </div>
 
@@ -86,6 +86,11 @@
                 <small>Add, enable, refresh, re-auth, and test upstream provider accounts.</small>
               </a>
 
+              <a href="/docs/codex-reset-credit-automation/" data-title="Codex reset-credit automation" data-category="How-to guides" data-summary="Safely preserve an expiring Codex reset credit through a managed local App Server profile when an account limit is reached." data-keywords="codex chatgpt app server json rpc rate limit reset credit expiry automatic redeem idempotency account profile policy sqlite action ledger">
+                <span>Codex reset-credit automation</span>
+                <small>Safely preserve an expiring Codex reset credit through a managed local App Server profile when an account limit is reached.</small>
+              </a>
+
               <a href="/docs/dashboard/" data-title="Dashboard" data-category="How-to guides" data-summary="Use the operator dashboard for accounts, testing, custom models, keys, and history." data-keywords="dashboard login providers settings overview custom models api keys usage history admin">
                 <span>Dashboard</span>
                 <small>Use the operator dashboard for accounts, testing, custom models, keys, and history.</small>
@@ -95,9 +100,9 @@
             <div class="docs-nav-group docs-journey-nav">
               <p class="docs-toc-label docs-journey-label"><span>03</span>Set route policy</p>
 
-              <a href="/docs/api-keys/" data-title="API keys" data-category="Reference" data-summary="Create managed keys with provider/account scopes and prompt-token limits at whole, provider, and account levels." data-keywords="api keys managed scopes provider account prompt token limits whole key custom aliases access rules" aria-current="page" class="is-active">
+              <a href="/docs/api-keys/" data-title="API keys" data-category="Reference" data-summary="Create managed keys with scopes, input caps, and durable first-use daily, weekly, or monthly token/request quotas." data-keywords="api keys managed scopes provider account estimated input tokens per request input token budget custom aliases access rules" aria-current="page" class="is-active">
                 <span>API keys</span>
-                <small>Create managed keys with provider/account scopes and prompt-token limits at whole, provider, and account levels.</small>
+                <small>Create managed keys with scopes, input caps, and durable first-use daily, weekly, or monthly token/request quotas.</small>
               </a>
 
               <a href="/docs/routing-and-models/" data-title="Routing and models" data-category="Explanation" data-summary="Understand gateway endpoints, model prefixes, custom aliases, failover, and routing rules." data-keywords="routing models v1 responses chat completions claude messages prefix ctm alias failover">
@@ -124,9 +129,9 @@
                 <small>Point a client at IO Gateway, inspect its model catalog, and prove a request reaches an upstream account.</small>
               </a>
 
-              <a href="/docs/test-api/" data-title="Test API" data-category="How-to guides" data-summary="Validate models and routes from the dashboard without creating a separate client API key." data-keywords="test api dashboard settings model validate route prompt admin session smoke test">
+              <a href="/docs/test-api/" data-title="Test API" data-category="How-to guides" data-summary="Validate upstream routes in operator-bypass mode or against a selected managed-key policy." data-keywords="test api dashboard settings model validate route managed key policy prompt admin session smoke test">
                 <span>Test API</span>
-                <small>Validate models and routes from the dashboard without creating a separate client API key.</small>
+                <small>Validate upstream routes in operator-bypass mode or against a selected managed-key policy.</small>
               </a>
 
               <a href="/docs/usage-and-quota/" data-title="Usage and quota" data-category="Reference" data-summary="Read usage history, context-token charts, account health, provider quota, and useful admin endpoints." data-keywords="usage quota history context tokens account health endpoints dashboard json account-routing">
@@ -163,35 +168,52 @@
             <dl class="docs-meta"><div><dt>Use when</dt><dd>Client API access</dd></div><div><dt>Updated</dt><dd>September 4, 2026</dd></div></dl>
           </div>
 
-      <p class="docs-lead">Managed API keys let operators expose only the model routes a client should use and enforce prompt-token limits at the whole-key, provider, and account levels.</p>
+      <p class="docs-lead">Managed API keys restrict clients by provider and account. Add per-request input caps, legacy input budgets, or independent renewable request and token quotas. Rules and usage are persisted in SQLite across restarts.</p>
 
       <figure class="docs-figure">
         <div class="docs-figure-frame">
-          <img src="/assets/docs-api-key-limits.png?v=20260910a" alt="API key settings showing whole-key, provider-level, and account-level prompt token limits." loading="lazy" width="720" height="760">
+          <img src="/assets/docs-api-key-limits.png?v=20260910a" alt="API key settings showing whole-key, provider-level, and account-level input-token controls." loading="lazy" width="720" height="760">
         </div>
-        <figcaption>Managed keys can combine route scope with prompt ceilings before any upstream account is selected.</figcaption>
+        <figcaption>Managed keys combine provider/account access with per-request input caps before upstream dispatch.</figcaption>
       </figure>
       <h2>Access model</h2>
       <ul class="docs-list">
-        <li><strong>Whole key</strong> Global limit across every provider and model the key may call.</li>
-        <li><strong>Provider</strong> Limit usage for one upstream provider such as Claude, Gemini, or Codex.</li>
-        <li><strong>Account</strong> Limit usage for a specific provider account.</li>
-        <li><strong>Model scope</strong> Allow raw provider prefixes or specific <code>ctm:</code> aliases.</li>
+        <li><strong>Provider</strong> Allow one or more upstream providers such as Claude, Gemini, or Codex.</li>
+        <li><strong>Account</strong> Within an allowed provider, allow every account or selected accounts only.</li>
+        <li><strong>Custom models</strong> A <code>ctm:</code> request is authorized against each resolved target's provider and account. There is no model-name or alias-specific allow-list.</li>
       </ul>
       <h2>Create a managed key</h2>
       <ol class="docs-steps compact">
         <li><span>1</span><div><strong>Open API Keys in the dashboard.</strong><p>Use an authenticated operator session.</p></div></li>
-        <li><span>2</span><div><strong>Choose route scope.</strong><p>Select providers, accounts, model prefixes, or custom aliases.</p></div></li>
-        <li><span>3</span><div><strong>Set prompt-token limits.</strong><p>Use whole-key, provider, and account limits where needed.</p></div></li>
+        <li><span>2</span><div><strong>Choose route scope.</strong><p>Select providers and, for each provider, every account or selected accounts.</p></div></li>
+        <li><span>3</span><div><strong>Set input controls.</strong><p>Set a per-request input cap at whole-key, provider, or account level; optionally set a whole-key cumulative input-token budget.</p></div></li>
         <li><span>4</span><div><strong>Test with the client key.</strong><p>Send a request with the generated key and verify usage history.</p></div></li>
       </ol>
-      <h2>Limit fields</h2>
+      <h2>Input controls</h2>
       <div class="docs-table-wrap"><table class="docs-table"><thead><tr><th>Limit</th><th>Meaning</th></tr></thead><tbody>
-        <tr><td>Whole prompt-token limit</td><td>Maximum prompt tokens the key may spend across all allowed routes.</td></tr>
-        <tr><td>Provider prompt-token limit</td><td>Maximum prompt tokens the key may spend on one provider.</td></tr>
-        <tr><td>Account prompt-token limit</td><td>Maximum prompt tokens the key may spend on one upstream account.</td></tr>
-        <tr><td>Scope allow-list</td><td>Providers, models, accounts, or aliases this key can call.</td></tr>
+        <tr><td><code>max_estimated_input_tokens_per_request</code></td><td>A positive maximum for estimated input tokens in one request. Set it at whole-key, provider, or account level; the smallest matching cap applies. Omit it for no per-request cap.</td></tr>
+        <tr><td><code>prompt_token_limit</code></td><td>Deprecated input alias for <code>max_estimated_input_tokens_per_request</code>, retained for migration.</td></tr>
+        <tr><td><code>input_token_budget</code></td><td>Optional whole-key cumulative input-token control: <code>{"limit": positive_integer, "period": "lifetime" | "calendar_month"}</code>. It does not cap output tokens or monetary cost.</td></tr>
+        <tr><td>Scope allow-list</td><td>Providers and accounts this key can call; it is not a model or alias allow-list.</td></tr>
       </tbody></table></div>
+      <p>A per-request cap is a guardrail, not a spending counter. Use <code>input_token_budget</code> when cumulative input-token usage needs a lifetime or calendar-month boundary.</p>
+      <p>Neither legacy input control is a request-count quota. Cap-only keys can make repeated requests that each fit their cap. Legacy budget estimates are conservative, not exact provider billing counts; each upstream retry or fallback needs its own reservation, and settlement retains at least that amount.</p>
+      <h2>Renewable request and token quotas</h2>
+      <p>Set <code>access.quota</code> to a <code>timezone</code> (default <code>UTC</code>) and a <code>rules</code> array. Each rule contains <code>metric</code>, <code>period</code>, and a positive integer <code>limit</code>. Periods are <code>daily</code>, <code>weekly</code>, or <code>monthly</code>. Multiple rules apply atomically.</p>
+      <pre><code>{"all":true,"quota":{"timezone":"Asia/Jakarta","rules":[{"metric":"requests","period":"daily","limit":100},{"metric":"input_tokens","period":"weekly","limit":100000},{"metric":"output_tokens","period":"monthly","limit":50000}]}}</code></pre>
+      <p>Metrics: <code>requests</code>, <code>input_tokens</code>, <code>uncached_input_tokens</code>, <code>output_tokens</code>, <code>cache_read_tokens</code>, <code>cache_write_tokens</code>, and <code>cache_tokens</code>. Input includes cached input; output includes reasoning. Do not add those subsets again to token totals. Missing provider usage is unknown, not zero.</p>
+      <p>The first accepted generation starts the common anchor. Daily is 24 hours; weekly is 168 hours; monthly follows the original calendar date/time in the chosen timezone, clamping short months. January 31 renews February 28/29 then March 31. Creation, rejected requests, catalog queries, inactivity, and server restarts do not reset usage or move an established anchor.</p>
+      <p>One admitted client generation consumes one request; retries/fallbacks consume additional tokens, not another logical request. All dimensions are reserved before upstream dispatch and settled to trustworthy actual usage. Interrupted or missing reports retain uncertain conservative charges. Requests-per-day is not a burst/concurrency rate limiter.</p>
+      <p>Use <strong>Add quota rule</strong> in the dashboard. Inspect confirmed, reserved, uncertain, and remaining amounts through <code>GET /admin/api-keys/quotas?id=KEY_ID</code> or <code>iogw keys quotas --id KEY_ID</code>. Exhaustion returns protocol-native <code>429 quota_exceeded</code> with renewal/retry headers. Ordinary allowance edits preserve balances; activated schedule changes are rejected instead of silently resetting them.</p>
+      <p>Dashboard balances refresh after managed-key Test API calls and every 10 seconds while Settings is open. These read-only refreshes preserve unsaved policy edits and account selections. If a per-key accounting summary fails, <code>/admin/api-keys/quotas</code> returns <code>503</code> with <code>ok: false</code>, retaining available summaries and an <code>{"error":true}</code> entry for each failed key. Unavailable accounting never means zero usage or a renewed allowance.</p>
+      <p>Renewable quota limits support positive signed-64-bit integers through <code>9223372036854775807</code>. The dashboard safely edits integers only through <code>9007199254740991</code>; it refuses to edit a policy with larger limits instead of rounding or removing them. Use <code>iogw keys update KEY_ID --access-json @access.json</code> or the admin API for those policies, and <code>iogw keys quotas --id KEY_ID</code> or the API for exact large balances.</p>
+      <p>Admin create/update requests reject unknown fields in the outer payload and access, provider, account-limit, input-budget, and quota objects. Typos such as <code>acess</code> or <code>quotas</code> cannot silently create an unlimited key. The canonical cap name and deprecated <code>prompt_token_limit</code> alias remain accepted. An empty create payload deliberately creates an unrestricted key; updates require an <code>access</code> object. Persisted legacy metadata remains compatible with migration.</p>
+      <div class="docs-note"><strong>Strict provider capability checks</strong><p>Set a small explicit output maximum for output quotas. A provider/model without a defensible bound is rejected before dispatch with <code>quota_measurement_required</code>; Codex, Grok, and native MiniMax Responses strict output quotas are currently unsupported. Unknown usage can reduce usable allowance conservatively. Request-only quotas do not require token measurement.</p></div>
+      <h2>Restart-safe accounting</h2>
+      <p>Managed key authority and quota ledgers live in <code>&lt;auth_dir&gt;/api-key-policy.sqlite3</code>. Legacy JSON is imported with a private recovery backup and an old-binary migration sentinel. Preserve the database, its identity file, and the persistent local volume. Missing or damaged established accounting fails closed; a legacy budget whose accounting database is missing cannot be migrated to a fresh allowance. Pin an explicit persistent <code>auth_dir</code> before upgrading.</p>
+      <pre><code>io-gateway --config /absolute/config.json --backup-policy /backups/new-policy-snapshot</code></pre>
+      <p>This command creates a consistent private SQLite snapshot with matching identity metadata and exits. The destination must be new; provider credentials, configuration and reporting history need separate backups. Copying just a live main database can lose committed WAL data. Restoring an old backup requires reconciling the missing usage interval.</p>
+      <p>Keys with input controls reject unmeasurable media, encrypted or retained context, and provider-hosted retrieval or execution tools with <code>400 prompt_measurement_required</code>. Ordinary function definitions and JSON schemas remain measurable. Policy history includes dispatches and outcomes for cap-only keys as well as budgeted keys.</p>
       <h2>Operational advice</h2>
       <div class="docs-note"><strong>Prefer managed keys for clients</strong><p>Use managed keys instead of the broad shared proxy key when exposing IO Gateway to applications or users.</p></div>
 

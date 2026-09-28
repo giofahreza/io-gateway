@@ -72,9 +72,9 @@
                 <small>Build, configure, run, and smoke-test IO Gateway for the first time.</small>
               </a>
 
-              <a href="/docs/configuration/" data-title="Configuration" data-category="Reference" data-summary="Core config.json fields, environment overrides, dashboard auth, and proxy safety settings." data-keywords="config json env admin auth proxy api key totp secure cookies trusted proxy">
+              <a href="/docs/configuration/" data-title="Configuration" data-category="Reference" data-summary="Core config.json fields, environment overrides, dashboard auth, proxy safety, and optional Codex App Server reset-credit profiles." data-keywords="config json env admin auth proxy api key totp secure cookies trusted proxy codex app server reset credit profiles">
                 <span>Configuration</span>
-                <small>Core config.json fields, environment overrides, dashboard auth, and proxy safety settings.</small>
+                <small>Core config.json fields, environment overrides, dashboard auth, proxy safety, and optional Codex App Server reset-credit profiles.</small>
               </a>
             </div>
 
@@ -86,6 +86,11 @@
                 <small>Add, enable, refresh, re-auth, and test upstream provider accounts.</small>
               </a>
 
+              <a href="/docs/codex-reset-credit-automation/" data-title="Codex reset-credit automation" data-category="How-to guides" data-summary="Safely preserve an expiring Codex reset credit through a managed local App Server profile when an account limit is reached." data-keywords="codex chatgpt app server json rpc rate limit reset credit expiry automatic redeem idempotency account profile policy sqlite action ledger">
+                <span>Codex reset-credit automation</span>
+                <small>Safely preserve an expiring Codex reset credit through a managed local App Server profile when an account limit is reached.</small>
+              </a>
+
               <a href="/docs/dashboard/" data-title="Dashboard" data-category="How-to guides" data-summary="Use the operator dashboard for accounts, testing, custom models, keys, and history." data-keywords="dashboard login providers settings overview custom models api keys usage history admin">
                 <span>Dashboard</span>
                 <small>Use the operator dashboard for accounts, testing, custom models, keys, and history.</small>
@@ -95,9 +100,9 @@
             <div class="docs-nav-group docs-journey-nav">
               <p class="docs-toc-label docs-journey-label"><span>03</span>Set route policy</p>
 
-              <a href="/docs/api-keys/" data-title="API keys" data-category="Reference" data-summary="Create managed keys with provider/account scopes and prompt-token limits at whole, provider, and account levels." data-keywords="api keys managed scopes provider account prompt token limits whole key custom aliases access rules">
+              <a href="/docs/api-keys/" data-title="API keys" data-category="Reference" data-summary="Create managed keys with scopes, input caps, and durable first-use daily, weekly, or monthly token/request quotas." data-keywords="api keys managed scopes provider account estimated input tokens per request input token budget custom aliases access rules">
                 <span>API keys</span>
-                <small>Create managed keys with provider/account scopes and prompt-token limits at whole, provider, and account levels.</small>
+                <small>Create managed keys with scopes, input caps, and durable first-use daily, weekly, or monthly token/request quotas.</small>
               </a>
 
               <a href="/docs/routing-and-models/" data-title="Routing and models" data-category="Explanation" data-summary="Understand gateway endpoints, model prefixes, custom aliases, failover, and routing rules." data-keywords="routing models v1 responses chat completions claude messages prefix ctm alias failover">
@@ -124,9 +129,9 @@
                 <small>Point a client at IO Gateway, inspect its model catalog, and prove a request reaches an upstream account.</small>
               </a>
 
-              <a href="/docs/test-api/" data-title="Test API" data-category="How-to guides" data-summary="Validate models and routes from the dashboard without creating a separate client API key." data-keywords="test api dashboard settings model validate route prompt admin session smoke test">
+              <a href="/docs/test-api/" data-title="Test API" data-category="How-to guides" data-summary="Validate upstream routes in operator-bypass mode or against a selected managed-key policy." data-keywords="test api dashboard settings model validate route managed key policy prompt admin session smoke test">
                 <span>Test API</span>
-                <small>Validate models and routes from the dashboard without creating a separate client API key.</small>
+                <small>Validate upstream routes in operator-bypass mode or against a selected managed-key policy.</small>
               </a>
 
               <a href="/docs/usage-and-quota/" data-title="Usage and quota" data-category="Reference" data-summary="Read usage history, context-token charts, account health, provider quota, and useful admin endpoints." data-keywords="usage quota history context tokens account health endpoints dashboard json account-routing">
@@ -210,7 +215,7 @@ IO_GATEWAY_START_NOW=no \
 IO_GATEWAY_INTERACTIVE=no \
 bash -c 'set -o pipefail; curl -fsSL https://github.com/giofahreza/io-gateway/releases/latest/download/install.sh | sh'</code></pre>
       <p>The same cross-platform environment variables are available with values <code>auto</code>, <code>yes</code>, or <code>no</code> where applicable: <code>IO_GATEWAY_INSTALL_IOGW</code>, <code>IO_GATEWAY_AUTOSTART</code>, <code>IO_GATEWAY_START_NOW</code>, and <code>IO_GATEWAY_INTERACTIVE</code>; <code>IO_GATEWAY_PORT</code> selects the port. Explicit command-line choices take precedence. <code>--start-now</code> / <code>-StartNow</code> starts the gateway immediately without changing autostart; <code>--no-start</code> / <code>-NoStart</code> skips that launch while preserving an existing service or task. Combine <code>--autostart --no-start</code> for a next-sign-in-only service, or <code>--no-autostart --start-now</code> for a one-off local background process.</p>
-      <div class="docs-note warning"><strong>Secure before exposing</strong><p>Admin authentication is initially disabled only for local setup. Configure a TOTP secret and enable <code>admin_auth</code> before changing <code>listen</code> to a LAN or public address.</p></div>
+      <div class="docs-note warning"><strong>Secure before exposing</strong><p>Admin authentication is initially disabled only for local setup. Configure a separate admin API key, a TOTP secret, and <code>admin_auth</code> before changing <code>listen</code> to a LAN or public address. The client-facing <code>proxy_api_key</code> is never a dashboard credential.</p></div>
       <h2>Finish setup</h2>
       <ol class="docs-steps">
         <li><span>1</span><div><strong>Open the local dashboard.</strong><p>If you chose <em>Start now</em>, visit <code>http://127.0.0.1:&lt;selected-port&gt;/</code> after the gateway becomes healthy (the default is <code>http://127.0.0.1:8319/</code>). Otherwise, use the printed command to start it now or sign in again when autostart is enabled.</p></div></li>
@@ -232,7 +237,7 @@ cp config.example.json config.json
       <h2>Next steps</h2>
       <ul class="docs-list">
         <li><strong>Secure dashboard access</strong> Configure admin auth before exposing the service.</li>
-        <li><strong>Create managed API keys</strong> Replace broad shared-key access with scoped keys and prompt-token limits.</li>
+        <li><strong>Create managed API keys</strong> Replace broad shared-key access with provider/account scopes, per-request input caps, and optional input-token budgets.</li>
         <li><strong>Plan routing</strong> Use priority routing or custom models when traffic should prefer specific accounts.</li>
       </ul>
 
@@ -240,9 +245,9 @@ cp config.example.json config.json
           <section class="docs-related" aria-labelledby="continue-the-route">
             <h2 id="continue-the-route">Continue the route</h2>
             <ul class="docs-link-list">
-              <li><a href="/docs/configuration/">Configuration</a> - Core config.json fields, environment overrides, dashboard auth, and proxy safety settings.</li>
+              <li><a href="/docs/configuration/">Configuration</a> - Core config.json fields, environment overrides, dashboard auth, proxy safety, and optional Codex App Server reset-credit profiles.</li>
 <li><a href="/docs/provider-accounts/">Provider accounts</a> - Add, enable, refresh, re-auth, and test upstream provider accounts.</li>
-<li><a href="/docs/test-api/">Test API</a> - Validate models and routes from the dashboard without creating a separate client API key.</li>
+<li><a href="/docs/test-api/">Test API</a> - Validate upstream routes in operator-bypass mode or against a selected managed-key policy.</li>
             </ul>
           </section>
         </article>
