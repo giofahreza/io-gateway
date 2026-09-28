@@ -3,9 +3,13 @@ use data_encoding::BASE32_NOPAD;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
+use sha2::Sha256;
 use std::{
     collections::{HashMap, VecDeque},
-    path::Path,
+    fs::{self, File, OpenOptions},
+    io::{self, Write},
+    net::{IpAddr, SocketAddr},
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
@@ -21,8 +25,18 @@ const LOGIN_FAILURE_WINDOW_SECONDS: u64 = 5 * 60;
 const LOGIN_FAILURE_THRESHOLD: usize = 3;
 const LOGIN_BASE_LOCKOUT_SECONDS: u64 = 5 * 60;
 const LOGIN_MAX_BACKOFF_SHIFT: u32 = 10;
+// Changing this invalidates every persisted admin session.  Keep it separate
+// from the cookie name so an authentication-policy upgrade cannot silently
+// inherit sessions minted under an older policy.
+const ADMIN_SESSION_AUTH_CONTEXT_VERSION: u8 = 1;
+const ADMIN_SESSION_AUTH_CONTEXT_DOMAIN: &[u8] = b"io-gateway/admin-session-auth-context/v1";
+// This is a domain separator, not a secret.  `verify_slice` performs the
+// fixed-size MAC comparison in constant time, which is what we need when
+// comparing a supplied administrator key with the configured one.
+const ADMIN_API_KEY_COMPARISON_DOMAIN: &[u8] = b"io-gateway/admin-api-key-compare/v1";
 
 type HmacSha1 = Hmac<Sha1>;
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Deserialize, Default, Clone)]
 pub(crate) struct AdminAuthConfig {
@@ -41,6 +55,13 @@ pub(crate) struct AdminAuthConfig {
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct AdminSession {
     pub expires_at_unix: u64,
+    /// An authenticated-session context bound to the configured credentials
+    /// and authentication policy.  Older persisted sessions deserialize with
+    /// the defaults below and are intentionally rejected on their next use.
+    #[serde(default)]
+    pub auth_context_version: u8,
+    #[serde(default)]
+    pub auth_context: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -53,6 +74,8 @@ pub(crate) struct LoginAttemptState {
 #[derive(Deserialize)]
 pub(crate) struct LoginForm {
     pub otp: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 pub(crate) fn apply_env_overrides(cfg: &mut AdminAuthConfig) {
@@ -76,21 +99,17 @@ pub(crate) fn apply_env_overrides(cfg: &mut AdminAuthConfig) {
 }
 
 pub(crate) fn is_enabled(cfg: &AdminAuthConfig) -> bool {
-    cfg.enabled
-        || cfg
-            .totp_secret
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .is_some()
+    cfg.enabled || configured_totp_secret(cfg).is_some() || configured_admin_api_key(cfg).is_some()
 }
 
 pub(crate) fn is_configured(cfg: &AdminAuthConfig) -> bool {
-    cfg.totp_secret
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_some()
+    configured_totp_secret(cfg).is_some()
+}
+
+/// Returns whether a successful admin login must also prove knowledge of the
+/// configured administrator API key.  TOTP remains required in all modes.
+pub(crate) fn requires_api_key(cfg: &AdminAuthConfig) -> bool {
+    configured_admin_api_key(cfg).is_some()
 }
 
 pub(crate) fn session_ttl_seconds(cfg: &AdminAuthConfig) -> u64 {
@@ -102,6 +121,7 @@ pub(crate) fn session_ttl_seconds(cfg: &AdminAuthConfig) -> u64 {
 pub(crate) fn verify_login(
     cfg: &AdminAuthConfig,
     otp: &str,
+    api_key: Option<&str>,
     now: SystemTime,
 ) -> Result<(), String> {
     if !is_enabled(cfg) {
@@ -113,55 +133,127 @@ pub(crate) fn verify_login(
                 .to_string(),
         );
     }
-    let secret = cfg
-        .totp_secret
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            "admin login is not configured: set admin_auth.totp_secret or ADMIN_AUTH_TOTP_SECRET"
-                .to_string()
-        })?;
-    if !verify_totp(secret, otp, now) {
-        return Err("invalid OTP".to_string());
+    let secret = configured_totp_secret(cfg).ok_or_else(|| {
+        "admin login is not configured: set admin_auth.totp_secret or ADMIN_AUTH_TOTP_SECRET"
+            .to_string()
+    })?;
+
+    // Check both factors before deciding.  Besides making failures
+    // indistinguishable to callers, this avoids turning OTP success into an
+    // oracle for the optional administrator key.
+    let otp_valid = verify_totp(secret, otp, now);
+    let api_key_valid = configured_admin_api_key(cfg)
+        .map(|expected| verify_admin_api_key(expected, api_key))
+        .unwrap_or(true);
+    if !otp_valid || !api_key_valid {
+        return Err("invalid administrator credentials".to_string());
     }
     Ok(())
 }
 
-pub(crate) fn login_client_key(headers: &HeaderMap, trust_forwarded_headers: bool) -> String {
-    let forwarded_ip = if trust_forwarded_headers {
-        [
-            "cf-connecting-ip",
-            "true-client-ip",
-            "x-real-ip",
-            "x-forwarded-for",
-        ]
-        .iter()
-        .find_map(|header_name| {
-            headers.get(*header_name).and_then(|value| {
-                value.to_str().ok().and_then(|raw| {
-                    raw.split(',')
-                        .next()
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .map(ToOwned::to_owned)
-                })
-            })
-        })
-    } else {
-        None
-    };
-    let user_agent = headers
-        .get(header::USER_AGENT)
-        .and_then(|value| value.to_str().ok())
+fn configured_admin_api_key(cfg: &AdminAuthConfig) -> Option<&str> {
+    cfg.api_key
+        .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("unknown");
+}
 
-    match forwarded_ip {
-        Some(ip) => format!("ip:{}|ua:{}", ip, user_agent),
-        None => format!("ua:{}", user_agent),
+fn configured_totp_secret(cfg: &AdminAuthConfig) -> Option<&str> {
+    cfg.totp_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn verify_admin_api_key(expected: &str, supplied: Option<&str>) -> bool {
+    let supplied = supplied.map(str::trim).unwrap_or_default();
+
+    // HMAC tags are a fixed size, and `Mac::verify_slice` uses a constant-time
+    // tag comparison.  Comparing tags instead of the raw strings avoids a
+    // length-dependent comparison of the configured administrator key.
+    let mut expected_mac = HmacSha256::new_from_slice(ADMIN_API_KEY_COMPARISON_DOMAIN)
+        .expect("fixed HMAC domain is valid");
+    expected_mac.update(expected.as_bytes());
+    let expected_tag = expected_mac.finalize().into_bytes();
+
+    let mut supplied_mac = HmacSha256::new_from_slice(ADMIN_API_KEY_COMPARISON_DOMAIN)
+        .expect("fixed HMAC domain is valid");
+    supplied_mac.update(supplied.as_bytes());
+    supplied_mac.verify_slice(expected_tag.as_slice()).is_ok()
+}
+
+fn session_auth_context_fingerprint(cfg: &AdminAuthConfig) -> String {
+    // Do not store credential material itself in admin-sessions.json. The
+    // session file is mode 0600 on Unix and contains bearer session IDs, so it
+    // must remain protected even though this fingerprint is opaque.
+    let mut key_material = Vec::new();
+    append_auth_context_component(&mut key_material, configured_admin_api_key(cfg));
+    append_auth_context_component(&mut key_material, configured_totp_secret(cfg));
+
+    let mut mac = HmacSha256::new_from_slice(&key_material)
+        .expect("HMAC accepts administrator credential material of any length");
+    mac.update(ADMIN_SESSION_AUTH_CONTEXT_DOMAIN);
+    mac.update(&[ADMIN_SESSION_AUTH_CONTEXT_VERSION]);
+    let tag = mac.finalize().into_bytes();
+    tag.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn append_auth_context_component(buffer: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            buffer.push(1);
+            let length = u64::try_from(value.len()).unwrap_or(u64::MAX);
+            buffer.extend_from_slice(&length.to_be_bytes());
+            buffer.extend_from_slice(value.as_bytes());
+        }
+        None => buffer.push(0),
     }
+}
+
+/// Returns a stable identity for rate limiting administrator login failures.
+///
+/// A User-Agent is not an identity: clients can vary it at no cost, which
+/// would make a per-User-Agent login lockout ineffective. Prefer a sanitized
+/// forwarding address only when the operator explicitly trusts the proxy;
+/// otherwise use the TCP peer address installed by the server. If neither is
+/// available (for example an embedded router), use one shared bucket rather
+/// than trusting any request-controlled header.
+pub(crate) fn login_client_key(
+    headers: &HeaderMap,
+    trust_forwarded_headers: bool,
+    peer_addr: Option<SocketAddr>,
+) -> String {
+    if trust_forwarded_headers {
+        if let Some(forwarded_ip) = forwarded_client_ip(headers) {
+            return format!("forwarded-ip:{forwarded_ip}");
+        }
+    }
+
+    match peer_addr {
+        Some(peer_addr) => format!("peer-ip:{}", peer_addr.ip()),
+        None => "global".to_string(),
+    }
+}
+
+fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    [
+        "cf-connecting-ip",
+        "true-client-ip",
+        "x-real-ip",
+        "x-forwarded-for",
+    ]
+    .iter()
+    .find_map(|header_name| {
+        headers.get(*header_name).and_then(|value| {
+            value.to_str().ok().and_then(|raw| {
+                raw.split(',')
+                    .next()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .and_then(|value| value.parse::<IpAddr>().ok())
+            })
+        })
+    })
 }
 
 pub(crate) fn current_lockout_message(
@@ -220,24 +312,41 @@ pub(crate) fn clear_login_attempts(
 pub(crate) fn create_session(
     sessions: &mut HashMap<String, AdminSession>,
     ttl_seconds: u64,
+    cfg: &AdminAuthConfig,
 ) -> String {
     prune_expired_sessions(sessions);
     let session_id = Uuid::new_v4().simple().to_string();
     let expires_at_unix = now_unix_seconds().saturating_add(ttl_seconds);
-    sessions.insert(session_id.clone(), AdminSession { expires_at_unix });
+    sessions.insert(
+        session_id.clone(),
+        AdminSession {
+            expires_at_unix,
+            auth_context_version: ADMIN_SESSION_AUTH_CONTEXT_VERSION,
+            auth_context: session_auth_context_fingerprint(cfg),
+        },
+    );
     session_id
 }
 
 pub(crate) fn validate_session(
     headers: &HeaderMap,
     sessions: &mut HashMap<String, AdminSession>,
+    cfg: &AdminAuthConfig,
 ) -> bool {
     prune_expired_sessions(sessions);
     let Some(session_id) = read_cookie_value(headers, ADMIN_SESSION_COOKIE) else {
         return false;
     };
+    let expected_auth_context = session_auth_context_fingerprint(cfg);
     match sessions.get(&session_id) {
-        Some(session) if session.expires_at_unix > now_unix_seconds() => true,
+        Some(session)
+            if session.expires_at_unix > now_unix_seconds()
+                && session.auth_context_version == ADMIN_SESSION_AUTH_CONTEXT_VERSION
+                && !session.auth_context.is_empty()
+                && timing_safe_eq(&session.auth_context, &expected_auth_context) =>
+        {
+            true
+        }
         _ => {
             sessions.remove(&session_id);
             false
@@ -275,7 +384,7 @@ pub(crate) fn append_set_cookie(headers: &mut axum::http::HeaderMap, cookie: &st
 }
 
 pub(crate) fn load_sessions(path: &Path) -> HashMap<String, AdminSession> {
-    let Ok(data) = std::fs::read_to_string(path) else {
+    let Ok(data) = fs::read_to_string(path) else {
         return HashMap::new();
     };
     let Ok(mut sessions) = serde_json::from_str::<HashMap<String, AdminSession>>(&data) else {
@@ -285,23 +394,95 @@ pub(crate) fn load_sessions(path: &Path) -> HashMap<String, AdminSession> {
     sessions
 }
 
-pub(crate) fn save_sessions(path: &Path, sessions: &HashMap<String, AdminSession>) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let Ok(data) = serde_json::to_vec_pretty(sessions) else {
-        return;
-    };
-    let tmp_path = path.with_extension("json.tmp");
-    if std::fs::write(&tmp_path, data).is_ok() && std::fs::rename(&tmp_path, path).is_ok() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+/// Durably save bearer admin sessions without ever exposing a partially
+/// written JSON file.  The temporary file lives in the target directory so
+/// the rename is atomic on the same filesystem.  On Unix it is created 0600
+/// before any session material is written, then both it and the containing
+/// directory are fsynced around the rename.
+pub(crate) fn save_sessions(
+    path: &Path,
+    sessions: &HashMap<String, AdminSession>,
+) -> Result<(), String> {
+    let parent = session_parent_dir(path);
+    fs::create_dir_all(parent).map_err(|err| {
+        format!(
+            "failed to create admin session directory '{}': {err}",
+            parent.display()
+        )
+    })?;
+    let data = serde_json::to_vec_pretty(sessions)
+        .map_err(|err| format!("failed to serialize admin sessions: {err}"))?;
+    let (tmp_path, mut tmp_file) = create_session_temp_file(parent, path).map_err(|err| {
+        format!(
+            "failed to create temporary admin session file in '{}': {err}",
+            parent.display()
+        )
+    })?;
+
+    let result = (|| -> io::Result<()> {
+        tmp_file.write_all(&data)?;
+        tmp_file.sync_all()?;
+        drop(tmp_file);
+        fs::rename(&tmp_path, path)?;
+        // A directory fsync failure happens after the rename is already
+        // visible. Returning it as an ordinary save failure would cause the
+        // caller to roll back its in-memory session map while a restart loads
+        // the new on-disk session state. Keep the two authorities coherent and
+        // make the reduced crash-durability visible in logs instead.
+        if let Err(err) = sync_directory(parent) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "admin session file was renamed but its parent directory could not be fsynced"
+            );
         }
-    } else {
-        let _ = std::fs::remove_file(&tmp_path);
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        // If rename already succeeded this is harmless; if it did not, do
+        // not leave session data in a stale temporary file.
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!(
+            "failed to durably save admin sessions to '{}': {err}",
+            path.display()
+        ));
     }
+    Ok(())
+}
+
+fn session_parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn create_session_temp_file(parent: &Path, path: &Path) -> io::Result<(PathBuf, File)> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("admin-sessions.json");
+    let tmp_path = parent.join(format!(".{name}.{}.tmp", Uuid::new_v4().simple()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&tmp_path)?;
+    Ok((tmp_path, file))
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn verify_totp(secret: &str, otp: &str, now: SystemTime) -> bool {
@@ -466,47 +647,269 @@ fn human_duration(seconds: u64) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn verify_login_accepts_rfc_totp_vector() {
-        let cfg = AdminAuthConfig {
+    fn test_config(api_key: Option<&str>) -> AdminAuthConfig {
+        AdminAuthConfig {
             enabled: true,
-            api_key: Some("admin-key".to_string()),
+            api_key: api_key.map(ToOwned::to_owned),
             totp_secret: Some("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".to_string()),
             session_ttl_seconds: None,
             secure_cookies: false,
-        };
+        }
+    }
+
+    #[test]
+    fn verify_login_accepts_rfc_totp_vector() {
+        let cfg = test_config(Some("admin-key"));
 
         let now = UNIX_EPOCH + std::time::Duration::from_secs(59);
-        assert!(verify_login(&cfg, "287082", now).is_ok());
+        assert!(verify_login(&cfg, "287082", Some("admin-key"), now).is_ok());
     }
 
     #[test]
     fn verify_login_rejects_wrong_totp() {
+        let cfg = test_config(Some("admin-key"));
+
+        let now = UNIX_EPOCH + std::time::Duration::from_secs(59);
+        assert!(verify_login(&cfg, "000000", Some("admin-key"), now).is_err());
+    }
+
+    #[test]
+    fn verify_login_requires_configured_admin_api_key() {
+        let cfg = test_config(Some("admin-key"));
+        let now = UNIX_EPOCH + std::time::Duration::from_secs(59);
+
+        assert!(verify_login(&cfg, "287082", None, now).is_err());
+        assert!(verify_login(&cfg, "287082", Some("wrong-key"), now).is_err());
+        assert!(verify_login(&cfg, "287082", Some("admin-key"), now).is_ok());
+    }
+
+    #[test]
+    fn verify_login_remains_otp_only_without_admin_api_key() {
+        let cfg = test_config(None);
+        let now = UNIX_EPOCH + std::time::Duration::from_secs(59);
+
+        assert!(!requires_api_key(&cfg));
+        assert!(verify_login(&cfg, "287082", None, now).is_ok());
+    }
+
+    #[test]
+    fn configured_admin_key_without_totp_fails_closed() {
         let cfg = AdminAuthConfig {
-            enabled: true,
+            enabled: false,
             api_key: Some("admin-key".to_string()),
-            totp_secret: Some("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".to_string()),
+            totp_secret: None,
             session_ttl_seconds: None,
             secure_cookies: false,
         };
 
-        let now = UNIX_EPOCH + std::time::Duration::from_secs(59);
-        assert!(verify_login(&cfg, "000000", now).is_err());
+        assert!(is_enabled(&cfg));
+        assert!(!is_configured(&cfg));
+        assert!(verify_login(&cfg, "287082", Some("admin-key"), UNIX_EPOCH).is_err());
     }
 
     #[test]
     fn session_cookie_round_trip_validates_and_clears() {
+        let cfg = test_config(Some("admin-key"));
         let mut sessions = HashMap::new();
-        let session_id = create_session(&mut sessions, 600);
+        let session_id = create_session(&mut sessions, 600, &cfg);
         let cookie = build_session_cookie(&session_id, 600, false);
         let cookie_pair = cookie.split(';').next().unwrap_or_default();
 
         let mut headers = HeaderMap::new();
         headers.insert(header::COOKIE, HeaderValue::from_str(cookie_pair).unwrap());
 
-        assert!(validate_session(&headers, &mut sessions));
+        assert!(validate_session(&headers, &mut sessions, &cfg));
         remove_session(&headers, &mut sessions);
-        assert!(!validate_session(&headers, &mut sessions));
+        assert!(!validate_session(&headers, &mut sessions, &cfg));
+    }
+
+    #[test]
+    fn changing_admin_credentials_invalidates_existing_sessions() {
+        let original_cfg = test_config(Some("admin-key"));
+        let changed_cfg = test_config(Some("rotated-admin-key"));
+        let mut sessions = HashMap::new();
+        let session_id = create_session(&mut sessions, 600, &original_cfg);
+        let cookie = build_session_cookie(&session_id, 600, false);
+        let cookie_pair = cookie.split(';').next().unwrap_or_default();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, HeaderValue::from_str(cookie_pair).unwrap());
+
+        assert!(!validate_session(&headers, &mut sessions, &changed_cfg));
+        assert!(!sessions.contains_key(&session_id));
+    }
+
+    #[test]
+    fn changing_totp_secret_invalidates_existing_sessions() {
+        let original_cfg = test_config(Some("admin-key"));
+        let mut changed_cfg = original_cfg.clone();
+        changed_cfg.totp_secret = Some("JBSWY3DPEHPK3PXP".to_string());
+        let mut sessions = HashMap::new();
+        let session_id = create_session(&mut sessions, 600, &original_cfg);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("{ADMIN_SESSION_COOKIE}={session_id}")).unwrap(),
+        );
+
+        assert!(!validate_session(&headers, &mut sessions, &changed_cfg));
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn enabling_admin_api_key_requirement_invalidates_otp_only_sessions() {
+        let otp_only_cfg = test_config(None);
+        let key_and_otp_cfg = test_config(Some("admin-key"));
+        let mut sessions = HashMap::new();
+        let session_id = create_session(&mut sessions, 600, &otp_only_cfg);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("{ADMIN_SESSION_COOKIE}={session_id}")).unwrap(),
+        );
+
+        assert!(!validate_session(&headers, &mut sessions, &key_and_otp_cfg));
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn legacy_sessions_without_auth_context_are_rejected() {
+        let cfg = test_config(None);
+        let session_id = "legacy-session".to_string();
+        let mut sessions = HashMap::from([(
+            session_id.clone(),
+            AdminSession {
+                expires_at_unix: now_unix_seconds().saturating_add(600),
+                auth_context_version: 0,
+                auth_context: String::new(),
+            },
+        )]);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("{ADMIN_SESSION_COOKIE}={session_id}")).unwrap(),
+        );
+
+        assert!(!validate_session(&headers, &mut sessions, &cfg));
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn durable_session_save_round_trips_with_restrictive_permissions() {
+        let directory =
+            std::env::temp_dir().join(format!("io-gateway-admin-session-tests-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("admin-sessions.json");
+        let cfg = test_config(Some("admin-key"));
+        let mut sessions = HashMap::new();
+        let session_id = create_session(&mut sessions, 600, &cfg);
+
+        save_sessions(&path, &sessions).expect("save succeeds");
+        assert!(fs::metadata(&path).unwrap().is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let mut loaded = load_sessions(&path);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("{ADMIN_SESSION_COOKIE}={session_id}")).unwrap(),
+        );
+        assert!(validate_session(&headers, &mut loaded, &cfg));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn save_sessions_surfaces_unwritable_parent_errors() {
+        let directory =
+            std::env::temp_dir().join(format!("io-gateway-admin-session-tests-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let non_directory = directory.join("not-a-directory");
+        fs::write(&non_directory, b"not a directory").unwrap();
+
+        let err = save_sessions(&non_directory.join("admin-sessions.json"), &HashMap::new())
+            .expect_err("invalid parent must be returned to the caller");
+        assert!(err.contains("failed to create admin session directory"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn login_lockout_identity_uses_peer_ip_not_rotatable_user_agent() {
+        let peer_addr: SocketAddr = "203.0.113.10:4242".parse().unwrap();
+        let mut attempts = HashMap::new();
+
+        for (index, user_agent) in ["attempt-one", "attempt-two", "attempt-three"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::USER_AGENT, HeaderValue::from_static(user_agent));
+            // An untrusted client can send a spoofed forwarding header, but it
+            // must not determine the lockout bucket when trusted_proxy=false.
+            headers.insert("x-forwarded-for", HeaderValue::from_static("198.51.100.99"));
+            let client_key = login_client_key(&headers, false, Some(peer_addr));
+            assert_eq!(client_key, "peer-ip:203.0.113.10");
+
+            let result = record_failed_login(
+                &mut attempts,
+                &client_key,
+                UNIX_EPOCH + std::time::Duration::from_secs(index as u64),
+            );
+            if index < 2 {
+                assert!(result.is_none());
+            } else {
+                assert!(result.is_some());
+            }
+        }
+
+        let mut rotated_headers = HeaderMap::new();
+        rotated_headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("new-user-agent"),
+        );
+        let rotated_key = login_client_key(&rotated_headers, false, Some(peer_addr));
+        assert!(current_lockout_message(
+            &mut attempts,
+            &rotated_key,
+            UNIX_EPOCH + std::time::Duration::from_secs(4)
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn login_lockout_identity_uses_validated_forwarded_ip_only_when_trusted() {
+        let peer_addr: SocketAddr = "192.0.2.10:4242".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.10, 192.0.2.1"),
+        );
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("rotatable-agent"),
+        );
+
+        assert_eq!(
+            login_client_key(&headers, true, Some(peer_addr)),
+            "forwarded-ip:198.51.100.10"
+        );
+        assert_eq!(
+            login_client_key(&headers, false, Some(peer_addr)),
+            "peer-ip:192.0.2.10"
+        );
+
+        headers.insert("x-forwarded-for", HeaderValue::from_static("not-an-ip"));
+        assert_eq!(
+            login_client_key(&headers, true, Some(peer_addr)),
+            "peer-ip:192.0.2.10"
+        );
+        assert_eq!(login_client_key(&headers, false, None), "global");
     }
 
     #[test]

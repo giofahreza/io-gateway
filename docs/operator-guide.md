@@ -273,7 +273,7 @@ not the process working directory.
 
 - `tokens` is optional. Tokens are loaded from `auth_dir` credential files when empty.
 - `disabled_files` lists credential filenames that should be loaded but kept disabled at startup.
-- `admin_auth.api_key` falls back to `proxy_api_key` when omitted; a separate key is safer.
+- `admin_auth.api_key` is a separate dashboard credential. When configured, it is required in addition to TOTP; it never falls back to `proxy_api_key`.
 - `admin_auth.session_ttl_seconds` defaults to 43200 (12 hours), min 300, max 604800 (7 days).
 - Set `admin_auth.secure_cookies` to `true` when the dashboard is served over HTTPS.
 - Set `trusted_proxy` only when a configured reverse proxy sanitizes forwarded IP headers.
@@ -316,9 +316,7 @@ Qwen OAuth fields can be overridden individually with `QWEN_OAUTH_*` (e.g. `QWEN
 
 Open `http://127.0.0.1:8319/` to access the dashboard.
 
-When `admin_auth.enabled` is `true`, the dashboard prompts for:
-- The admin API key
-- A 6-digit TOTP code from Google Authenticator (set up with `totp_secret`)
+When `admin_auth.enabled` is `true`, the dashboard requires a 6-digit TOTP code from Google Authenticator (set up with `totp_secret`). If `admin_auth.api_key` is configured, it also requires that separate admin API key. The client-facing `proxy_api_key` never grants dashboard access.
 
 Sessions are persisted to disk and survive server restarts. Session duration is configurable.
 

@@ -11,6 +11,8 @@ export type AdminSession = {
   enabled: boolean;
   configured: boolean;
   authenticated: boolean;
+  requires_api_key?: boolean;
+  api_key_required?: boolean;
 };
 
 export type UsageTotals = {
@@ -94,8 +96,12 @@ export async function gatewayRequest<T = JsonValue>(
   });
 }
 
-export async function login(baseUrl: string, otp: string): Promise<GatewayResponse<{ ok?: boolean; message?: string }>> {
-  return invoke('gateway_login', { request: { baseUrl, otp } });
+export async function login(
+  baseUrl: string,
+  otp: string,
+  apiKey?: string,
+): Promise<GatewayResponse<{ ok?: boolean; message?: string }>> {
+  return invoke('gateway_login', { request: { baseUrl, otp, apiKey: apiKey || undefined } });
 }
 
 export function isUnauthorized(response: GatewayResponse<unknown>): boolean {

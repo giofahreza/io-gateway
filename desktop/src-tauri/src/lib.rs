@@ -34,6 +34,7 @@ struct GatewayRequest {
 struct LoginRequest {
     base_url: String,
     otp: String,
+    api_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,7 +99,10 @@ async fn gateway_login(
 ) -> Result<GatewayResponse, String> {
     let (client, cookie) = session_client(&state, &request.base_url).await?;
     let url = gateway_url(&request.base_url, "/admin/login")?;
-    let params = [("otp", request.otp)];
+    let mut params = vec![("otp", request.otp)];
+    if let Some(api_key) = request.api_key.filter(|value| !value.trim().is_empty()) {
+        params.push(("api_key", api_key));
+    }
     let mut builder = client.post(url).form(&params);
     if let Some(cookie) = cookie {
         builder = builder.header(COOKIE, cookie);

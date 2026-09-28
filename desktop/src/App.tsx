@@ -40,6 +40,7 @@ export function App() {
   const [state, setState] = useState<LoadState>('idle');
   const [message, setMessage] = useState<string | null>(null);
   const [otp, setOtp] = useState('');
+  const [adminApiKey, setAdminApiKey] = useState('');
   const [loggingIn, setLoggingIn] = useState(false);
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
 
@@ -107,12 +108,13 @@ export function App() {
     setLoggingIn(true);
     setMessage(null);
     try {
-      const response = await login(settings.baseUrl, otp);
+      const response = await login(settings.baseUrl, otp, adminApiKey);
       if (response.status >= 400 || !response.body.ok) {
         setMessage(responseMessage(response));
         return;
       }
       setOtp('');
+      setAdminApiKey('');
       await refresh();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
@@ -129,6 +131,7 @@ export function App() {
   const connected = state === 'ready';
   const loading = state === 'loading';
   const isDark = settings.theme === 'dark';
+  const adminApiKeyRequired = session?.requires_api_key === true || session?.api_key_required === true;
 
   return (
     <main className="app-shell" data-theme={settings.theme}>
@@ -225,7 +228,9 @@ export function App() {
             <h2>Admin Session</h2>
             <p className="muted">
               {session?.configured
-                ? 'Enter the current TOTP code for this gateway.'
+                ? adminApiKeyRequired
+                  ? 'Enter the current TOTP code and administrator API key for this gateway.'
+                  : 'Enter the current TOTP code for this gateway.'
                 : 'Admin auth is enabled, but the gateway reports no TOTP secret configured.'}
             </p>
           </div>
@@ -237,7 +242,16 @@ export function App() {
               value={otp}
               onChange={(event) => setOtp(event.target.value)}
             />
-            <button type="submit" disabled={loggingIn || !otp.trim()}>
+            {adminApiKeyRequired && (
+              <input
+                type="password"
+                autoComplete="current-password"
+                placeholder="Administrator API key"
+                value={adminApiKey}
+                onChange={(event) => setAdminApiKey(event.target.value)}
+              />
+            )}
+            <button type="submit" disabled={loggingIn || !otp.trim() || (adminApiKeyRequired && !adminApiKey.trim())}>
               {loggingIn ? 'Signing in' : 'Sign in'}
             </button>
           </form>

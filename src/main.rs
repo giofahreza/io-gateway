@@ -180,6 +180,35 @@ struct AppState {
     account_refresh_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
+/// Optional peer information for the administrator login limiter.
+///
+/// The live server installs `ConnectInfo<SocketAddr>` for every TCP request.
+/// Keeping this extractor optional is intentional: a differently embedded
+/// router must use the shared limiter bucket rather than reject the request
+/// or fall back to attacker-controlled headers such as `User-Agent`.
+#[derive(Clone, Copy)]
+struct LoginPeerAddress(Option<SocketAddr>);
+
+#[axum::async_trait]
+impl<S> axum::extract::FromRequestParts<S> for LoginPeerAddress
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            parts
+                .extensions
+                .get::<axum::extract::ConnectInfo<SocketAddr>>()
+                .map(|info| info.0),
+        ))
+    }
+}
+
 #[derive(Clone)]
 enum ApiKeyCacheEntry {
     Verified(AuthenticatedApiKey),
@@ -722,10 +751,14 @@ async fn main() {
         max_request_body_bytes = state.cfg.max_request_body_bytes,
         "request body limit configuration"
     );
-    axum::serve(tokio::net::TcpListener::bind(addr).await.unwrap(), app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .unwrap();
 
     quota_refresh.abort();
     maintenance.abort();
@@ -3348,12 +3381,16 @@ async fn dashboard() -> impl IntoResponse {
     <div id="adminLoginGate" class="modal" role="dialog" aria-modal="true" aria-labelledby="adminLoginTitle" aria-hidden="true" style="display:none;">
       <div class="modal-card admin-login-card">
         <h2 id="adminLoginTitle" style="margin-top:0;">Admin Login</h2>
-        <p class="admin-login-copy">Enter the current 6-digit OTP from Google Authenticator to manage accounts.</p>
+        <p id="adminLoginCopy" class="admin-login-copy">Enter the current 6-digit OTP from Google Authenticator to manage accounts.</p>
         <form id="adminLoginForm" class="admin-login-form">
           <input class="sr-only" type="text" name="username" autocomplete="username" value="admin" tabindex="-1" aria-hidden="true">
           <div>
             <label for="adminOtpInput">Google Authenticator OTP</label>
             <input id="adminOtpInput" name="otp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]*" placeholder="123456">
+          </div>
+          <div id="adminApiKeyField" hidden>
+            <label for="adminApiKeyInput">Administrator API key</label>
+            <input id="adminApiKeyInput" name="api_key" type="password" autocomplete="current-password" placeholder="Administrator API key">
           </div>
           <button type="submit">Log in</button>
           <div id="adminLoginStatus" class="muted"></div>
@@ -3581,6 +3618,7 @@ async fn dashboard() -> impl IntoResponse {
     <script>
       let adminAuthEnabled = false;
       let adminAuthenticated = false;
+      let adminApiKeyRequired = false;
       let adminAuthEpoch = 0;
       let dashboardIntervalsStarted = false;
       let lastQuota = new Map();
@@ -5198,6 +5236,19 @@ async fn dashboard() -> impl IntoResponse {
         document.getElementById('logoutBtn').style.display = 'none';
         document.getElementById('adminLoginStatus').textContent = message || '';
       }
+      function setAdminApiKeyRequirement(required) {
+        adminApiKeyRequired = !!required;
+        var field = document.getElementById('adminApiKeyField');
+        var input = document.getElementById('adminApiKeyInput');
+        var copy = document.getElementById('adminLoginCopy');
+        if (field) field.hidden = !adminApiKeyRequired;
+        if (input) input.required = adminApiKeyRequired;
+        if (copy) {
+          copy.textContent = adminApiKeyRequired
+            ? 'Enter the current 6-digit OTP and administrator API key to manage accounts.'
+            : 'Enter the current 6-digit OTP from Google Authenticator to manage accounts.';
+        }
+      }
       function hideAdminLogin() {
         const gate = document.getElementById('adminLoginGate');
         gate.style.display = 'none';
@@ -5293,6 +5344,7 @@ async fn dashboard() -> impl IntoResponse {
         const res = await fetch('/admin/session', { credentials: 'same-origin' });
         const data = await res.json();
         adminAuthEnabled = !!data.enabled;
+        setAdminApiKeyRequirement(!!(data.requires_api_key || data.api_key_required));
         adminAuthenticated = !!data.authenticated || !adminAuthEnabled;
         if (!adminAuthEnabled) {
           hideAdminLogin();
@@ -5308,7 +5360,9 @@ async fn dashboard() -> impl IntoResponse {
           startDashboard();
           return;
         }
-        showAdminLogin('Enter your current Google Authenticator code.');
+        showAdminLogin(adminApiKeyRequired
+          ? 'Enter your current Google Authenticator code and administrator API key.'
+          : 'Enter your current Google Authenticator code.');
       }
       function setThemeToggleLabel(theme) {
         const btn = document.getElementById('themeToggleBtn');
@@ -9029,15 +9083,24 @@ async fn dashboard() -> impl IntoResponse {
       document.getElementById('adminLoginForm').addEventListener('submit', async (e) => {
         e.preventDefault();
         const otp = document.getElementById('adminOtpInput').value.trim();
+        const apiKeyInput = document.getElementById('adminApiKeyInput');
+        const apiKey = apiKeyInput ? apiKeyInput.value.trim() : '';
         if (!otp) {
           document.getElementById('adminLoginStatus').textContent = 'OTP is required.';
           return;
         }
+        if (adminApiKeyRequired && !apiKey) {
+          document.getElementById('adminLoginStatus').textContent = 'Administrator API key is required.';
+          apiKeyInput?.focus();
+          return;
+        }
+        const credentials = { otp: otp };
+        if (adminApiKeyRequired) credentials.api_key = apiKey;
         const res = await fetch('/admin/login', {
           method: 'POST',
           credentials: 'same-origin',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({ otp: otp })
+          body: new URLSearchParams(credentials)
         });
         const data = await res.json();
         if (!res.ok || !data.ok) {
@@ -9047,6 +9110,7 @@ async fn dashboard() -> impl IntoResponse {
         adminAuthEpoch += 1;
         adminAuthenticated = true;
         document.getElementById('adminOtpInput').value = '';
+        if (apiKeyInput) apiKeyInput.value = '';
         hideAdminLogin();
         startDashboard();
       });
@@ -9088,7 +9152,7 @@ async fn admin_session_route(
     let configured = admin_auth::is_configured(&state.cfg.admin_auth);
     let authenticated = if enabled {
         let mut sessions = state.admin_sessions.lock().unwrap();
-        admin_auth::validate_session(&headers, &mut sessions)
+        admin_auth::validate_session(&headers, &mut sessions, &state.cfg.admin_auth)
     } else {
         true
     };
@@ -9096,6 +9160,7 @@ async fn admin_session_route(
     axum::Json(serde_json::json!({
         "enabled": enabled,
         "configured": configured,
+        "api_key_required": admin_auth::requires_api_key(&state.cfg.admin_auth),
         "authenticated": authenticated
     }))
 }
@@ -9103,10 +9168,11 @@ async fn admin_session_route(
 async fn admin_login_route(
     State(state): State<AppState>,
     headers: HeaderMap,
+    LoginPeerAddress(peer_addr): LoginPeerAddress,
     Form(form): Form<admin_auth::LoginForm>,
 ) -> impl IntoResponse {
     let now = std::time::SystemTime::now();
-    let client_key = admin_auth::login_client_key(&headers, state.cfg.trusted_proxy);
+    let client_key = admin_auth::login_client_key(&headers, state.cfg.trusted_proxy, peer_addr);
     if let Some(message) = {
         let mut attempts = state.admin_login_attempts.lock().unwrap();
         admin_auth::current_lockout_message(&mut attempts, &client_key, now)
@@ -9121,19 +9187,48 @@ async fn admin_login_route(
             .into_response();
     }
 
-    match admin_auth::verify_login(&state.cfg.admin_auth, &form.otp, now) {
+    match admin_auth::verify_login(
+        &state.cfg.admin_auth,
+        &form.otp,
+        form.api_key.as_deref(),
+        now,
+    ) {
         Ok(()) => {
             let ttl_seconds = admin_auth::session_ttl_seconds(&state.cfg.admin_auth);
+            let session_id = match {
+                let mut sessions = state.admin_sessions.lock().unwrap();
+                let previous_sessions = sessions.clone();
+                let session_id =
+                    admin_auth::create_session(&mut sessions, ttl_seconds, &state.cfg.admin_auth);
+                match admin_auth::save_sessions(&admin_session_path(state.cfg.as_ref()), &sessions)
+                {
+                    Ok(()) => Ok(session_id),
+                    Err(err) => {
+                        // Do not leave a session live only in memory when the
+                        // durable save failed. A browser cookie is issued only
+                        // after the authoritative session file is committed.
+                        *sessions = previous_sessions;
+                        Err(err)
+                    }
+                }
+            } {
+                Ok(session_id) => session_id,
+                Err(err) => {
+                    error!("failed to persist newly created admin session: {}", err);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(serde_json::json!({
+                            "ok": false,
+                            "message": "failed to persist admin session"
+                        })),
+                    )
+                        .into_response();
+                }
+            };
             {
                 let mut attempts = state.admin_login_attempts.lock().unwrap();
                 admin_auth::clear_login_attempts(&mut attempts, &client_key);
             }
-            let session_id = {
-                let mut sessions = state.admin_sessions.lock().unwrap();
-                let session_id = admin_auth::create_session(&mut sessions, ttl_seconds);
-                admin_auth::save_sessions(&admin_session_path(state.cfg.as_ref()), &sessions);
-                session_id
-            };
             let mut response = axum::Json(serde_json::json!({
                 "ok": true,
                 "message": "logged in"
@@ -9175,10 +9270,31 @@ async fn admin_logout_route(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    {
+    let persisted = {
         let mut sessions = state.admin_sessions.lock().unwrap();
+        let previous_sessions = sessions.clone();
         admin_auth::remove_session(&headers, &mut sessions);
-        admin_auth::save_sessions(&admin_session_path(state.cfg.as_ref()), &sessions);
+        match admin_auth::save_sessions(&admin_session_path(state.cfg.as_ref()), &sessions) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                // Keep the in-memory session and browser cookie intact so the
+                // caller can retry rather than believing a logout persisted
+                // when it did not.
+                *sessions = previous_sessions;
+                Err(err)
+            }
+        }
+    };
+    if let Err(err) = persisted {
+        error!("failed to persist admin logout: {}", err);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({
+                "ok": false,
+                "message": "failed to persist admin logout"
+            })),
+        )
+            .into_response();
     }
     let mut response = axum::Json(serde_json::json!({
         "ok": true,
@@ -19362,7 +19478,7 @@ fn require_admin_session_json(state: &AppState, headers: &HeaderMap) -> Option<R
         return None;
     }
     let mut sessions = state.admin_sessions.lock().unwrap();
-    if admin_auth::validate_session(headers, &mut sessions) {
+    if admin_auth::validate_session(headers, &mut sessions, &state.cfg.admin_auth) {
         return None;
     }
     Some(
@@ -19384,7 +19500,7 @@ fn require_admin_session_text(state: &AppState, headers: &HeaderMap) -> Option<R
         return None;
     }
     let mut sessions = state.admin_sessions.lock().unwrap();
-    if admin_auth::validate_session(headers, &mut sessions) {
+    if admin_auth::validate_session(headers, &mut sessions, &state.cfg.admin_auth) {
         return None;
     }
     Some(

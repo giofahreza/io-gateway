@@ -151,6 +151,10 @@ enum Command {
 struct LoginArgs {
     /// One-time password from the configured TOTP authenticator.
     otp: Option<String>,
+    /// Administrator API key, when the gateway requires it in addition to TOTP.
+    /// Prefer IOGW_ADMIN_API_KEY in scripts so the value is not placed in shell history.
+    #[arg(long, env = "IOGW_ADMIN_API_KEY", hide_env_values = true)]
+    api_key: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -564,7 +568,7 @@ async fn run() -> Result<(), String> {
                 Some(otp) => otp,
                 None => prompt_line("OTP: ").map_err(|err| err.to_string())?,
             };
-            let response = client.login(&otp).await?;
+            let response = client.login(&otp, args.api_key.as_deref()).await?;
             ensure_success(&response)?;
             print_response(cli.json, response.body)
         }
@@ -643,9 +647,12 @@ impl GatewayClient {
         response_to_api_response(response).await
     }
 
-    async fn login(&mut self, otp: &str) -> Result<ApiResponse, String> {
-        let body =
-            serde_urlencoded::to_string([("otp", otp.trim())]).map_err(|err| err.to_string())?;
+    async fn login(&mut self, otp: &str, api_key: Option<&str>) -> Result<ApiResponse, String> {
+        let mut fields = vec![("otp", otp.trim())];
+        if let Some(api_key) = api_key.map(str::trim).filter(|value| !value.is_empty()) {
+            fields.push(("api_key", api_key));
+        }
+        let body = serde_urlencoded::to_string(fields).map_err(|err| err.to_string())?;
         let response = self
             .http
             .post(self.url("/admin/login"))
@@ -1154,7 +1161,14 @@ async fn run_tui_loop(
             KeyCode::Char('u') => app.show_all_usage_filters(),
             KeyCode::Char('o') => {
                 let otp = prompt_in_terminal(terminal, "OTP: ")?;
-                match app.client.login(&otp).await {
+                let api_key_required = bool_at(&app.data.session, &["requires_api_key"])
+                    || bool_at(&app.data.session, &["api_key_required"]);
+                let api_key = if api_key_required {
+                    Some(prompt_in_terminal(terminal, "Administrator API key: ")?)
+                } else {
+                    None
+                };
+                match app.client.login(&otp, api_key.as_deref()).await {
                     Ok(response) if response.status.is_success() => {
                         app.message = "logged in".to_string();
                         app.refresh(true).await;
