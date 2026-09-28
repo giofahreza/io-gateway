@@ -1447,10 +1447,15 @@ mod tests {
                 claude_oauth_pending: Arc::new(Mutex::new(HashMap::new())),
                 admin_sessions: Arc::new(Mutex::new(HashMap::new())),
                 admin_login_attempts: Arc::new(Mutex::new(HashMap::new())),
-                api_keys: Arc::new(Mutex::new(crate::api_keys::ApiKeyStore::default())),
-                api_key_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+                api_key_registry: crate::ApiKeyRegistry::new(
+                    crate::api_keys::ApiKeyStore::default(),
+                ),
                 api_key_last_used: Arc::new(Mutex::new(HashMap::new())),
                 request_api_key_id: None,
+                request_source_api: crate::SourceApi::V1,
+                request_api_key_budget: None,
+                request_api_key_quota: None,
+                request_api_key_audit: None,
                 internal_proxy_secret: Arc::new("test-internal-proxy-secret".to_string()),
                 notification_settings: Arc::new(Mutex::new(
                     crate::notifications::NotificationSettings::default(),

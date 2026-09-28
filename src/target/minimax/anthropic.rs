@@ -57,6 +57,7 @@ pub async fn messages(
     body: Bytes,
 ) -> impl IntoResponse {
     if !crate::check_api_key(&state, &headers) {
+        crate::release_api_key_budget_before_dispatch(&state);
         return anthropic_error(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
@@ -67,6 +68,7 @@ pub async fn messages(
     let raw: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return anthropic_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
@@ -78,6 +80,7 @@ pub async fn messages(
     let model = match raw.get("model").and_then(|v| v.as_str()) {
         Some(model) if !model.trim().is_empty() => model.trim().to_string(),
         _ => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return anthropic_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
@@ -88,6 +91,7 @@ pub async fn messages(
 
     let accounts = super::accounts::candidate_accounts(&state);
     if accounts.is_empty() {
+        crate::release_api_key_budget_before_dispatch(&state);
         return anthropic_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "api_error",
@@ -106,6 +110,12 @@ pub async fn messages(
             "/minimax/anthropic/v1/messages",
             prompt_metrics.clone(),
         );
+        if let Err(response) = crate::api_key_quota_runtime::reserve_api_key_budgets_for_prepared_dispatch_with_protocol(
+            &state, context.provider_name, &context.key, &body,
+            crate::quota_usage::PreparedProtocol::AnthropicMessages,
+        ).await {
+            return response;
+        }
         crate::record_minimax_request(&state, &context);
 
         let base_url = super::api::normalize_base_url(account.base_url.as_deref());
@@ -199,7 +209,11 @@ pub async fn messages(
         }
 
         let usage = serde_json::from_slice::<Value>(&bytes)
-            .map(|value| crate::usage_metrics_from_response_value(&value))
+            .map(|value| {
+                let mut usage = crate::usage_metrics_from_response_value(&value);
+                crate::quota_usage::preserve_native_usage(&mut usage, &value, "anthropic");
+                usage
+            })
             .unwrap_or_default();
         crate::record_minimax_success(&state, &context, &usage);
         return (status, out_headers, bytes).into_response();
@@ -226,14 +240,21 @@ async fn stream_messages(
 ) -> axum::response::Response {
     let usage_state = state.clone();
     let usage_context = context.clone();
+    let lifecycle = crate::StreamRequestGuard::new(&usage_state, &usage_context);
     let stream = async_stream::stream! {
-        let mut lifecycle = crate::StreamRequestGuard::new(&usage_state, &usage_context);
+        let mut lifecycle = lifecycle;
         let mut upstream = resp.bytes_stream();
         let mut parser = AnthropicSseUsageTracker::default();
         while let Some(chunk) = upstream.next().await {
             match chunk {
                 Ok(bytes) => {
                     parser.push(&bytes);
+                    if let Some(message) = parser.terminal_error() {
+                        crate::record_minimax_error(&usage_state, &usage_context, message);
+                        lifecycle.finish();
+                        yield Ok::<Bytes, std::io::Error>(bytes);
+                        return;
+                    }
                     yield Ok::<Bytes, std::io::Error>(bytes);
                 }
                 Err(err) => {
@@ -245,10 +266,14 @@ async fn stream_messages(
                 }
             }
         }
-        if let Some(usage) = parser.finish() {
-            crate::record_minimax_success(&usage_state, &usage_context, &usage);
-        } else {
-            crate::record_minimax_success(&usage_state, &usage_context, &crate::UsageMetrics::default());
+        match parser.finish() {
+            Err(message) => crate::record_minimax_error(&usage_state, &usage_context, &message),
+            Ok(Some(usage)) => crate::record_minimax_success(&usage_state, &usage_context, &usage),
+            Ok(None) => crate::record_minimax_success(
+                &usage_state,
+                &usage_context,
+                &crate::UsageMetrics::default(),
+            ),
         }
         lifecycle.finish();
     };
@@ -313,6 +338,9 @@ fn anthropic_error(
 struct AnthropicSseUsageTracker {
     buffer: Vec<u8>,
     last_usage: Option<crate::UsageMetrics>,
+    terminal_error: Option<String>,
+    saw_message_stop: bool,
+    saw_final_output_usage: bool,
 }
 
 impl AnthropicSseUsageTracker {
@@ -327,27 +355,61 @@ impl AnthropicSseUsageTracker {
         }
     }
 
-    fn finish(mut self) -> Option<crate::UsageMetrics> {
+    fn finish(mut self) -> Result<Option<crate::UsageMetrics>, String> {
         if !self.buffer.is_empty() {
             let raw = std::mem::take(&mut self.buffer);
             self.absorb_event(&raw);
         }
-        self.last_usage
+        if let Some(usage) = self.last_usage.as_mut() {
+            crate::quota_usage::mark_stream_usage(
+                usage,
+                "anthropic",
+                self.saw_message_stop && self.saw_final_output_usage,
+            );
+        }
+        self.terminal_error.map_or(Ok(self.last_usage), Err)
+    }
+
+    fn terminal_error(&self) -> Option<&str> {
+        self.terminal_error.as_deref()
     }
 
     fn absorb_event(&mut self, raw_event: &[u8]) {
-        let Some(data) = parse_sse_data(raw_event) else {
-            return;
-        };
-        if data.trim() == "[DONE]" {
-            return;
+        if self.terminal_error.is_none() {
+            if let Some(error) = crate::sse_terminal_error_from_event(raw_event) {
+                self.terminal_error = Some(error);
+                return;
+            }
         }
-        let Ok(value) = serde_json::from_str::<Value>(&data) else {
+        let Some(value) = crate::sse_event_json_value(raw_event) else {
             return;
         };
+        if value.get("type").and_then(Value::as_str) == Some("message_stop") {
+            self.saw_message_stop = true;
+        }
+        if value.get("type").and_then(Value::as_str) == Some("message_delta") {
+            self.saw_final_output_usage |= value
+                .get("usage")
+                .is_some_and(crate::quota_usage::has_output_observation)
+                && value
+                    .pointer("/delta/stop_reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reason| !reason.is_empty());
+        }
         let usage = crate::usage_metrics_from_response_value(&value);
-        if usage.input_tokens > 0 || usage.output_tokens > 0 || usage.total_tokens > 0 {
-            self.last_usage = Some(usage);
+        if let Some(raw) = usage.raw_usage.as_ref() {
+            let previous = self
+                .last_usage
+                .get_or_insert_with(crate::UsageMetrics::default);
+            previous.input_tokens = previous.input_tokens.max(usage.input_tokens);
+            previous.output_tokens = previous.output_tokens.max(usage.output_tokens);
+            previous.total_tokens = previous
+                .total_tokens
+                .max(usage.total_tokens)
+                .max(previous.input_tokens.saturating_add(previous.output_tokens));
+            previous.cache_tokens = previous.cache_tokens.max(usage.cache_tokens);
+            previous.reasoning_tokens = previous.reasoning_tokens.max(usage.reasoning_tokens);
+            crate::quota_usage::merge_cumulative_usage(&mut previous.raw_usage, raw);
         }
     }
 }
@@ -386,6 +448,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quota_stream_requires_final_output_usage_not_just_message_stop() {
+        for (tail, complete) in [
+            ("", false),
+            ("data: {\"type\":\"message_stop\"}\n\n", false),
+            ("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\ndata: {\"type\":\"message_stop\"}\n\n", false),
+            ("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\ndata: {\"type\":\"message_stop\"}\n\n", true),
+        ] {
+            let mut tracker = AnthropicSseUsageTracker::default();
+            tracker.push(&Bytes::from_static(b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"cache_read_input_tokens\":7,\"cache_creation_input_tokens\":3,\"output_tokens\":0}}}\n\n"));
+            tracker.push(&Bytes::copy_from_slice(tail.as_bytes()));
+            let metrics = tracker.finish().unwrap().unwrap();
+            let normalized = crate::quota_usage::normalize("claude", metrics.raw_usage.as_ref().unwrap(), true);
+            assert_eq!(normalized.trustworthy_final, complete, "{tail:?}");
+            assert_eq!(normalized.input_tokens, Some(15));
+            if complete { assert_eq!(normalized.output_tokens, Some(9)); }
+        }
+    }
+
+    #[test]
     fn anthropic_messages_url_uses_official_anthropic_route() {
         assert_eq!(
             anthropic_messages_url("https://api.minimax.io"),
@@ -419,5 +500,17 @@ mod tests {
             anthropic_messages_url("https://api.minimax.io/v1/chat/completions"),
             "https://api.minimax.io/anthropic/v1/messages"
         );
+    }
+
+    #[test]
+    fn anthropic_sse_tracker_rejects_terminal_error_events() {
+        let mut tracker = AnthropicSseUsageTracker::default();
+        tracker.push(&Bytes::from_static(
+            b"data: {\"type\":\"error\",\"error\":{\"message\":\"minimax quota\"}}\n\n",
+        ));
+        assert!(matches!(
+            tracker.finish(),
+            Err(message) if message == "minimax quota"
+        ));
     }
 }

@@ -61,6 +61,7 @@ pub async fn responses(
     body: Bytes,
 ) -> impl IntoResponse {
     if !crate::check_api_key(&state, &headers) {
+        crate::release_api_key_budget_before_dispatch(&state);
         return (
             StatusCode::UNAUTHORIZED,
             [("Content-Type", "application/json")],
@@ -76,6 +77,7 @@ pub async fn responses(
     let raw: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
@@ -92,6 +94,7 @@ pub async fn responses(
     let model = match raw.get("model").and_then(|v| v.as_str()) {
         Some(model) if !model.trim().is_empty() => model.to_string(),
         _ => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
@@ -107,6 +110,7 @@ pub async fn responses(
 
     let accounts = super::accounts::candidate_accounts(&state);
     if accounts.is_empty() {
+        crate::release_api_key_budget_before_dispatch(&state);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [("Content-Type", "application/json")],
@@ -192,6 +196,18 @@ async fn native_responses(
         "/minimax/v1/responses",
         crate::prompt_metrics_from_request_value(raw),
     );
+    if let Err(response) =
+        crate::api_key_quota_runtime::reserve_api_key_budgets_for_prepared_dispatch_with_protocol(
+            state,
+            context.provider_name,
+            &context.key,
+            body,
+            crate::quota_usage::PreparedProtocol::OpenAiResponses,
+        )
+        .await
+    {
+        return response;
+    }
     crate::record_minimax_request(state, &context);
 
     let wants_stream = crate::source::wants_stream(incoming_headers, body);
@@ -305,14 +321,21 @@ async fn stream_native_responses(
 ) -> axum::response::Response {
     let usage_state = state.clone();
     let usage_context = context.clone();
+    let lifecycle = crate::StreamRequestGuard::new(&usage_state, &usage_context);
     let stream = async_stream::stream! {
-        let mut lifecycle = crate::StreamRequestGuard::new(&usage_state, &usage_context);
+        let mut lifecycle = lifecycle;
         let mut upstream = resp.bytes_stream();
         let mut parser = NativeResponsesSseUsageTracker::default();
         while let Some(chunk) = upstream.next().await {
             match chunk {
                 Ok(bytes) => {
                     parser.push(&bytes);
+                    if let Some(message) = parser.terminal_error() {
+                        crate::record_minimax_error(&usage_state, &usage_context, message);
+                        lifecycle.finish();
+                        yield Ok::<Bytes, std::io::Error>(bytes);
+                        return;
+                    }
                     yield Ok::<Bytes, std::io::Error>(bytes);
                 }
                 Err(err) => {
@@ -324,11 +347,17 @@ async fn stream_native_responses(
                 }
             }
         }
-        if let Some(response) = parser.finish() {
-            let usage = crate::usage_metrics_from_response_value(&response);
-            crate::record_minimax_success(&usage_state, &usage_context, &usage);
-        } else {
-            crate::record_minimax_success(&usage_state, &usage_context, &crate::UsageMetrics::default());
+        match parser.finish() {
+            Err(message) => crate::record_minimax_error(&usage_state, &usage_context, &message),
+            Ok(Some(response)) => {
+                let usage = crate::usage_metrics_from_response_value(&response);
+                crate::record_minimax_success(&usage_state, &usage_context, &usage);
+            }
+            Ok(None) => crate::record_minimax_success(
+                &usage_state,
+                &usage_context,
+                &crate::UsageMetrics::default(),
+            ),
         }
         lifecycle.finish();
     };
@@ -348,6 +377,7 @@ async fn stream_native_responses(
 struct NativeResponsesSseUsageTracker {
     buffer: Vec<u8>,
     last_response: Option<Value>,
+    terminal_error: Option<String>,
 }
 
 impl NativeResponsesSseUsageTracker {
@@ -359,15 +389,25 @@ impl NativeResponsesSseUsageTracker {
         }
     }
 
-    fn finish(mut self) -> Option<Value> {
+    fn finish(mut self) -> Result<Option<Value>, String> {
         if !self.buffer.is_empty() {
             let raw = std::mem::take(&mut self.buffer);
             self.absorb_event(&raw);
         }
-        self.last_response
+        self.terminal_error.map_or(Ok(self.last_response), Err)
+    }
+
+    fn terminal_error(&self) -> Option<&str> {
+        self.terminal_error.as_deref()
     }
 
     fn absorb_event(&mut self, raw_event: &[u8]) {
+        if self.terminal_error.is_none() {
+            if let Some(error) = crate::sse_terminal_error_from_event(raw_event) {
+                self.terminal_error = Some(error);
+                return;
+            }
+        }
         let Some(data) = parse_sse_data(raw_event) else {
             return;
         };
@@ -431,14 +471,12 @@ async fn chat_completions_responses(
         "/minimax/v1/chat/completions",
         crate::prompt_metrics_from_request_value(raw),
     );
-    crate::record_minimax_request(state, &context);
-
     let wants_stream = crate::source::wants_stream(headers, body);
 
-    let chat_payload = match build_chat_completions_payload(raw, model) {
+    let mut chat_payload = match build_chat_completions_payload(raw, model) {
         Ok(payload) => payload,
         Err(err) => {
-            crate::record_minimax_error(state, &context, &err);
+            crate::record_request_pre_dispatch_error(state, &context, err.as_str());
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
@@ -447,6 +485,26 @@ async fn chat_completions_responses(
                 .into_response();
         }
     };
+
+    if wants_stream {
+        chat_payload["stream"] = serde_json::json!(true);
+        if chat_payload.get("stream_options").is_none() {
+            chat_payload["stream_options"] = serde_json::json!({"include_usage": true});
+        }
+    }
+    if let Err(response) =
+        crate::api_key_quota_runtime::reserve_api_key_budgets_for_prepared_dispatch_with_protocol(
+            state,
+            context.provider_name,
+            &context.key,
+            &serde_json::to_vec(&chat_payload).unwrap_or_default(),
+            crate::quota_usage::PreparedProtocol::ChatCompletions,
+        )
+        .await
+    {
+        return response;
+    }
+    crate::record_minimax_request(state, &context);
 
     if wants_stream {
         return match stream_chat_completions(
@@ -556,7 +614,8 @@ async fn chat_completions_responses(
     };
 
     let response = chat_completion_to_responses(&chat_response, model);
-    let usage = crate::usage_metrics_from_response_value(&response);
+    let mut usage = crate::usage_metrics_from_response_value(&response);
+    crate::quota_usage::preserve_native_usage(&mut usage, &chat_response, "openai");
     crate::record_minimax_success(state, &context, &usage);
 
     let body = serde_json::to_vec(&response).unwrap_or_default();
@@ -603,5 +662,17 @@ mod tests {
         assert!(!use_native_responses(Some(
             "https://example.com/v1/chat/completions"
         )));
+    }
+
+    #[test]
+    fn native_sse_tracker_rejects_terminal_error_events() {
+        let mut tracker = NativeResponsesSseUsageTracker::default();
+        tracker.push(&Bytes::from_static(
+            b"event: error\ndata: {\"error\":{\"message\":\"minimax unavailable\"}}\n\n",
+        ));
+        assert!(matches!(
+            tracker.finish(),
+            Err(message) if message == "minimax unavailable"
+        ));
     }
 }

@@ -18,19 +18,29 @@ use std::{
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
     pin::Pin,
-    sync::{mpsc, Arc, Mutex, OnceLock, RwLock},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
+        mpsc, Arc, Mutex, OnceLock, RwLock,
+    },
     time::Duration,
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
 mod admin_auth;
+mod api_key_policy_store;
+mod api_key_quota;
+mod api_key_quota_runtime;
+mod api_key_request_audit;
 mod api_keys;
 mod custom_models;
+mod input_assessment;
 mod notifications;
+mod quota_usage;
 mod source;
 mod stats_store;
 mod target;
 mod usage_store;
+pub(crate) use api_key_quota_runtime::reserve_api_key_budgets_for_prepared_dispatch;
 use source::v1::response::{
     model_retrieve_to_openai_json, models_list_to_openai_json, openai_error_body,
     sse_to_response_json, status_to_error_code, status_to_error_type, upstream_error_to_openai,
@@ -56,6 +66,13 @@ const MODEL_CACHE_TTL_SECONDS: u64 = 10 * 60;
 const MODEL_LIST_TIMEOUT: Duration = Duration::from_secs(3);
 const QUOTA_REFRESH_SECONDS: u64 = 60;
 const EXHAUSTED_QUOTA_REFRESH_SECONDS: u64 = 60 * 60;
+// The HTTP client has a 30-minute total request timeout. Keep stale budget
+// holds longer than that so a legitimate slow stream is never swept while it
+// can still be in flight, then conservatively charge abandoned holds after a
+// crash or lost completion event.
+const API_KEY_BUDGET_STALE_RESERVATION_AGE: Duration = Duration::from_secs(35 * 60);
+const API_KEY_BUDGET_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+const API_KEY_BUDGET_SWEEP_BATCH_SIZE: usize = 256;
 const CONFIG_PATH_ENV: &str = "IO_GATEWAY_CONFIG";
 const MODEL_PROVIDER_PREFIXES: [&str; 10] = [
     "cod", "agw", "gem", "qwn", "dsk", "grk", "min", "cop", "cld", "glm",
@@ -67,6 +84,10 @@ struct GatewayArgs {
     /// Path to the runtime configuration file. Defaults to $IO_GATEWAY_CONFIG, then ./config.json.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
+    /// Back up durable API-key rules and balances into a NEW directory, then exit.
+    /// Does not include provider credentials, config, or reporting history.
+    #[arg(long, value_name = "NEW_DIRECTORY")]
+    backup_policy: Option<PathBuf>,
 }
 const MOBILE_QUOTA_SCALAR_KEYS: [&str; 25] = [
     "label",
@@ -167,10 +188,16 @@ struct AppState {
     claude_oauth_pending: Arc<Mutex<HashMap<String, target::claude::auth::PendingOAuth>>>,
     admin_sessions: Arc<Mutex<HashMap<String, admin_auth::AdminSession>>>,
     admin_login_attempts: Arc<Mutex<HashMap<String, admin_auth::LoginAttemptState>>>,
-    api_keys: Arc<Mutex<api_keys::ApiKeyStore>>,
-    api_key_cache: Arc<RwLock<HashMap<String, ApiKeyCacheEntry>>>,
+    api_key_registry: ApiKeyRegistry,
     api_key_last_used: Arc<Mutex<HashMap<String, String>>>,
     request_api_key_id: Option<String>,
+    /// The public protocol that owns this request. Provider adapters use it
+    /// when a later retry needs a fresh managed-key budget hold and that hold
+    /// is denied before another upstream dispatch.
+    request_source_api: SourceApi,
+    request_api_key_budget: Option<ApiKeyBudgetReservationContext>,
+    request_api_key_audit: Option<Arc<api_key_request_audit::RequestAudit>>,
+    request_api_key_quota: Option<Arc<api_key_quota_runtime::QuotaRequestContext>>,
     internal_proxy_secret: Arc<String>,
     notification_settings: Arc<Mutex<notifications::NotificationSettings>>,
     account_routing: Arc<Mutex<AccountRoutingSettings>>,
@@ -215,10 +242,579 @@ enum ApiKeyCacheEntry {
     Rejected(std::time::Instant),
 }
 
+/// API-key authentication state has one authority.  In particular, a
+/// delayed Argon2 verification must not be able to repopulate a cache that a
+/// concurrent revoke just cleared, and a delayed last-used update must not
+/// rewrite an older full API-key snapshot to disk.
+#[derive(Clone)]
+struct ApiKeyRegistry {
+    auth: Arc<RwLock<ApiKeyAuthState>>,
+    mutation_gate: Arc<Mutex<()>>,
+}
+
+struct ApiKeyAuthState {
+    store: api_keys::ApiKeyStore,
+    epoch: u64,
+    cache: HashMap<String, ApiKeyCacheEntry>,
+}
+
+/// An API-key change can be rejected by policy before it is written, or it
+/// can fail while saving an otherwise-valid candidate.  Routes must not turn
+/// the latter into a client validation error: the in-memory authority has not
+/// changed and the operator needs to know that storage is unavailable.
+#[derive(Debug)]
+enum ApiKeyRegistryMutationError {
+    Rejected(String),
+    Persistence(String),
+}
+
+impl ApiKeyRegistry {
+    fn new(store: api_keys::ApiKeyStore) -> Self {
+        Self {
+            auth: Arc::new(RwLock::new(ApiKeyAuthState {
+                store,
+                epoch: 0,
+                cache: HashMap::new(),
+            })),
+            mutation_gate: Arc::new(Mutex::new(())),
+        }
+    }
+
+    fn public_records(&self, cfg: &Config) -> Result<Vec<api_keys::PublicApiKeyRecord>, String> {
+        let _file_lock = api_keys::lock_store_shared(cfg)?;
+        self.reload_from_disk_while_locked(cfg)?;
+        let auth = self.auth.read().unwrap();
+        Ok(api_keys::public_records(&auth.store))
+    }
+
+    /// Persist and publish an authorization-changing mutation.  Disk is
+    /// written before memory is published so an error never returns a failed
+    /// mutation while leaving a state that disappears after restart.
+    fn mutate<R>(
+        &self,
+        cfg: &Config,
+        mutate: impl FnOnce(&mut api_keys::ApiKeyStore) -> Result<R, String>,
+    ) -> Result<(R, api_keys::ApiKeyStore), ApiKeyRegistryMutationError> {
+        let _gate = self.mutation_gate.lock().unwrap();
+        let _file_lock = api_keys::lock_store_exclusive(cfg)
+            .map_err(ApiKeyRegistryMutationError::Persistence)?;
+        // A different gateway process may have created, updated, or revoked
+        // a key since this instance last served a request. Mutate only the
+        // durable snapshot protected by the shared coordination lock.
+        let mut candidate =
+            api_keys::load(cfg).map_err(ApiKeyRegistryMutationError::Persistence)?;
+        self.publish_store_if_changed(candidate.clone());
+        let result = mutate(&mut candidate).map_err(ApiKeyRegistryMutationError::Rejected)?;
+        api_keys::validate_policy_changes(cfg, &candidate)
+            .map_err(ApiKeyRegistryMutationError::Rejected)?;
+        api_keys::save(cfg, &candidate).map_err(ApiKeyRegistryMutationError::Persistence)?;
+        self.publish_store_if_changed(candidate.clone());
+        Ok((result, candidate))
+    }
+
+    /// Applies throttled metadata updates to the latest store while holding
+    /// the same mutation gate as administrative edits.  Unlike the old
+    /// persistence event, this never owns or writes a stale full snapshot.
+    fn persist_touches(
+        &self,
+        cfg: &Config,
+        touches: &HashMap<String, String>,
+    ) -> Result<(), String> {
+        if touches.is_empty() {
+            return Ok(());
+        }
+        let _gate = self.mutation_gate.lock().unwrap();
+        let _file_lock = api_keys::lock_store_exclusive(cfg)?;
+        // Touches are metadata-only, but they still must start from the
+        // newest durable authority or a delayed worker can resurrect a key
+        // that another process has just revoked.
+        let mut candidate = api_keys::load(cfg)?;
+        self.publish_store_if_changed(candidate.clone());
+        let mut changed = false;
+        for (id, timestamp) in touches {
+            changed |= api_keys::touch_last_used(&mut candidate, id, timestamp);
+        }
+        if !changed {
+            return Ok(());
+        }
+        api_keys::save(cfg, &candidate)?;
+        self.publish_store_if_changed(candidate);
+        Ok(())
+    }
+
+    fn authenticate_cached(
+        &self,
+        cfg: &Config,
+        token: &str,
+        lookup_hash: &str,
+    ) -> Option<AuthenticatedApiKey> {
+        // Hold a shared lock through cache lookup and Argon2 verification.
+        // An exclusive revoke/update cannot commit while this request is
+        // authenticated, and every later request reloads the durable state
+        // before consulting the cache.
+        let _file_lock = match api_keys::lock_store_shared(cfg) {
+            Ok(lock) => lock,
+            Err(err) => {
+                error!(
+                    "failed to coordinate API-key authentication safely: {}",
+                    err
+                );
+                return None;
+            }
+        };
+        if let Err(err) = self.reload_from_disk_while_locked(cfg) {
+            error!("failed to reload API-key authority safely: {}", err);
+            return None;
+        }
+        // The epoch check below is deliberately after Argon2. A revoke/update
+        // that wins while verification is expensive forces us to retry from
+        // the newly published store instead of caching a cloned pre-revoke
+        // record.
+        loop {
+            let (epoch, cached, candidates) = {
+                let auth = self.auth.read().unwrap();
+                let cached = auth.cache.get(lookup_hash).cloned();
+                let candidates = match cached {
+                    Some(ApiKeyCacheEntry::Verified(_)) => Vec::new(),
+                    Some(ApiKeyCacheEntry::Rejected(when))
+                        if when.elapsed() < Duration::from_secs(5) =>
+                    {
+                        Vec::new()
+                    }
+                    _ => api_keys::verification_candidates(&auth.store, token),
+                };
+                (auth.epoch, cached, candidates)
+            };
+
+            match cached {
+                Some(ApiKeyCacheEntry::Verified(authenticated)) => return Some(authenticated),
+                Some(ApiKeyCacheEntry::Rejected(when))
+                    if when.elapsed() < Duration::from_secs(5) =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+
+            let verified = candidates
+                .iter()
+                .find(|record| api_keys::verify_record(record, token))
+                .map(|record| AuthenticatedApiKey {
+                    id: Some(record.id.clone()),
+                    access: record.access.clone(),
+                });
+            let cache_entry = verified
+                .as_ref()
+                .map(|authenticated| ApiKeyCacheEntry::Verified(authenticated.clone()))
+                .unwrap_or_else(|| ApiKeyCacheEntry::Rejected(std::time::Instant::now()));
+
+            let mut auth = self.auth.write().unwrap();
+            if auth.epoch != epoch {
+                continue;
+            }
+            auth.cache.insert(lookup_hash.to_string(), cache_entry);
+            return verified;
+        }
+    }
+
+    /// Replace local state only after the caller has acquired the stable
+    /// cross-process lock and loaded a complete, normalized store. Keeping a
+    /// separate epoch means an in-flight verifier cannot repopulate an old
+    /// cache entry if another local operation publishes newer state.
+    fn reload_from_disk_while_locked(&self, cfg: &Config) -> Result<(), String> {
+        let store = api_keys::load(cfg)?;
+        self.publish_store_if_changed(store);
+        Ok(())
+    }
+
+    fn publish_store_if_changed(&self, store: api_keys::ApiKeyStore) {
+        let mut auth = self.auth.write().unwrap();
+        if auth.store != store {
+            auth.store = store;
+            auth.epoch = auth.epoch.wrapping_add(1);
+            auth.cache.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod api_key_registry_tests {
+    use super::*;
+
+    fn test_config(auth_dir: std::path::PathBuf) -> Config {
+        Config {
+            listen: "127.0.0.1:0".to_string(),
+            upstream_base: "https://example.test".to_string(),
+            proxy_api_key: String::new(),
+            tokens: Vec::new(),
+            auth_dir: Some(auth_dir.to_string_lossy().to_string()),
+            disabled_files: None,
+            admin_auth: admin_auth::AdminAuthConfig::default(),
+            oauth: target::oauth::OAuthConfig::default(),
+            request_body_limit_enabled: default_request_body_limit_enabled(),
+            max_request_body_bytes: default_max_request_body_bytes(),
+            max_concurrent_requests: default_max_concurrent_requests(),
+            trusted_proxy: false,
+            history_retention_days: default_history_retention_days(),
+            history_max_entries: default_history_max_entries(),
+            upstream_connect_timeout_seconds: default_upstream_connect_timeout_seconds(),
+            upstream_read_timeout_seconds: default_upstream_read_timeout_seconds(),
+            upstream_first_event_timeout_seconds: default_upstream_first_event_timeout_seconds(),
+        }
+    }
+
+    fn temp_dir() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "io-gateway-api-key-registry-tests-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn registry_with_key() -> (ApiKeyRegistry, String, String) {
+        let mut store = api_keys::ApiKeyStore::default();
+        let created = api_keys::create_key(
+            &mut store,
+            "test",
+            &api_keys::ApiKeyAccess::default(),
+            "2026-09-19T00:00:00Z",
+        )
+        .unwrap();
+        (
+            ApiKeyRegistry::new(store),
+            created.key.id,
+            created.plain_text_key,
+        )
+    }
+
+    #[test]
+    fn failed_authorization_save_never_publishes_candidate_state() {
+        let directory = temp_dir();
+        let non_directory = directory.join("not-a-directory");
+        std::fs::write(&non_directory, b"file").unwrap();
+        let cfg = test_config(non_directory);
+        let (registry, id, raw_key) = registry_with_key();
+
+        let result = registry.mutate(&cfg, |store| {
+            api_keys::revoke_key(store, &id, "2026-09-19T00:01:00Z")
+        });
+        assert!(matches!(
+            result,
+            Err(ApiKeyRegistryMutationError::Persistence(_))
+        ));
+        let auth = registry.auth.read().unwrap();
+        assert_eq!(auth.epoch, 0);
+        assert!(auth.store.keys[0].revoked_at.is_none());
+        drop(auth);
+        // The failed save path has no readable durable authority. Runtime
+        // authentication fails closed rather than serving an unverifiable
+        // in-memory snapshot.
+        assert!(registry
+            .authenticate_cached(&cfg, &raw_key, &api_keys::token_lookup_hash(&raw_key))
+            .is_none());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn revoke_invalidates_cached_or_inflight_verification_and_stale_touch() {
+        let directory = temp_dir();
+        let cfg = test_config(directory.clone());
+        let (registry, id, raw_key) = registry_with_key();
+        let lookup = api_keys::token_lookup_hash(&raw_key);
+        api_keys::save(&cfg, &registry.auth.read().unwrap().store).unwrap();
+
+        // Prime the successful Argon2 result, then start another verifier as
+        // the revoke is committed. Whichever operation wins first, the final
+        // cache and live authority must never keep this key authenticated.
+        assert!(registry
+            .authenticate_cached(&cfg, &raw_key, &lookup)
+            .is_some());
+        let verifier = registry.clone();
+        let verifier_raw_key = raw_key.clone();
+        let verifier_lookup = lookup.clone();
+        let verifier_cfg = test_config(directory.clone());
+        let join = std::thread::spawn(move || {
+            verifier.authenticate_cached(&verifier_cfg, &verifier_raw_key, &verifier_lookup)
+        });
+        registry
+            .mutate(&cfg, |store| {
+                api_keys::revoke_key(store, &id, "2026-09-19T00:01:00Z")
+            })
+            .unwrap();
+        let _ = join.join().unwrap();
+
+        assert!(registry
+            .authenticate_cached(&cfg, &raw_key, &lookup)
+            .is_none());
+        {
+            let auth = registry.auth.read().unwrap();
+            assert!(auth.store.keys[0].revoked_at.is_some());
+            assert!(!matches!(
+                auth.cache.get(&lookup),
+                Some(ApiKeyCacheEntry::Verified(_))
+            ));
+        }
+
+        let touches = HashMap::from([(id.clone(), "2026-09-19T00:02:00Z".to_string())]);
+        registry.persist_touches(&cfg, &touches).unwrap();
+        let loaded = api_keys::load(&cfg).unwrap();
+        let record = loaded.keys.iter().find(|record| record.id == id).unwrap();
+        assert!(record.revoked_at.is_some());
+        assert!(record.last_used_at.is_none());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn separate_registries_reload_revocations_and_cannot_resurrect_them() {
+        let directory = temp_dir();
+        let cfg = test_config(directory.clone());
+        let (registry_a, id, raw_key) = registry_with_key();
+        let initial_store = registry_a.auth.read().unwrap().store.clone();
+        api_keys::save(&cfg, &initial_store).unwrap();
+        // These stand in for two gateway processes which each started with
+        // the same snapshot and maintain independent in-memory caches.
+        let registry_b = ApiKeyRegistry::new(initial_store);
+        let lookup = api_keys::token_lookup_hash(&raw_key);
+        assert!(registry_b
+            .authenticate_cached(&cfg, &raw_key, &lookup)
+            .is_some());
+
+        registry_a
+            .mutate(&cfg, |store| {
+                api_keys::revoke_key(store, &id, "2026-09-19T00:01:00Z")
+            })
+            .unwrap();
+        // B must discard its positive cache after reading the durable store,
+        // then a later last-used flush must merge from disk instead of writing
+        // B's pre-revocation snapshot back over A's change.
+        assert!(registry_b
+            .authenticate_cached(&cfg, &raw_key, &lookup)
+            .is_none());
+        registry_b
+            .persist_touches(
+                &cfg,
+                &HashMap::from([(id.clone(), "2026-09-19T00:02:00Z".to_string())]),
+            )
+            .unwrap();
+        let record = api_keys::load(&cfg)
+            .unwrap()
+            .keys
+            .into_iter()
+            .find(|record| record.id == id)
+            .unwrap();
+        assert!(record.revoked_at.is_some());
+        assert!(record.last_used_at.is_none());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
 #[derive(Clone)]
 struct AuthenticatedApiKey {
     id: Option<String>,
     access: api_keys::ApiKeyAccess,
+}
+
+/// Per-request state for an already-reserved managed-key input budget. It is
+/// intentionally copied with `AppState`: provider adapters and stream
+/// trackers receive cloned state, but all copies point to the same durable
+/// reservation ID, whose settlement operation is idempotent.
+#[derive(Clone)]
+struct ApiKeyBudgetReservationContext {
+    reservation_id: String,
+    request_id: String,
+    api_key_id: String,
+    request_path: String,
+    provider: Option<String>,
+    model: Option<String>,
+    estimated_input_tokens: u64,
+    /// Keep the checked budget with the request-local context so each later
+    /// upstream retry can reserve its own hold before it is sent.
+    budget: api_keys::ApiKeyInputTokenBudget,
+    lifecycle: Arc<ApiKeyBudgetReservationLifecycle>,
+}
+
+/// The durable fields needed to settle one actual upstream-dispatch attempt.
+///
+/// This intentionally excludes `lifecycle`: keeping an `Arc` back to the
+/// lifecycle inside its own mutable attempt state would create a reference
+/// cycle for every managed request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ApiKeyBudgetDispatchAttempt {
+    reservation_id: String,
+    request_id: String,
+    api_key_id: String,
+    request_path: String,
+    provider: Option<String>,
+    model: Option<String>,
+    estimated_input_tokens: u64,
+}
+
+impl From<&ApiKeyBudgetReservationContext> for ApiKeyBudgetDispatchAttempt {
+    fn from(context: &ApiKeyBudgetReservationContext) -> Self {
+        Self {
+            reservation_id: context.reservation_id.clone(),
+            request_id: context.request_id.clone(),
+            api_key_id: context.api_key_id.clone(),
+            request_path: context.request_path.clone(),
+            provider: context.provider.clone(),
+            model: context.model.clone(),
+            estimated_input_tokens: context.estimated_input_tokens,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ApiKeyBudgetDispatchAttemptState {
+    /// The hold assigned to the provider/account attempt currently being
+    /// prepared or dispatched. Requests are tried sequentially, but keeping
+    /// this explicit makes a second send without a new hold fail closed.
+    active: Option<ApiKeyBudgetDispatchAttempt>,
+    /// A pre-dispatch setup failure can retry another account without
+    /// spending the hold it never used. Reuse that same reservation instead
+    /// of racing an asynchronous release against the next reserve.
+    reusable: Option<ApiKeyBudgetDispatchAttempt>,
+    /// The original preflight hold is used for the first real upstream
+    /// attempt. Every later attempt gets a distinct reservation.
+    original_assigned: bool,
+}
+
+enum ApiKeyBudgetDispatchBegin {
+    Existing,
+    AdditionalReservationNeeded,
+    AlreadyActive,
+}
+
+enum ApiKeyBudgetActiveSettlement {
+    None,
+    Deferred,
+    Attempt(ApiKeyBudgetDispatchAttempt),
+}
+
+/// Runtime-only coordination for one durable input-budget reservation.
+///
+/// A custom-model alias can try more than one target.  A target adapter may
+/// prove that its own request failed locally before dispatch, but that must
+/// not release the shared reservation while the alias route can still try a
+/// later target.  All scoped `AppState` clones retain this single lifecycle.
+#[derive(Default)]
+struct ApiKeyBudgetReservationLifecycle {
+    deferred_local_releases: AtomicUsize,
+    may_have_dispatched: AtomicBool,
+    attempts: Mutex<ApiKeyBudgetDispatchAttemptState>,
+}
+
+impl ApiKeyBudgetReservationLifecycle {
+    fn defer_local_release(&self) {
+        self.deferred_local_releases
+            .fetch_add(1, AtomicOrdering::AcqRel);
+    }
+
+    fn finish_deferred_local_release(&self) {
+        // `fetch_update` avoids wrapping on a programming error. The guard
+        // is intentionally best-effort at teardown; a stale nonzero value is
+        // safer than allowing a later request-local release to race ahead of
+        // an active alias candidate.
+        let _ = self.deferred_local_releases.fetch_update(
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+            |current| current.checked_sub(1),
+        );
+    }
+
+    fn local_release_is_deferred(&self) -> bool {
+        self.deferred_local_releases.load(AtomicOrdering::Acquire) > 0
+    }
+
+    fn mark_may_have_dispatched(&self) {
+        self.may_have_dispatched
+            .store(true, AtomicOrdering::Release);
+    }
+
+    fn may_have_dispatched(&self) -> bool {
+        self.may_have_dispatched.load(AtomicOrdering::Acquire)
+    }
+
+    fn begin_dispatch(&self, original: ApiKeyBudgetDispatchAttempt) -> ApiKeyBudgetDispatchBegin {
+        let mut attempts = self.attempts.lock().unwrap();
+        if attempts.active.is_some() {
+            return ApiKeyBudgetDispatchBegin::AlreadyActive;
+        }
+        if let Some(reusable) = attempts.reusable.take() {
+            attempts.active = Some(reusable);
+            return ApiKeyBudgetDispatchBegin::Existing;
+        }
+        if !attempts.original_assigned {
+            attempts.original_assigned = true;
+            attempts.active = Some(original);
+            return ApiKeyBudgetDispatchBegin::Existing;
+        }
+        ApiKeyBudgetDispatchBegin::AdditionalReservationNeeded
+    }
+
+    fn activate_additional_dispatch(&self, attempt: ApiKeyBudgetDispatchAttempt) -> bool {
+        let mut attempts = self.attempts.lock().unwrap();
+        if attempts.active.is_some() {
+            return false;
+        }
+        attempts.active = Some(attempt);
+        true
+    }
+
+    fn take_active_for_settlement(
+        &self,
+        settlement: api_key_policy_store::ApiKeyInputTokenSettlement,
+    ) -> ApiKeyBudgetActiveSettlement {
+        let mut attempts = self.attempts.lock().unwrap();
+        let Some(attempt) = attempts.active.take() else {
+            return ApiKeyBudgetActiveSettlement::None;
+        };
+        if matches!(
+            settlement,
+            api_key_policy_store::ApiKeyInputTokenSettlement::Release
+        ) && self.local_release_is_deferred()
+        {
+            attempts.reusable = Some(attempt);
+            return ApiKeyBudgetActiveSettlement::Deferred;
+        }
+        ApiKeyBudgetActiveSettlement::Attempt(attempt)
+    }
+
+    fn cancel_active_for_retry(&self) {
+        let mut attempts = self.attempts.lock().unwrap();
+        if let Some(attempt) = attempts.active.take() {
+            attempts.reusable = Some(attempt);
+        }
+    }
+
+    fn take_reusable_for_release(&self) -> Option<ApiKeyBudgetDispatchAttempt> {
+        self.attempts.lock().unwrap().reusable.take()
+    }
+
+    fn original_was_assigned(&self) -> bool {
+        self.attempts.lock().unwrap().original_assigned
+    }
+}
+
+struct DeferredApiKeyBudgetReleaseGuard {
+    lifecycle: Option<Arc<ApiKeyBudgetReservationLifecycle>>,
+}
+
+impl Drop for DeferredApiKeyBudgetReleaseGuard {
+    fn drop(&mut self) {
+        let Some(lifecycle) = &self.lifecycle else {
+            return;
+        };
+        lifecycle.finish_deferred_local_release();
+    }
+}
+
+enum ApiKeyBudgetReservationError {
+    Denied(api_key_policy_store::ApiKeyInputTokenBudgetDenied),
+    Storage(String),
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -238,6 +834,256 @@ enum SourceApi {
     V1,
     Codex,
     Claude,
+}
+
+/// Render gateway-originated policy errors in the protocol spoken by the
+/// client. Upstream adapters already have their own response translation, but
+/// failures raised before dispatch must not degrade a Claude request into
+/// plaintext.
+fn source_error_response(
+    source_api: SourceApi,
+    status: StatusCode,
+    message: impl AsRef<str>,
+    openai_type: &str,
+    openai_code: Option<&str>,
+    anthropic_type: &str,
+) -> Response {
+    let message = message.as_ref();
+    match source_api {
+        SourceApi::V1 => (
+            status,
+            [(
+                axum::http::header::CONTENT_TYPE.as_str(),
+                "application/json",
+            )],
+            openai_error_body(message, openai_type, openai_code),
+        )
+            .into_response(),
+        SourceApi::Claude => {
+            let request_id = format!("req_{}", Uuid::new_v4().simple());
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "error",
+                "error": { "type": anthropic_type, "message": message },
+                "request_id": request_id,
+            }))
+            .unwrap_or_default();
+            (
+                status,
+                [
+                    (
+                        axum::http::header::CONTENT_TYPE.as_str(),
+                        "application/json",
+                    ),
+                    ("request-id", request_id.as_str()),
+                ],
+                body,
+            )
+                .into_response()
+        }
+        SourceApi::Codex => (status, message.to_string()).into_response(),
+    }
+}
+
+fn api_key_authentication_error_response(source_api: SourceApi) -> Response {
+    // Invalid and revoked credentials deliberately share a response so this
+    // endpoint cannot reveal whether an arbitrary key once existed.
+    source_error_response(
+        source_api,
+        StatusCode::UNAUTHORIZED,
+        "Missing or invalid API key",
+        "authentication_error",
+        Some("invalid_api_key"),
+        "authentication_error",
+    )
+}
+
+#[cfg(test)]
+mod source_error_response_tests {
+    use super::{
+        codex_error_response, custom_model_error_response, source_error_response,
+        unified_model_catalog_error_response, SourceApi,
+    };
+    use axum::{
+        body::to_bytes,
+        http::{header, StatusCode},
+    };
+
+    #[tokio::test]
+    async fn invalid_or_revoked_keys_are_authentication_errors_not_missing_headers() {
+        for source in [SourceApi::V1, SourceApi::Claude] {
+            let response = super::api_key_authentication_error_response(source);
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["error"]["type"], "authentication_error");
+            assert_eq!(value["error"]["message"], "Missing or invalid API key");
+            if source == SourceApi::V1 {
+                assert_eq!(value["error"]["code"], "invalid_api_key");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_source_errors_use_the_native_envelope_and_request_id() {
+        let response = source_error_response(
+            SourceApi::Claude,
+            StatusCode::FORBIDDEN,
+            "scope denied",
+            "permission_error",
+            Some("forbidden"),
+            "permission_error",
+        );
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let request_id = response
+            .headers()
+            .get("request-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(request_id.starts_with("req_"));
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["error"]["type"], "permission_error");
+        assert_eq!(value["error"]["message"], "scope denied");
+        assert_eq!(value["request_id"], request_id);
+    }
+
+    #[tokio::test]
+    async fn codex_error_wrapper_preserves_claude_rate_limit_semantics() {
+        let response = codex_error_response(
+            SourceApi::Claude,
+            StatusCode::TOO_MANY_REQUESTS,
+            "request limit reached",
+        );
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let request_id = response
+            .headers()
+            .get("request-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["error"]["type"], "rate_limit_error");
+        assert_eq!(value["error"]["message"], "request limit reached");
+        assert_eq!(value["request_id"], request_id);
+    }
+
+    #[tokio::test]
+    async fn claude_codex_bridge_local_failures_use_native_api_error_and_request_id() {
+        let response = codex_error_response(
+            SourceApi::Claude,
+            StatusCode::BAD_GATEWAY,
+            "upstream error (failed to read body)",
+        );
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let request_id = response
+            .headers()
+            .get("request-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["error"]["type"], "api_error");
+        assert_eq!(value["request_id"], request_id);
+    }
+
+    #[tokio::test]
+    async fn claude_custom_alias_local_errors_use_native_envelope_and_request_id() {
+        let response = custom_model_error_response(
+            SourceApi::Claude,
+            StatusCode::FORBIDDEN,
+            "API key does not have access to any target for custom model 'workhorse'",
+            "permission_error",
+            None,
+        );
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let request_id = response
+            .headers()
+            .get("request-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(request_id.starts_with("req_"));
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["error"]["type"], "permission_error");
+        assert!(value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("custom model 'workhorse'"));
+        assert_eq!(value["request_id"], request_id);
+    }
+
+    #[tokio::test]
+    async fn v1_custom_alias_local_errors_preserve_openai_error_code() {
+        let response = custom_model_error_response(
+            SourceApi::V1,
+            StatusCode::NOT_FOUND,
+            "The custom model 'workhorse' does not exist",
+            "invalid_request_error",
+            Some("model_not_found"),
+        );
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        assert_eq!(value["error"]["code"], "model_not_found");
+    }
+
+    #[tokio::test]
+    async fn claude_unified_catalog_errors_use_native_envelope_and_request_id() {
+        let response = unified_model_catalog_error_response(
+            SourceApi::Claude,
+            StatusCode::NOT_FOUND,
+            "The model 'ctm:workhorse' does not exist",
+            "invalid_request_error",
+            Some("model_not_found"),
+        );
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let request_id = response
+            .headers()
+            .get("request-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        assert_eq!(value["request_id"], request_id);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -310,11 +1156,127 @@ fn default_upstream_first_event_timeout_seconds() -> u64 {
     45
 }
 
+/// Admin writes must not inherit the persisted-file migration for provider
+/// account scope.  Old files legitimately omitted `account_scope`, but an
+/// omitted scope in a new restricted-key request would otherwise silently
+/// become all-account access.
+#[derive(Debug)]
+struct AdminApiKeyAccess(api_keys::ApiKeyAccess);
+
+impl Default for AdminApiKeyAccess {
+    fn default() -> Self {
+        Self(api_keys::ApiKeyAccess::default())
+    }
+}
+
+impl<'de> Deserialize<'de> for AdminApiKeyAccess {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        let access = serde_json::from_value::<api_keys::ApiKeyAccess>(raw.clone())
+            .map_err(serde::de::Error::custom)?;
+        validate_admin_api_key_access_scope(&raw).map_err(serde::de::Error::custom)?;
+        Ok(Self(access))
+    }
+}
+
+fn validate_admin_api_key_access_scope(raw: &serde_json::Value) -> Result<(), String> {
+    // Persisted records remain forward/legacy compatible, but administrative
+    // writes must not silently ignore a misspelled limit or scope field.
+    validate_admin_api_key_fields(
+        raw,
+        &[
+            "all",
+            "max_estimated_input_tokens_per_request",
+            "prompt_token_limit",
+            "input_token_budget",
+            "quota",
+            "providers",
+        ],
+        "access",
+    )?;
+    if let Some(budget) = raw.get("input_token_budget") {
+        validate_admin_api_key_fields(budget, &["limit", "period"], "access.input_token_budget")?;
+    }
+    let Some(provider_rules) = raw.get("providers").and_then(serde_json::Value::as_array) else {
+        return Ok(());
+    };
+    if provider_rules.is_empty() {
+        return Ok(());
+    }
+    if !matches!(raw.get("all"), Some(serde_json::Value::Bool(false))) {
+        return Err(
+            "access.all must be explicitly set to false when provider rules are supplied"
+                .to_string(),
+        );
+    }
+    for (index, rule) in provider_rules.iter().enumerate() {
+        let path = format!("access.providers[{index}]");
+        validate_admin_api_key_fields(
+            rule,
+            &[
+                "provider",
+                "account_scope",
+                "accounts",
+                "max_estimated_input_tokens_per_request",
+                "prompt_token_limit",
+                "account_limits",
+            ],
+            &path,
+        )?;
+        if let Some(limits) = rule
+            .get("account_limits")
+            .and_then(serde_json::Value::as_array)
+        {
+            for (limit_index, limit) in limits.iter().enumerate() {
+                validate_admin_api_key_fields(
+                    limit,
+                    &[
+                        "account",
+                        "max_estimated_input_tokens_per_request",
+                        "prompt_token_limit",
+                    ],
+                    &format!("{path}.account_limits[{limit_index}]"),
+                )?;
+            }
+        }
+        let has_explicit_scope = rule
+            .get("account_scope")
+            .is_some_and(|scope| !scope.is_null());
+        if !has_explicit_scope {
+            return Err(format!(
+                "access.providers[{}].account_scope must be explicitly set to 'all' or 'selected' for a restricted API key",
+                index
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_admin_api_key_fields(
+    value: &serde_json::Value,
+    allowed: &[&str],
+    path: &str,
+) -> Result<(), String> {
+    if let Some(object) = value.as_object() {
+        if let Some(field) = object
+            .keys()
+            .find(|field| !allowed.contains(&field.as_str()))
+        {
+            return Err(format!("unknown field '{field}' in {path}"));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ApiKeyCreateRequest {
     label: Option<String>,
     #[serde(default)]
-    access: api_keys::ApiKeyAccess,
+    access: AdminApiKeyAccess,
 }
 
 #[derive(Debug, Deserialize)]
@@ -323,9 +1285,482 @@ struct ApiKeyRevokeRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ApiKeyAccessUpdateRequest {
     id: String,
-    access: api_keys::ApiKeyAccess,
+    access: AdminApiKeyAccess,
+}
+
+/// Canonicalize account selectors at the administrative boundary while the
+/// current account inventory is available.  The dashboard already sends the
+/// `key` field from this inventory; accepting a uniquely resolved historical
+/// label/email/file alias here makes existing operator workflows migrate
+/// forward without retaining alias matching in the authorization path.
+fn canonicalize_api_key_access_for_current_accounts(
+    state: &AppState,
+    access: &api_keys::ApiKeyAccess,
+) -> Result<api_keys::ApiKeyAccess, String> {
+    let mut access = access.normalized()?;
+    if access.all {
+        return Ok(access);
+    }
+
+    let accounts = notification_account_options(state);
+    for rule in &mut access.providers {
+        let provider = rule.provider.clone();
+        if !rule.account_scope.is_all() {
+            rule.accounts = rule
+                .accounts
+                .iter()
+                .map(|selector| {
+                    canonicalize_api_key_account_selector(&provider, selector, &accounts)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        for limit in &mut rule.account_limits {
+            limit.account =
+                canonicalize_api_key_account_selector(&provider, &limit.account, &accounts)?;
+        }
+    }
+
+    // Alias canonicalization can intentionally collapse two old spellings of
+    // one account into one key, so run the normalizer once more before it is
+    // persisted.
+    access.normalized()
+}
+
+fn canonicalize_api_key_account_selector(
+    provider: &str,
+    selector: &str,
+    accounts: &[notifications::NotificationAccountOption],
+) -> Result<String, String> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return Err(format!("{} account selector must not be empty", provider));
+    }
+
+    let provider_accounts = accounts
+        .iter()
+        .filter(|account| account.provider == provider)
+        .collect::<Vec<_>>();
+
+    // A canonical key always wins over an accidentally equal display alias
+    // from another account.  Duplicate canonical keys are unsafe: they do
+    // not identify one credential, so reject rather than broadening access.
+    let exact_keys = provider_accounts
+        .iter()
+        .copied()
+        .filter(|account| account.key == selector)
+        .collect::<Vec<_>>();
+    if exact_keys.len() == 1 {
+        let key = exact_keys[0].key.trim();
+        return is_stable_api_key_account_selector(provider, key)
+            .then(|| key.to_string())
+            .ok_or_else(|| {
+                format!(
+                    "{} account does not expose a stable canonical selector",
+                    provider
+                )
+            });
+    }
+    if exact_keys.len() > 1 {
+        return Err(format!(
+            "{} account selector is ambiguous; use a unique canonical account key",
+            provider
+        ));
+    }
+
+    // Preserve a canonical selector for a temporarily unavailable account.
+    // It cannot match any current credential until that exact stable identity
+    // returns, so this is fail-closed while allowing the dashboard to retain
+    // offline account caps/selections during edits.
+    if is_stable_api_key_account_selector(provider, selector) {
+        return Ok(selector.to_string());
+    }
+
+    let aliases = provider_accounts
+        .iter()
+        .copied()
+        .filter(|account| {
+            account.account_id == selector
+                || account.label == selector
+                || account
+                    .credential_file
+                    .as_deref()
+                    .is_some_and(|file_name| file_name == selector)
+        })
+        .collect::<Vec<_>>();
+    match aliases.as_slice() {
+        [account] if is_stable_api_key_account_selector(provider, account.key.trim()) => {
+            Ok(account.key.trim().to_string())
+        }
+        [_] => Err(format!(
+            "{} account does not expose a stable canonical selector",
+            provider
+        )),
+        [] => Err(format!(
+            "{} account selector is unknown; use a canonical account key from the dashboard",
+            provider
+        )),
+        _ => Err(format!(
+            "{} account selector is ambiguous; use a unique canonical account key",
+            provider
+        )),
+    }
+}
+
+#[cfg(test)]
+mod admin_api_key_scope_validation_tests {
+    use super::{
+        api_keys, canonicalize_api_key_account_selector, ApiKeyAccessUpdateRequest,
+        ApiKeyCreateRequest,
+    };
+    use crate::notifications::NotificationAccountOption;
+    use axum::http::StatusCode;
+    use axum::{response::IntoResponse, Json};
+
+    fn codex_account(
+        key: &str,
+        label: &str,
+        account_id: &str,
+        file_name: &str,
+    ) -> NotificationAccountOption {
+        NotificationAccountOption {
+            provider: "codex".to_string(),
+            provider_label: "Codex".to_string(),
+            key: key.to_string(),
+            label: label.to_string(),
+            account_id: account_id.to_string(),
+            credential_file: Some(file_name.to_string()),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn account_selector_write_migrates_only_uniquely_resolved_aliases() {
+        let accounts = vec![
+            codex_account(
+                "codex:account_id:account-a",
+                "Shared label",
+                "account-a",
+                "first.json",
+            ),
+            codex_account(
+                "codex:account_id:account-b",
+                "Shared label",
+                "account-b",
+                "second.json",
+            ),
+        ];
+
+        assert_eq!(
+            canonicalize_api_key_account_selector("codex", "second.json", &accounts).unwrap(),
+            "codex:account_id:account-b"
+        );
+        assert_eq!(
+            canonicalize_api_key_account_selector("codex", "account-a", &accounts).unwrap(),
+            "codex:account_id:account-a"
+        );
+        assert!(
+            canonicalize_api_key_account_selector("codex", "Shared label", &accounts)
+                .unwrap_err()
+                .contains("ambiguous")
+        );
+        // Offline canonical keys stay representable, whereas unknown aliases
+        // cannot turn into a broad future account selection.
+        assert_eq!(
+            canonicalize_api_key_account_selector("codex", "codex:file:offline.json", &accounts)
+                .unwrap(),
+            "codex:file:offline.json"
+        );
+        assert!(
+            canonicalize_api_key_account_selector("codex", "unknown.json", &accounts)
+                .unwrap_err()
+                .contains("unknown")
+        );
+    }
+
+    #[test]
+    fn persisted_legacy_provider_rules_still_migrate_their_omitted_scope() {
+        let access: api_keys::ApiKeyAccess = serde_json::from_value(serde_json::json!({
+            "all": false,
+            "providers": [
+                { "provider": "codex", "accounts": [] },
+                { "provider": "claude", "accounts": ["team-a.json"] }
+            ]
+        }))
+        .expect("legacy persisted access should deserialize");
+
+        assert_eq!(
+            access.provider_rule("codex").unwrap().account_scope,
+            api_keys::ApiKeyAccountScope::All
+        );
+        assert_eq!(
+            access.provider_rule("claude").unwrap().account_scope,
+            api_keys::ApiKeyAccountScope::Selected
+        );
+    }
+
+    #[test]
+    fn persisted_legacy_access_keeps_its_unrestricted_default_when_all_is_omitted() {
+        let access: api_keys::ApiKeyAccess = serde_json::from_value(serde_json::json!({
+            "providers": [{
+                "provider": "codex",
+                "account_scope": "selected",
+                "accounts": ["team-a.json"]
+            }]
+        }))
+        .expect("legacy persisted access should deserialize");
+
+        assert!(
+            access.all,
+            "the persisted-file default remains unrestricted"
+        );
+    }
+
+    #[test]
+    fn create_and_update_require_explicit_restricted_all_flag_for_provider_rules() {
+        let create_error = serde_json::from_value::<ApiKeyCreateRequest>(serde_json::json!({
+            "access": {
+                "providers": [{
+                    "provider": "codex",
+                    "account_scope": "selected",
+                    "accounts": ["team-a.json"]
+                }]
+            }
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(create_error.contains("access.all"));
+
+        let update_error = serde_json::from_value::<ApiKeyAccessUpdateRequest>(serde_json::json!({
+            "id": "key_123",
+            "access": {
+                "all": true,
+                "providers": [{
+                    "provider": "claude",
+                    "account_scope": "all",
+                    "accounts": []
+                }]
+            }
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(update_error.contains("access.all"));
+    }
+
+    #[test]
+    fn create_and_update_reject_restricted_rules_with_an_omitted_scope() {
+        let create_error = serde_json::from_value::<ApiKeyCreateRequest>(serde_json::json!({
+            "label": "restricted",
+            "access": {
+                "all": false,
+                "providers": [{ "provider": "codex", "accounts": [] }]
+            }
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(create_error.contains("account_scope"));
+
+        let update_error = serde_json::from_value::<ApiKeyAccessUpdateRequest>(serde_json::json!({
+            "id": "key_123",
+            "access": {
+                "all": false,
+                "providers": [{ "provider": "claude", "accounts": ["team-a.json"] }]
+            }
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(update_error.contains("account_scope"));
+
+        let null_scope_error = serde_json::from_value::<ApiKeyCreateRequest>(serde_json::json!({
+            "access": {
+                "all": false,
+                "providers": [{
+                    "provider": "codex",
+                    "account_scope": null,
+                    "accounts": []
+                }]
+            }
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(null_scope_error.contains("account_scope"));
+    }
+
+    #[test]
+    fn create_and_update_accept_explicit_all_and_selected_provider_scopes() {
+        let create: ApiKeyCreateRequest = serde_json::from_value(serde_json::json!({
+            "access": {
+                "all": false,
+                "providers": [{
+                    "provider": "codex",
+                    "account_scope": "all",
+                    "accounts": []
+                }]
+            }
+        }))
+        .expect("explicit all-account scope should be accepted");
+        assert_eq!(
+            create
+                .access
+                .0
+                .provider_rule("codex")
+                .unwrap()
+                .account_scope,
+            api_keys::ApiKeyAccountScope::All
+        );
+
+        let update: ApiKeyAccessUpdateRequest = serde_json::from_value(serde_json::json!({
+            "id": "key_123",
+            "access": {
+                "all": false,
+                "providers": [{
+                    "provider": "claude",
+                    "account_scope": "selected",
+                    "accounts": ["team-a.json"]
+                }]
+            }
+        }))
+        .expect("explicit selected-account scope should be accepted");
+        assert_eq!(
+            update
+                .access
+                .0
+                .provider_rule("claude")
+                .unwrap()
+                .account_scope,
+            api_keys::ApiKeyAccountScope::Selected
+        );
+    }
+
+    #[test]
+    fn raw_json_extraction_rejects_omitted_restricted_provider_scope_before_mutation() {
+        let rejection = Json::<ApiKeyCreateRequest>::from_bytes(
+            br#"{
+                "access": {
+                    "all": false,
+                    "providers": [{ "provider": "codex", "accounts": [] }]
+                }
+            }"#,
+        )
+        .expect_err("the raw admin JSON body must be rejected");
+        let response = rejection.into_response();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn create_and_update_reject_unknown_policy_fields_at_every_boundary() {
+        let cases = [
+            serde_json::json!({"all": true, "quotas": {"rules": []}}),
+            serde_json::json!({"all": true, "input_token_budget": {
+                "limit": 100, "period": "lifetime", "limiit": 5
+            }}),
+            serde_json::json!({"all": false, "providers": [{
+                "provider": "claude", "account_scope": "all", "max_input_tokens": 10
+            }]}),
+            serde_json::json!({"all": false, "providers": [{
+                "provider": "claude", "account_scope": "all", "account_limits": [{
+                    "account": "claude:one", "max_input_tokens": 10
+                }]
+            }]}),
+            serde_json::json!({"all": true, "quota": {
+                "rules": [{"metric": "requests", "period": "daily", "limit": 5}],
+                "reset_at": "2026-09-20"
+            }}),
+        ];
+        for access in cases {
+            let create = serde_json::json!({"access": access});
+            let update = serde_json::json!({"id": "key-one", "access": access});
+            assert!(serde_json::from_value::<ApiKeyCreateRequest>(create)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown field"));
+            assert!(serde_json::from_value::<ApiKeyAccessUpdateRequest>(update)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown field"));
+        }
+    }
+
+    #[test]
+    fn admin_write_payload_typos_do_not_become_unlimited_keys() {
+        for create in [
+            serde_json::json!({"acess": {"all": true, "prompt_token_limit": 1}}),
+            serde_json::json!({"access": {}, "quota": {"rules": []}}),
+        ] {
+            assert!(serde_json::from_value::<ApiKeyCreateRequest>(create)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown field"));
+        }
+        assert!(
+            serde_json::from_value::<ApiKeyAccessUpdateRequest>(serde_json::json!({
+                "id": "key-one", "access": {}, "quotas": {}
+            }))
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field")
+        );
+        assert!(
+            serde_json::from_value::<ApiKeyAccessUpdateRequest>(serde_json::json!({
+                "id": "key-one"
+            }))
+            .is_err()
+        );
+        let deliberate = serde_json::from_value::<ApiKeyCreateRequest>(serde_json::json!({}))
+            .expect("empty create is an explicit backwards-compatible unrestricted request");
+        assert!(deliberate.access.0.all);
+    }
+
+    #[test]
+    fn admin_writes_accept_canonical_and_deprecated_cap_names_at_every_scope() {
+        for cap in [
+            "max_estimated_input_tokens_per_request",
+            "prompt_token_limit",
+        ] {
+            let mut access = serde_json::json!({
+                "all": false,
+                "input_token_budget": {"limit": 100, "period": "lifetime"},
+                "quota": {"timezone": "UTC", "rules": [
+                    {"metric": "requests", "period": "weekly", "limit": 5}
+                ]},
+                "providers": [{"provider": "claude", "account_scope": "selected",
+                    "accounts": ["claude:one"], "account_limits": [{"account": "claude:one"}]
+                }]
+            });
+            access[cap] = serde_json::json!(50);
+            access["providers"][0][cap] = serde_json::json!(40);
+            access["providers"][0]["account_limits"][0][cap] = serde_json::json!(30);
+            let create = serde_json::from_value::<ApiKeyCreateRequest>(serde_json::json!({
+                "access": access
+            }))
+            .unwrap();
+            let update = serde_json::from_value::<ApiKeyAccessUpdateRequest>(serde_json::json!({
+                "id": "key-one", "access": access
+            }))
+            .unwrap();
+            for parsed in [create.access.0, update.access.0] {
+                assert_eq!(parsed.prompt_token_limit, Some(50));
+                assert_eq!(parsed.providers[0].prompt_token_limit, Some(40));
+                assert_eq!(
+                    parsed.providers[0].account_limits[0].prompt_token_limit,
+                    Some(30)
+                );
+                assert_eq!(parsed.input_token_budget.unwrap().limit, 100);
+                assert_eq!(parsed.quota.unwrap().rules[0].limit, 5);
+            }
+        }
+    }
+
+    #[test]
+    fn persisted_access_metadata_remains_compatible_with_strict_admin_writes() {
+        let persisted: api_keys::ApiKeyAccess = serde_json::from_value(serde_json::json!({
+            "all": true, "migration_note": "legacy metadata", "prompt_token_limit": 5
+        }))
+        .expect("only the admin wire boundary rejects unknown metadata");
+        assert_eq!(persisted.prompt_token_limit, Some(5));
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -342,11 +1777,16 @@ struct ModelCatalogRefreshForm {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AdminTestApiRequest {
     model: String,
     prompt: String,
     instructions: Option<String>,
     max_output_tokens: Option<u32>,
+    /// Optional managed-key profile to emulate. This is an identifier only;
+    /// the dashboard never accepts or forwards a plaintext API key.
+    #[serde(default)]
+    api_key_id: Option<String>,
 }
 
 #[derive(Default, Clone, Serialize)]
@@ -396,16 +1836,41 @@ struct AccountUsage {
     last_error_message: Option<String>,
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub(crate) struct PromptMetrics {
     input_chars: u64,
     prompt_items: u64,
     is_prompt: bool,
+    /// A byte-oriented conservative upper bound.  This deliberately replaces
+    /// the old `chars / 4` heuristic for API-key enforcement: schemas, tool
+    /// results, non-ASCII text and unknown provider fields must not become a
+    /// way to spend more than the configured cap.
+    estimated_input_tokens: u64,
+    complete: bool,
 }
 
 impl PromptMetrics {
     pub(crate) fn estimated_input_tokens(&self) -> u64 {
-        estimated_tokens_from_chars(self.input_chars)
+        self.estimated_input_tokens
+    }
+
+    fn requires_measurement(&self) -> bool {
+        !self.complete
+    }
+}
+
+impl Default for PromptMetrics {
+    fn default() -> Self {
+        Self {
+            input_chars: 0,
+            prompt_items: 0,
+            is_prompt: false,
+            estimated_input_tokens: 0,
+            // An absent request body has no hidden input.  Invalid/non-JSON
+            // requests are validated by their adapter rather than silently
+            // treated as a known zero-token prompt here.
+            complete: true,
+        }
     }
 }
 
@@ -458,6 +1923,10 @@ impl Drop for StreamRequestGuard {
     fn drop(&mut self) {
         if !self.finished {
             router_request_abandoned(&self.state, self.provider, &self.account_key);
+            // The upstream stream was already accepted, but it ended before
+            // its terminal usage event was observed. The provider may have
+            // billed it, so retain the conservative input-budget hold.
+            commit_api_key_budget_unknown(&self.state);
         }
     }
 }
@@ -482,7 +1951,17 @@ struct CounterDelta {
 enum PersistenceEvent {
     StatsDirty,
     History(usage_store::UsageHistoryEntry),
-    ApiKeys(api_keys::ApiKeyStore),
+    ApiKeyTouch {
+        id: String,
+        timestamp: String,
+    },
+    ApiKeyPolicyAudit(api_key_policy_store::ApiKeyRequestAuditEvent),
+    ApiKeyBudgetSettlement {
+        reservation: ApiKeyBudgetReservationContext,
+        settlement: api_key_policy_store::ApiKeyInputTokenSettlement,
+        decision: api_key_policy_store::ApiKeyPolicyDecision,
+        actual_input_tokens: Option<u64>,
+    },
     Shutdown(mpsc::SyncSender<()>),
 }
 
@@ -514,6 +1993,18 @@ async fn main() {
         std::env::var_os(CONFIG_PATH_ENV).map(PathBuf::from),
     );
     let (cfg, config_path) = load_config(&requested_config_path);
+    if let Some(destination) = args.backup_policy {
+        match api_key_policy_store::backup(&cfg, &destination) {
+            Ok(()) => {
+                println!("API-key policy snapshot saved to {}", destination.display());
+                return;
+            }
+            Err(err) => {
+                eprintln!("API-key policy backup failed: {err}");
+                std::process::exit(1);
+            }
+        }
+    }
     let disabled = cfg
         .disabled_files
         .clone()
@@ -535,18 +2026,27 @@ async fn main() {
     let admin_sessions = admin_auth::load_sessions(&admin_session_path(&cfg));
     let notification_settings = notifications::load(&cfg);
     let account_routing = load_account_routing_settings(&cfg);
-    let mut api_key_store = api_keys::load(&cfg);
-    match api_keys::bootstrap_legacy_key(&mut api_key_store, &cfg.proxy_api_key, &now_rfc3339()) {
-        Ok(true) => {
-            if let Err(err) = api_keys::save(&cfg, &api_key_store) {
-                error!("failed to persist API key store: {}", err);
-            }
+    // Read, reconcile, and persist the compatibility key under the same
+    // stable cross-process lock used by the live registry. Without this,
+    // simultaneous starts can publish different legacy snapshots and leave a
+    // process serving a credential that another process has retired.
+    let api_key_store = {
+        let _file_lock = api_keys::lock_store_exclusive(&cfg).unwrap_or_else(|err| {
+            panic!("failed to coordinate API key store safely: {err}");
+        });
+        let mut store = api_keys::load(&cfg).unwrap_or_else(|err| {
+            panic!("failed to load API key store safely: {err}");
+        });
+        if api_keys::bootstrap_legacy_key(&mut store, &cfg.proxy_api_key, &now_rfc3339())
+            .unwrap_or_else(|err| panic!("failed to reconcile legacy proxy API key: {err}"))
+        {
+            api_keys::save(&cfg, &store).unwrap_or_else(|err| {
+                panic!("failed to persist reconciled API key store safely: {err}");
+            });
         }
-        Ok(false) => {}
-        Err(err) => {
-            error!("failed to bootstrap legacy proxy API key: {}", err);
-        }
-    }
+        store
+    };
+    warn_unresolved_legacy_api_key_account_limits(&api_key_store);
     let stats = build_usage_stats(
         &tokens,
         &agw_accounts,
@@ -579,10 +2079,15 @@ async fn main() {
         .build()
         .unwrap();
 
+    let api_key_registry = ApiKeyRegistry::new(api_key_store);
     let (persistence_tx, persistence_rx) = mpsc::channel();
     let cfg = Arc::new(cfg);
-    let persistence_worker =
-        start_persistence_worker(cfg.clone(), persisted_stats.clone(), persistence_rx);
+    let persistence_worker = start_persistence_worker(
+        cfg.clone(),
+        persisted_stats.clone(),
+        api_key_registry.clone(),
+        persistence_rx,
+    );
 
     let state = AppState {
         cfg: cfg.clone(),
@@ -631,10 +2136,13 @@ async fn main() {
         claude_oauth_pending: Arc::new(Mutex::new(HashMap::new())),
         admin_sessions: Arc::new(Mutex::new(admin_sessions)),
         admin_login_attempts: Arc::new(Mutex::new(HashMap::new())),
-        api_keys: Arc::new(Mutex::new(api_key_store)),
-        api_key_cache: Arc::new(RwLock::new(HashMap::new())),
+        api_key_registry,
         api_key_last_used: Arc::new(Mutex::new(HashMap::new())),
         request_api_key_id: None,
+        request_source_api: SourceApi::V1,
+        request_api_key_budget: None,
+        request_api_key_audit: None,
+        request_api_key_quota: None,
         internal_proxy_secret: Arc::new(Uuid::new_v4().simple().to_string()),
         notification_settings: Arc::new(Mutex::new(notification_settings)),
         account_routing: Arc::new(Mutex::new(account_routing)),
@@ -659,6 +2167,7 @@ async fn main() {
         .route("/admin/login", any(admin_login_route))
         .route("/admin/logout", any(admin_logout_route))
         .route("/admin/api-keys", any(admin_api_keys_route))
+        .route("/admin/api-keys/quotas", any(admin_api_key_quotas_route))
         .route("/admin/api-keys/create", any(admin_api_keys_create_route))
         .route("/admin/api-keys/access", any(admin_api_keys_access_route))
         .route("/admin/api-keys/revoke", any(admin_api_keys_revoke_route))
@@ -1607,6 +3116,9 @@ async fn dashboard() -> impl IntoResponse {
       }
       .api-key-limit-row input {
         min-width: 0;
+      }
+      .api-key-budget-row {
+        grid-template-columns: minmax(0, 1fr) minmax(120px, 160px) auto;
       }
       .api-key-access-accounts {
         display: grid;
@@ -3723,6 +5235,7 @@ async fn dashboard() -> impl IntoResponse {
         apiKeys: [],
         apiKeyAccounts: [],
         apiKeyEditingId: '',
+        apiKeyQuotaSummaries: {},
         quotas: {
           codex: new Map(),
           agw: new Map(),
@@ -4208,12 +5721,47 @@ async fn dashboard() -> impl IntoResponse {
           input.value = entries[0].id;
         }
       }
+      function activeManagedTestApiKeyProfiles() {
+        return (dashboardState.apiKeys || []).filter(function(key) {
+          return key
+            && String(key.source || '').toLowerCase() === 'managed'
+            && !key.revoked_at
+            && String(key.id || '').trim();
+        });
+      }
+      function testApiPolicyModeForSelection(apiKeyId) {
+        return apiKeyId ? 'managed_api_key' : 'operator_bypass';
+      }
+      function testApiPolicyModeLabel(mode) {
+        var value = String(mode || '').trim();
+        if (value === 'managed_api_key') return 'Managed API key';
+        if (value === 'operator_bypass') return 'Operator bypass';
+        return value ? value.replace(/_/g, ' ') : 'Operator bypass';
+      }
+      function renderTestApiKeyProfileOptions() {
+        var select = document.getElementById('testApiApiKeyProfileInput');
+        if (!select) return;
+        var selectedId = String(select.value || '').trim();
+        var profiles = activeManagedTestApiKeyProfiles();
+        select.innerHTML = '<option value="">Operator bypass (all configured accounts)</option>'
+          + profiles.map(function(key) {
+            var id = String(key.id || '').trim();
+            var label = String(key.label || '').trim() || 'Managed API key';
+            var prefix = String(key.key_prefix || '').trim();
+            var display = label + (prefix ? ' · ' + prefix : '');
+            return '<option value="' + escapeHtml(id) + '">' + escapeHtml(display) + '</option>';
+          }).join('');
+        select.value = profiles.some(function(key) {
+          return String(key.id || '').trim() === selectedId;
+        }) ? selectedId : '';
+      }
       async function prepareTestApiPanel() {
         if (!dashboardState.testApiModelOptions.length && !dashboardState.customModelModelOptions.length && !dashboardState.customModels.length) {
           setText('testApiStatus', 'Loading model catalog...');
           await refreshCustomModels();
         }
         renderTestApiModelOptions();
+        renderTestApiKeyProfileOptions();
         if (document.getElementById('testApiStatus')?.textContent === 'Loading model catalog...') {
           setText('testApiStatus', 'Ready');
         }
@@ -4225,7 +5773,7 @@ async fn dashboard() -> impl IntoResponse {
           button.textContent = busy ? 'Sending...' : 'Send Test';
         }
       }
-      function renderTestApiResult(data) {
+      function renderTestApiResult(data, selectedApiKeyId) {
         var result = document.getElementById('testApiResult');
         var output = document.getElementById('testApiOutput');
         var raw = document.getElementById('testApiRaw');
@@ -4234,7 +5782,9 @@ async fn dashboard() -> impl IntoResponse {
         var status = data && data.status ? 'HTTP ' + data.status : 'HTTP ?';
         var ms = data && data.duration_ms != null ? ' · ' + data.duration_ms + ' ms' : '';
         var model = data && data.model ? ' · ' + data.model : '';
-        meta.textContent = (data && data.ok ? 'Success' : 'Failed') + ' · ' + status + ms + model;
+        var policyMode = data && data.policy_mode || testApiPolicyModeForSelection(selectedApiKeyId);
+        var policy = ' · Policy: ' + testApiPolicyModeLabel(policyMode);
+        meta.textContent = (data && data.ok ? 'Success' : 'Failed') + ' · ' + status + ms + model + policy;
         output.textContent = (data && data.output_text) || (data && data.message) || 'No text output returned.';
         raw.textContent = JSON.stringify((data && data.response) || data || {}, null, 2);
         result.hidden = false;
@@ -4244,6 +5794,7 @@ async fn dashboard() -> impl IntoResponse {
         var prompt = document.getElementById('testApiPromptInput')?.value.trim() || '';
         var instructions = document.getElementById('testApiInstructionsInput')?.value.trim() || '';
         var maxOutput = Number(document.getElementById('testApiMaxOutputInput')?.value || 512);
+        var apiKeyId = document.getElementById('testApiApiKeyProfileInput')?.value.trim() || '';
         if (!model) {
           setText('testApiStatus', 'Model is required.');
           return;
@@ -4255,15 +5806,17 @@ async fn dashboard() -> impl IntoResponse {
         setTestApiBusy(true);
         setText('testApiStatus', 'Sending test request...');
         try {
+          var request = {
+            model: model,
+            prompt: prompt,
+            instructions: instructions || undefined,
+            max_output_tokens: Number.isFinite(maxOutput) ? maxOutput : 512
+          };
+          if (apiKeyId) request.api_key_id = apiKeyId;
           const res = await adminFetch('/admin/test-api', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              model: model,
-              prompt: prompt,
-              instructions: instructions || undefined,
-              max_output_tokens: Number.isFinite(maxOutput) ? maxOutput : 512
-            })
+            body: JSON.stringify(request)
           });
           if (!res) return;
           const text = await res.text();
@@ -4275,11 +5828,12 @@ async fn dashboard() -> impl IntoResponse {
               ok: false,
               status: res.status,
               model: model,
+              policy_mode: testApiPolicyModeForSelection(apiKeyId),
               message: text || ('Test API returned HTTP ' + res.status),
               response: { body: text }
             };
           }
-          renderTestApiResult(data);
+          renderTestApiResult(data, apiKeyId);
           setText('testApiStatus', data.message || (data.ok ? 'Test completed' : 'Test failed'));
           if (data.ok) {
             invalidateDashboardSnapshot();
@@ -4295,11 +5849,13 @@ async fn dashboard() -> impl IntoResponse {
             ok: false,
             status: 0,
             model: model,
+            policy_mode: testApiPolicyModeForSelection(apiKeyId),
             message: message,
             response: { error: message }
-          });
+          }, apiKeyId);
         } finally {
           setTestApiBusy(false);
+          if (apiKeyId) await refreshApiKeyQuotaSummaries();
         }
       }
       function clearTestApi() {
@@ -4355,88 +5911,247 @@ async fn dashboard() -> impl IntoResponse {
       function formatSettingsDateTime(value, fallback) {
         return formatDashboardDateTime(value, fallback || 'Never');
       }
-	      function apiKeySourceLabel(source) {
-	        return source === 'legacy_config' ? 'Legacy config' : 'Managed';
-	      }
-	      function normalizePromptTokenLimit(value) {
-	        var n = Number(value);
-	        return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
-	      }
-	      function normalizeApiKeyAccess(access) {
-	        if (!access || access.all !== false) {
-	          return {
-	            all: true,
-	            prompt_token_limit: normalizePromptTokenLimit(access && access.prompt_token_limit),
-	            providers: []
-	          };
-	        }
-	        var providers = Array.isArray(access.providers) ? access.providers : [];
-	        return {
-	          all: false,
-	          prompt_token_limit: normalizePromptTokenLimit(access.prompt_token_limit),
-	          providers: providers.map(function(rule) {
-	            var accountLimits = Array.isArray(rule && rule.account_limits) ? rule.account_limits : [];
-	            return {
-	              provider: String(rule && rule.provider || ''),
-	              accounts: Array.isArray(rule && rule.accounts) ? rule.accounts.map(String) : [],
-	              prompt_token_limit: normalizePromptTokenLimit(rule && rule.prompt_token_limit),
-	              account_limits: accountLimits.map(function(limit) {
-	                return {
-	                  account: String(limit && limit.account || ''),
-	                  prompt_token_limit: normalizePromptTokenLimit(limit && limit.prompt_token_limit)
-	                };
-	              }).filter(function(limit) { return !!limit.account && limit.prompt_token_limit != null; })
-	            };
-	          }).filter(function(rule) { return !!rule.provider; })
-	        };
-	      }
+      function apiKeySourceLabel(source) {
+        return source === 'legacy_config' ? 'Legacy config' : 'Managed';
+      }
+      // The server accepts `prompt_token_limit` while older clients migrate,
+      // but the dashboard always writes the unambiguous request-guardrail
+      // field. Read both so existing records remain editable.
+      function normalizePromptTokenLimit(value) {
+        if (value == null || String(value).trim() === '') return null;
+        var raw = String(value).trim();
+        if (!/^[1-9][0-9]*$/.test(raw)) return null;
+        var n = Number(raw);
+        return Number.isSafeInteger(n) ? n : null;
+      }
+      function apiKeyRequestLimit(value) {
+        if (!value || typeof value !== 'object') return null;
+        var raw = value.max_estimated_input_tokens_per_request;
+        if (raw == null) raw = value.prompt_token_limit;
+        return normalizePromptTokenLimit(raw);
+      }
+      function apiKeyAccountScope(rule) {
+        var scope = String(rule && rule.account_scope || '').toLowerCase();
+        if (scope === 'all' || scope === 'selected') return scope;
+        // Before account_scope was introduced, an empty list meant all
+        // accounts. Keep that interpretation for display only; new writes
+        // always include an explicit scope.
+        var accounts = Array.isArray(rule && rule.accounts) ? rule.accounts : [];
+        return accounts.length ? 'selected' : 'all';
+      }
+      function normalizeInputTokenBudget(value) {
+        var budget = value && value.input_token_budget;
+        if (!budget || typeof budget !== 'object') return null;
+        var limit = normalizePromptTokenLimit(budget.limit);
+        if (limit == null) return null;
+        return {
+          limit: limit,
+          period: budget.period === 'calendar_month' ? 'calendar_month' : 'lifetime'
+        };
+      }
+      function apiKeyAccessEditorError(access) {
+        if (!access || typeof access !== 'object') return '';
+        var limits = [];
+        function collectRequestLimit(value) {
+          if (!value || typeof value !== 'object') return;
+          var limit = value.max_estimated_input_tokens_per_request;
+          if (limit == null) limit = value.prompt_token_limit;
+          if (limit != null) limits.push(limit);
+        }
+        collectRequestLimit(access);
+        if (access.input_token_budget) limits.push(access.input_token_budget.limit);
+        (access.quota?.rules || []).forEach(function(rule) { limits.push(rule.limit); });
+        (access.providers || []).forEach(function(provider) {
+          collectRequestLimit(provider);
+          (provider.account_limits || []).forEach(collectRequestLimit);
+        });
+        if (!limits.some(function(limit) { return normalizePromptTokenLimit(limit) == null; })) return '';
+        return 'This policy contains limits the dashboard cannot represent exactly. Use iogw keys update --access-json or the admin API to preserve its limits. No changes have been saved.';
+      }
+      function addRequestLimit(target, limit) {
+        if (limit != null) target.max_estimated_input_tokens_per_request = limit;
+        return target;
+      }
+      function formatInputTokenBudget(budget) {
+        if (!budget) return 'No cumulative input budget';
+        return budget.limit + ' input tokens (' + (budget.period === 'calendar_month' ? 'calendar month' : 'lifetime') + ')';
+      }
+      function apiKeyWholeLimitSummary(access) {
+        var cap = access.max_estimated_input_tokens_per_request;
+        return 'Max estimated input/request: ' + (cap != null ? cap + ' tokens' : 'unlimited')
+          + ' · Input budget: ' + formatInputTokenBudget(access.input_token_budget)
+          + (access.quota ? ' · Renewable: ' + access.quota.rules.map(function(rule) {
+              return rule.limit + ' ' + quotaMetricLabel(rule.metric) + '/' + rule.period;
+            }).join(', ') : '');
+      }
+      function quotaMetricLabel(metric) {
+        return ({ requests: 'requests', input_tokens: 'input tokens (incl. cache)',
+          uncached_input_tokens: 'uncached input tokens', output_tokens: 'output tokens (incl. reasoning)',
+          cache_read_tokens: 'cache-read tokens', cache_write_tokens: 'cache-write tokens',
+          cache_tokens: 'cache tokens (read + write)' })[metric] || metric;
+      }
+      function quotaRuleRow(rule) {
+        var metrics = ['requests', 'input_tokens', 'output_tokens', 'cache_read_tokens',
+          'cache_write_tokens', 'cache_tokens', 'uncached_input_tokens'];
+        var options = metrics.map(function(metric) {
+          return '<option value="' + metric + '"' + (metric === rule.metric ? ' selected' : '')
+            + '>' + escapeHtml(quotaMetricLabel(metric)) + '</option>';
+        }).join('');
+        var periods = ['daily', 'weekly', 'monthly'].map(function(period) {
+          return '<option value="' + period + '"' + (period === rule.period ? ' selected' : '') + '>' + period + '</option>';
+        }).join('');
+        return '<div class="api-key-limit-row" data-quota-rule style="margin-top:8px;">'
+          + '<select aria-label="Quota resource" data-quota-metric>' + options + '</select>'
+          + '<input aria-label="Quota allowance" data-quota-limit type="number" min="1" max="9007199254740991" step="1" value="' + escapeHtml(rule.limit || '') + '" placeholder="Allowance">'
+          + '<select aria-label="Quota renewal" data-quota-period>' + periods + '</select>'
+          + '<button type="button" class="mini-btn secondary-button" onclick="this.closest(\'[data-quota-rule]\').remove()">Remove</button></div>';
+      }
+      function addApiKeyQuotaRule() {
+        document.getElementById('apiKeyQuotaRules')?.insertAdjacentHTML('beforeend', quotaRuleRow({metric:'requests',period:'daily',limit:100}));
+      }
+      function renderApiKeyQuotaEditor(quota) {
+        var rules = document.getElementById('apiKeyQuotaRules');
+        var timezone = document.getElementById('apiKeyQuotaTimezone');
+        if (rules) rules.innerHTML = (quota?.rules || []).map(quotaRuleRow).join('');
+        if (timezone) timezone.value = quota?.timezone || 'UTC';
+      }
+      function quotaPolicyFromDom() {
+        var seen = new Set();
+        var rules = Array.from(document.querySelectorAll('[data-quota-rule]')).map(function(row) {
+          var metric = row.querySelector('[data-quota-metric]').value;
+          var period = row.querySelector('[data-quota-period]').value;
+          var limit = Number(row.querySelector('[data-quota-limit]').value);
+          if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('Quota allowances must be positive whole numbers up to 9,007,199,254,740,991.');
+          var identity = metric + '/' + period;
+          if (seen.has(identity)) throw new Error('Each resource and renewal period can appear only once.');
+          seen.add(identity);
+          return {metric:metric, period:period, limit:limit};
+        });
+        if (!rules.length) return null;
+        var timezone = document.getElementById('apiKeyQuotaTimezone')?.value.trim() || 'UTC';
+        try { new Intl.DateTimeFormat('en', {timeZone:timezone}); } catch (_) { throw new Error('Enter a valid timezone, for example UTC or Asia/Jakarta.'); }
+        return { timezone: timezone, rules: rules };
+      }
+      function apiKeyQuotaUsageHtml(id) {
+        var summary = dashboardState.apiKeyQuotaSummaries[id];
+        if (!summary) return '';
+        if (summary.error) return '<div class="api-key-meta">Quota accounting unavailable; requests fail closed.</div>';
+        return '<div class="api-key-meta">' + escapeHtml(summary.anchor
+          ? 'Quota anchor: ' + formatSettingsDateTime(summary.anchor, '')
+          : 'Quota timer starts on first accepted generation request') + '</div>'
+          + (summary.rules || []).map(function(rule) {
+            if ([rule.confirmed, rule.reserved, rule.uncertain, rule.remaining, rule.limit].some(function(amount) {
+              return !Number.isSafeInteger(amount) || amount < 0;
+            })) {
+              return '<div class="api-key-meta">' + escapeHtml(quotaMetricLabel(rule.metric) + '/' + rule.period
+                + ': Amounts exceed dashboard numeric precision; use iogw keys quotas or the admin API for exact balances.') + '</div>';
+            }
+            return '<div class="api-key-meta">' + escapeHtml(quotaMetricLabel(rule.metric) + '/' + rule.period
+              + ': ' + rule.confirmed + ' confirmed · ' + rule.reserved + ' reserved · ' + rule.uncertain + ' uncertain'
+              + ' · ' + rule.remaining + '/' + rule.limit + ' remaining'
+              + (rule.reset_at ? ' · Renews ' + formatSettingsDateTime(rule.reset_at, '') : '')) + '</div>';
+          }).join('');
+      }
+      function normalizeApiKeyAccess(access) {
+        var wholeLimit = apiKeyRequestLimit(access);
+        var inputTokenBudget = normalizeInputTokenBudget(access);
+        if (!access || access.all !== false) {
+          return {
+            all: true,
+            max_estimated_input_tokens_per_request: wholeLimit,
+            input_token_budget: inputTokenBudget,
+            quota: access && access.quota || null,
+            providers: []
+          };
+        }
+        var providers = Array.isArray(access.providers) ? access.providers : [];
+        return {
+          all: false,
+          max_estimated_input_tokens_per_request: wholeLimit,
+          input_token_budget: inputTokenBudget,
+          quota: access.quota || null,
+          providers: providers.map(function(rule) {
+            var accountLimits = Array.isArray(rule && rule.account_limits) ? rule.account_limits : [];
+            var accountScope = apiKeyAccountScope(rule);
+            return {
+              provider: String(rule && rule.provider || ''),
+              account_scope: accountScope,
+              accounts: accountScope === 'selected' && Array.isArray(rule && rule.accounts) ? rule.accounts.map(String) : [],
+              max_estimated_input_tokens_per_request: apiKeyRequestLimit(rule),
+              account_limits: accountLimits.map(function(limit) {
+                return {
+                  account: String(limit && limit.account || ''),
+                  max_estimated_input_tokens_per_request: apiKeyRequestLimit(limit)
+                };
+              }).filter(function(limit) {
+                return !!limit.account && limit.max_estimated_input_tokens_per_request != null;
+              })
+            };
+          }).filter(function(rule) { return !!rule.provider; })
+        };
+      }
       function apiKeyAccessRule(access, provider) {
         return normalizeApiKeyAccess(access).providers.find(function(rule) {
           return rule.provider === provider;
         }) || null;
       }
       function apiKeyAccessSummary(access) {
+        var editorError = apiKeyAccessEditorError(access);
         access = normalizeApiKeyAccess(access);
-        if (access.all) return 'All providers and accounts';
-        if (!access.providers.length) return 'No access';
-	        return access.providers.map(function(rule) {
-	          var label = providerLabels[rule.provider] || rule.provider;
-	          var limit = rule.prompt_token_limit ? ', limit ' + rule.prompt_token_limit + ' tok' : '';
-	          var accountLimits = rule.account_limits.length
-	            ? ', ' + rule.account_limits.length + ' account limit' + (rule.account_limits.length === 1 ? '' : 's')
-	            : '';
-	          return rule.accounts.length
-	            ? label + ' (' + rule.accounts.length + ' account' + (rule.accounts.length === 1 ? '' : 's') + limit + accountLimits + ')'
-	            : label + ' (all accounts' + limit + accountLimits + ')';
-	        }).join(', ');
-	      }
-	      function renderApiKeyAccessEditor(access) {
-	        access = normalizeApiKeyAccess(access);
-	        var mode = document.getElementById('apiKeyAccessModeInput');
-	        var groups = document.getElementById('apiKeyAccessGroups');
-	        var wholeLimit = document.getElementById('apiKeyPromptLimitInput');
-	        if (!mode || !groups) return;
-	        if (wholeLimit) wholeLimit.value = access.prompt_token_limit || '';
-	        mode.value = access.all ? 'all' : 'restricted';
-	        var accounts = Array.isArray(dashboardState.apiKeyAccounts) ? dashboardState.apiKeyAccounts : [];
-	        var grouped = {};
+        var scope = access.all
+          ? 'All providers and accounts'
+          : !access.providers.length
+            ? 'No access'
+            : access.providers.map(function(rule) {
+              var label = providerLabels[rule.provider] || rule.provider;
+              var limit = rule.max_estimated_input_tokens_per_request != null
+                ? ', max ' + rule.max_estimated_input_tokens_per_request + ' tok/request'
+                : '';
+              var accountLimits = rule.account_limits.length
+                ? ', ' + rule.account_limits.length + ' account cap' + (rule.account_limits.length === 1 ? '' : 's')
+                : '';
+              return rule.account_scope === 'selected'
+                ? label + ' (' + rule.accounts.length + ' account' + (rule.accounts.length === 1 ? '' : 's') + limit + accountLimits + ')'
+                : label + ' (all accounts' + limit + accountLimits + ')';
+            }).join(', ');
+        return scope + ' · ' + (editorError
+          ? 'Limits require CLI/API inspection; they exceed dashboard numeric precision.'
+          : apiKeyWholeLimitSummary(access));
+      }
+      function renderApiKeyAccessEditor(access) {
+        access = normalizeApiKeyAccess(access);
+        renderApiKeyQuotaEditor(access.quota);
+        var mode = document.getElementById('apiKeyAccessModeInput');
+        var groups = document.getElementById('apiKeyAccessGroups');
+        var wholeLimit = document.getElementById('apiKeyMaxEstimatedInputTokensInput');
+        var budgetLimit = document.getElementById('apiKeyInputTokenBudgetInput');
+        var budgetPeriod = document.getElementById('apiKeyInputTokenBudgetPeriodInput');
+        if (!mode || !groups) return;
+        if (wholeLimit) wholeLimit.value = access.max_estimated_input_tokens_per_request || '';
+        if (budgetLimit) budgetLimit.value = access.input_token_budget ? access.input_token_budget.limit : '';
+        if (budgetPeriod) budgetPeriod.value = access.input_token_budget ? access.input_token_budget.period : 'lifetime';
+        mode.value = access.all ? 'all' : 'restricted';
+        var accounts = Array.isArray(dashboardState.apiKeyAccounts) ? dashboardState.apiKeyAccounts : [];
+        var grouped = {};
         accounts.forEach(function(account) {
           var provider = String(account && account.provider || '');
           if (!provider) return;
           if (!grouped[provider]) grouped[provider] = [];
           grouped[provider].push(account);
         });
-	        groups.innerHTML = dashboardProviderKeys.map(function(provider) {
-	          var rule = apiKeyAccessRule(access, provider);
-	          var allAccounts = !!rule && rule.accounts.length === 0;
-	          var allowed = new Set(rule ? rule.accounts : []);
-	          var providerLimit = rule && rule.prompt_token_limit ? rule.prompt_token_limit : '';
-	          var accountLimits = new Map((rule && rule.account_limits || []).map(function(limit) {
-	            return [String(limit.account || ''), limit.prompt_token_limit];
-	          }));
-	          var providerValue = escapeHtml(provider);
-	          var providerAccounts = grouped[provider] || [];
-	          var seenKeys = new Set(providerAccounts.map(function(account) { return String(account.key || ''); }));
+        groups.innerHTML = dashboardProviderKeys.map(function(provider) {
+          var rule = apiKeyAccessRule(access, provider);
+          var allAccounts = !!rule && rule.account_scope === 'all';
+          var allowed = new Set(rule ? rule.accounts : []);
+          var providerLimit = rule && rule.max_estimated_input_tokens_per_request != null
+            ? rule.max_estimated_input_tokens_per_request
+            : '';
+          var accountLimits = new Map((rule && rule.account_limits || []).map(function(limit) {
+            return [String(limit.account || ''), limit.max_estimated_input_tokens_per_request];
+          }));
+          var providerValue = escapeHtml(provider);
+          var providerAccounts = grouped[provider] || [];
+          var seenKeys = new Set(providerAccounts.map(function(account) { return String(account.key || ''); }));
           var items = providerAccounts.map(function(account) {
             var key = String(account.key || '');
             if (!key) return '';
@@ -4452,28 +6167,47 @@ async fn dashboard() -> impl IntoResponse {
 	              + '<input class="api-key-account-limit-input" type="number" min="1" step="1" inputmode="numeric" data-api-key-account-prompt-limit data-provider="' + providerValue + '" data-account="' + escapeHtml(key) + '" value="' + escapeHtml(accountLimits.get(key) || '') + '" placeholder="limit">'
 	              + '</label>';
 	          }).join('');
-	          if (rule && rule.accounts.length) {
-	            items += rule.accounts.filter(function(key) { return !seenKeys.has(key); }).map(function(key) {
+          // Preserve policy for temporarily unavailable accounts. In
+          // particular, an all-account rule may still carry a future or
+          // offline account-specific cap; silently dropping it on edit would
+          // broaden that account's effective request limit when it returns.
+          var unavailableAccounts = [];
+          function retainUnavailableAccount(key) {
+            key = String(key || '').trim();
+            if (!key || seenKeys.has(key) || unavailableAccounts.includes(key)) return;
+            unavailableAccounts.push(key);
+          }
+          if (rule) {
+            if (rule.account_scope === 'selected') {
+              rule.accounts.forEach(retainUnavailableAccount);
+            }
+            (rule.account_limits || []).forEach(function(limit) {
+              retainUnavailableAccount(limit && limit.account);
+            });
+          }
+          if (unavailableAccounts.length) {
+            items += unavailableAccounts.map(function(key) {
 	              return '<label class="check-row api-key-access-account">'
-	                + '<input type="checkbox" data-api-key-access-account data-provider="' + providerValue + '" value="' + escapeHtml(key) + '" checked> '
+	                + '<input type="checkbox" data-api-key-access-account data-provider="' + providerValue + '" value="' + escapeHtml(key) + '"'
+	                + (allowed.has(key) ? ' checked' : '') + (allAccounts ? ' disabled' : '') + '> '
 	                + '<span class="account-choice-text"><span class="account-choice-title">Unavailable account</span><small title="' + escapeHtml(key) + '">' + escapeHtml(compactMiddle(key, 72)) + '</small></span>'
 	                + '<input class="api-key-account-limit-input" type="number" min="1" step="1" inputmode="numeric" data-api-key-account-prompt-limit data-provider="' + providerValue + '" data-account="' + escapeHtml(key) + '" value="' + escapeHtml(accountLimits.get(key) || '') + '" placeholder="limit">'
 	                + '</label>';
 	            }).join('');
 	          }
-	          return '<div class="api-key-access-provider">'
-	            + '<label class="check-row">'
-	            + '<input type="checkbox" data-api-key-access-provider data-provider="' + providerValue + '"'
-	            + (allAccounts ? ' checked' : '') + ' onchange="syncApiKeyAccessProvider(this)"> '
-	            + '<span>All ' + escapeHtml(providerLabels[provider] || provider) + ' accounts</span>'
-	            + '</label>'
-	            + '<div class="api-key-limit-row" style="margin-top:8px;">'
-	            + '<span class="muted">Provider prompt token limit</span>'
-	            + '<input type="number" min="1" step="1" inputmode="numeric" data-api-key-provider-prompt-limit data-provider="' + providerValue + '" value="' + escapeHtml(providerLimit) + '" placeholder="unlimited">'
-	            + '</div>'
-	            + '<div class="api-key-access-accounts">'
-	            + (items || '<span class="muted">No accounts configured</span>')
-	            + '</div>'
+          return '<div class="api-key-access-provider">'
+            + '<label class="check-row">'
+            + '<input type="checkbox" data-api-key-access-provider data-provider="' + providerValue + '"'
+            + (allAccounts ? ' checked' : '') + ' onchange="syncApiKeyAccessProvider(this)"> '
+            + '<span>Allow all ' + escapeHtml(providerLabels[provider] || provider) + ' accounts</span>'
+            + '</label>'
+            + '<div class="api-key-limit-row" style="margin-top:8px;">'
+            + '<span class="muted">Provider max estimated input/request</span>'
+            + '<input type="number" min="1" step="1" inputmode="numeric" data-api-key-provider-prompt-limit data-provider="' + providerValue + '" value="' + escapeHtml(providerLimit) + '" placeholder="unlimited">'
+            + '</div>'
+            + '<div class="api-key-access-accounts">'
+            + (items || '<span class="muted">No accounts configured</span>')
+            + '</div>'
             + '</div>';
         }).join('');
         groups.hidden = access.all;
@@ -4489,44 +6223,89 @@ async fn dashboard() -> impl IntoResponse {
         var groups = document.getElementById('apiKeyAccessGroups');
         if (mode && groups) groups.hidden = mode.value !== 'restricted';
       }
-	      function apiKeyAccessFromDom() {
-	        var mode = document.getElementById('apiKeyAccessModeInput');
-	        var wholeLimit = normalizePromptTokenLimit(document.getElementById('apiKeyPromptLimitInput')?.value);
-	        if (!mode || mode.value !== 'restricted') return { all: true, prompt_token_limit: wholeLimit, providers: [] };
-	        var providers = [];
-	        dashboardProviderKeys.forEach(function(provider) {
-	          var allInput = document.querySelector('[data-api-key-access-provider][data-provider="' + provider + '"]');
-	          var providerLimit = normalizePromptTokenLimit(document.querySelector('[data-api-key-provider-prompt-limit][data-provider="' + provider + '"]')?.value);
-	          var accountLimits = Array.from(document.querySelectorAll('[data-api-key-account-prompt-limit][data-provider="' + provider + '"]'))
-	            .map(function(input) {
-	              return {
-	                account: input.getAttribute('data-account') || '',
-	                prompt_token_limit: normalizePromptTokenLimit(input.value)
-	              };
-	            })
-	            .filter(function(limit) { return !!limit.account && limit.prompt_token_limit != null; });
-	          if (allInput && allInput.checked) {
-	            providers.push({ provider: provider, accounts: [], prompt_token_limit: providerLimit, account_limits: accountLimits });
-	            return;
-	          }
-	          var accounts = Array.from(document.querySelectorAll('[data-api-key-access-account][data-provider="' + provider + '"]:checked'))
-	            .map(function(input) { return input.value; })
-	            .filter(Boolean);
-	          accountLimits.forEach(function(limit) {
-	            if (!accounts.includes(limit.account)) accounts.push(limit.account);
-	          });
-	          if (accounts.length || providerLimit != null || accountLimits.length) {
-	            providers.push({
-	              provider: provider,
-	              accounts: accounts,
-	              prompt_token_limit: providerLimit,
-	              account_limits: accountLimits
-	            });
-	          }
-	        });
-	        if (!providers.length) return null;
-	        return { all: false, prompt_token_limit: wholeLimit, providers: providers };
-	      }
+      function validateApiKeyEditorLimits() {
+        var inputs = [
+          document.getElementById('apiKeyMaxEstimatedInputTokensInput'),
+          document.getElementById('apiKeyInputTokenBudgetInput')
+        ].concat(Array.from(document.querySelectorAll(
+          '[data-api-key-provider-prompt-limit], [data-api-key-account-prompt-limit]'
+        ))).filter(Boolean);
+        var invalid = inputs.find(function(input) {
+          return String(input.value || '').trim() && normalizePromptTokenLimit(input.value) == null;
+        });
+        inputs.forEach(function(input) { input.setCustomValidity(''); });
+        if (!invalid) return true;
+        invalid.setCustomValidity('Enter a whole number greater than zero, or leave this field blank.');
+        invalid.reportValidity();
+        invalid.focus();
+        return false;
+      }
+      function apiKeyAccessFromDom() {
+        var editedKey = (dashboardState.apiKeys || []).find(function(key) {
+          return key.id === dashboardState.apiKeyEditingId;
+        });
+        var editorError = apiKeyAccessEditorError(editedKey && editedKey.access);
+        if (editorError) throw new Error(editorError);
+        if (!validateApiKeyEditorLimits()) return null;
+        var quota = quotaPolicyFromDom();
+        var mode = document.getElementById('apiKeyAccessModeInput');
+        var wholeLimit = normalizePromptTokenLimit(document.getElementById('apiKeyMaxEstimatedInputTokensInput')?.value);
+        var budgetLimit = normalizePromptTokenLimit(document.getElementById('apiKeyInputTokenBudgetInput')?.value);
+        var budgetPeriod = document.getElementById('apiKeyInputTokenBudgetPeriodInput')?.value === 'calendar_month'
+          ? 'calendar_month'
+          : 'lifetime';
+        var inputTokenBudget = budgetLimit == null ? null : { limit: budgetLimit, period: budgetPeriod };
+        if (!mode || mode.value !== 'restricted') {
+          var unrestricted = addRequestLimit({ all: true, providers: [] }, wholeLimit);
+          if (inputTokenBudget) unrestricted.input_token_budget = inputTokenBudget;
+          unrestricted.quota = quota;
+          return unrestricted;
+        }
+        var providers = [];
+        dashboardProviderKeys.forEach(function(provider) {
+          var allInput = document.querySelector('[data-api-key-access-provider][data-provider="' + provider + '"]');
+          var providerLimit = normalizePromptTokenLimit(document.querySelector('[data-api-key-provider-prompt-limit][data-provider="' + provider + '"]')?.value);
+          var accountLimits = Array.from(document.querySelectorAll('[data-api-key-account-prompt-limit][data-provider="' + provider + '"]'))
+            .map(function(input) {
+              var limit = normalizePromptTokenLimit(input.value);
+              return limit == null ? null : addRequestLimit({
+                account: input.getAttribute('data-account') || ''
+              }, limit);
+            })
+            .filter(function(limit) { return !!limit && !!limit.account; });
+          if (allInput && allInput.checked) {
+            var allRule = addRequestLimit({
+              provider: provider,
+              account_scope: 'all',
+              accounts: [],
+              account_limits: accountLimits
+            }, providerLimit);
+            providers.push(allRule);
+            return;
+          }
+          var accounts = Array.from(document.querySelectorAll('[data-api-key-access-account][data-provider="' + provider + '"]:checked'))
+            .map(function(input) { return input.value; })
+            .filter(Boolean);
+          // Caps constrain accounts; they never grant access to an unchecked
+          // account, including a temporarily unavailable account retained here.
+          // A provider cap alone is not scope. Requiring an explicit selected
+          // account or the all-accounts checkbox prevents accidental access to
+          // every account through an empty list.
+          if (accounts.length) {
+            providers.push(addRequestLimit({
+              provider: provider,
+              account_scope: 'selected',
+              accounts: accounts,
+              account_limits: accountLimits
+            }, providerLimit));
+          }
+        });
+        if (!providers.length) return null;
+        var restricted = addRequestLimit({ all: false, providers: providers }, wholeLimit);
+        if (inputTokenBudget) restricted.input_token_budget = inputTokenBudget;
+        restricted.quota = quota;
+        return restricted;
+      }
       function resetApiKeyEditor() {
         dashboardState.apiKeyEditingId = '';
         var label = document.getElementById('apiKeyLabelInput');
@@ -4543,6 +6322,11 @@ async fn dashboard() -> impl IntoResponse {
       function editApiKeyAccess(id) {
         var key = (dashboardState.apiKeys || []).find(function(item) { return item.id === id; });
         if (!key || key.revoked_at) return;
+        var editorError = apiKeyAccessEditorError(key.access);
+        if (editorError) {
+          updateApiKeyStatusText(editorError);
+          return;
+        }
         dashboardState.apiKeyEditingId = id;
         var label = document.getElementById('apiKeyLabelInput');
         if (label) {
@@ -4572,6 +6356,7 @@ async fn dashboard() -> impl IntoResponse {
         if (code) code.textContent = value || '';
       }
       function renderApiKeys() {
+        renderTestApiKeyProfileOptions();
         var list = document.getElementById('apiKeysList');
         if (!list) return;
         var keys = Array.isArray(dashboardState.apiKeys) ? dashboardState.apiKeys : [];
@@ -4600,6 +6385,7 @@ async fn dashboard() -> impl IntoResponse {
             + (revoked ? ' · Revoked ' + escapeHtml(formatSettingsDateTime(key.revoked_at, 'Unknown')) : '')
             + '</div>'
             + '<div class="api-key-meta api-key-access-summary">Access: ' + escapeHtml(apiKeyAccessSummary(key.access)) + '</div>'
+            + apiKeyQuotaUsageHtml(key.id)
             + '</div>'
             + '<div class="api-key-actions">' + actions + '</div>'
             + '</div>';
@@ -4612,14 +6398,46 @@ async fn dashboard() -> impl IntoResponse {
         if (!res) return;
         const data = await res.json();
         dashboardState.apiKeys = Array.isArray(data.keys) ? data.keys : [];
+        dashboardState.apiKeyQuotaSummaries = data.quota_summaries || {};
         dashboardState.apiKeyAccounts = Array.isArray(data.accounts) ? data.accounts : [];
         if (!dashboardState.apiKeyEditingId) renderApiKeyAccessEditor({ all: true, providers: [] });
         renderApiKeys();
       }
+      async function refreshApiKeyQuotaSummaries() {
+        // Balance refreshes must not reset a policy the operator is editing.
+        // A mutation/list reload replaces this array; ignore an older balance
+        // response if that happened while its request was in flight.
+        var keysAtRequest = dashboardState.apiKeys;
+        var refreshId = (dashboardState.apiKeyQuotaRefreshId || 0) + 1;
+        dashboardState.apiKeyQuotaRefreshId = refreshId;
+        try {
+          var res = await adminFetch('/admin/api-keys/quotas');
+          if (!res) return;
+          var data = await res.json();
+          if (dashboardState.apiKeys !== keysAtRequest || dashboardState.apiKeyQuotaRefreshId !== refreshId) return;
+          if (!data.quota_summaries) throw new Error('Quota accounting unavailable');
+          dashboardState.apiKeyQuotaSummaries = data.quota_summaries;
+          renderApiKeys();
+          if (!res.ok || data.ok === false) updateApiKeyStatusText('Quota accounting unavailable; requests fail closed.');
+        } catch (_) {
+          if (dashboardState.apiKeys !== keysAtRequest || dashboardState.apiKeyQuotaRefreshId !== refreshId) return;
+          var unavailable = {};
+          (keysAtRequest || []).forEach(function(key) {
+            if (key.access?.quota) unavailable[key.id] = {error:true};
+          });
+          dashboardState.apiKeyQuotaSummaries = unavailable;
+          renderApiKeys();
+          updateApiKeyStatusText('Quota accounting unavailable; requests fail closed.');
+        }
+      }
       async function createApiKey() {
         var labelInput = document.getElementById('apiKeyLabelInput');
         var label = labelInput ? labelInput.value.trim() : '';
-        var access = apiKeyAccessFromDom();
+        var access;
+        try { access = apiKeyAccessFromDom(); } catch (error) {
+          updateApiKeyStatusText(error.message || 'Invalid quota policy.');
+          return;
+        }
         if (!access) {
           updateApiKeyStatusText('Select at least one provider or account for restricted access.');
           return;
@@ -4642,6 +6460,7 @@ async fn dashboard() -> impl IntoResponse {
         dashboardState.apiKeys = Array.isArray(data.keys) ? data.keys : dashboardState.apiKeys;
         dashboardState.apiKeyAccounts = Array.isArray(data.accounts) ? data.accounts : dashboardState.apiKeyAccounts;
         if (!editingId) setApiKeyReveal(data.plain_text_key || '');
+        dashboardState.apiKeyQuotaSummaries = data.quota_summaries || {};
         resetApiKeyEditor();
         renderApiKeys();
         updateApiKeyStatusText(editingId
@@ -4665,6 +6484,7 @@ async fn dashboard() -> impl IntoResponse {
         dashboardState.apiKeys = Array.isArray(data.keys) ? data.keys : dashboardState.apiKeys;
         dashboardState.apiKeyAccounts = Array.isArray(data.accounts) ? data.accounts : dashboardState.apiKeyAccounts;
         if (dashboardState.apiKeyEditingId === id) resetApiKeyEditor();
+        dashboardState.apiKeyQuotaSummaries = data.quota_summaries || {};
         renderApiKeys();
         updateApiKeyStatusText('API key revoked');
       }
@@ -7947,7 +9767,13 @@ async fn dashboard() -> impl IntoResponse {
               <label for="testApiModelInput">Model</label>
               <input id="testApiModelInput" class="test-api-model-input" list="testApiModelList" autocomplete="off" placeholder="qwn:qwen3-coder-plus">
               <datalist id="testApiModelList"></datalist>
-              <div class="settings-help">Uses dashboard admin access and the gateway's configured provider accounts.</div>
+            </div>
+            <div class="custom-model-form-row" style="margin-top:12px;">
+              <label for="testApiApiKeyProfileInput">Managed API key profile</label>
+              <select id="testApiApiKeyProfileInput" class="test-api-model-input">
+                <option value="">Operator bypass (all configured accounts)</option>
+              </select>
+              <div class="settings-help">Operator bypass is the default and uses dashboard admin access with all configured accounts. Select an active managed key to test its provider, account, request-cap, and input-budget policy without entering its secret.</div>
             </div>
             <div class="test-api-grid" style="margin-top:12px;">
               <div class="custom-model-form-row">
@@ -7995,8 +9821,26 @@ async fn dashboard() -> impl IntoResponse {
                 </div>
               </div>
               <div class="api-key-limit-row" style="margin-top:10px;">
-                <label for="apiKeyPromptLimitInput">Whole key prompt token limit</label>
-                <input id="apiKeyPromptLimitInput" type="number" min="1" step="1" inputmode="numeric" placeholder="unlimited">
+                <label for="apiKeyMaxEstimatedInputTokensInput">Whole-key max estimated input tokens per request</label>
+                <input id="apiKeyMaxEstimatedInputTokensInput" type="number" min="1" step="1" inputmode="numeric" placeholder="unlimited">
+              </div>
+              <div class="api-key-limit-row api-key-budget-row" style="margin-top:10px;">
+                <label for="apiKeyInputTokenBudgetInput">Whole-key cumulative input-token budget</label>
+                <input id="apiKeyInputTokenBudgetInput" type="number" min="1" step="1" inputmode="numeric" placeholder="no budget">
+                <select id="apiKeyInputTokenBudgetPeriodInput" aria-label="Input-token budget period">
+                  <option value="lifetime">Lifetime</option>
+                  <option value="calendar_month">Calendar month</option>
+                </select>
+              </div>
+              <div class="api-key-access-editor">
+                <label>Renewable quotas (optional)</label>
+                <div class="api-key-limit-row">
+                  <label for="apiKeyQuotaTimezone">Monthly calendar timezone</label>
+                  <input id="apiKeyQuotaTimezone" value="UTC" placeholder="Asia/Jakarta" autocomplete="off">
+                </div>
+                <div id="apiKeyQuotaRules"></div>
+                <button type="button" class="mini-btn secondary-button" onclick="addApiKeyQuotaRule()">Add quota rule</button>
+                <div class="settings-help">The first accepted generation starts the timer. Daily = 24 hours; weekly = 7 days; monthly = the same calendar date/time. All rules apply together. Cached tokens are part of input, and reasoning is part of output. Set a small explicit output maximum on requests using output quotas. Unsupported strict-token routes fail closed. After first use, only allowance values can be edited; changing a schedule requires a new policy/key.</div>
               </div>
               <div class="api-key-access-editor">
                 <label for="apiKeyAccessModeInput">Access</label>
@@ -8006,7 +9850,7 @@ async fn dashboard() -> impl IntoResponse {
                 </select>
                 <div id="apiKeyAccessGroups" class="api-key-access-groups" hidden></div>
               </div>
-              <div class="settings-help">API keys are for proxy API access only. Dashboard access uses OTP login.</div>
+              <div class="settings-help">The request cap is a guardrail, not a spend cap. A cumulative budget is optional. API keys are for proxy API access only; dashboard access uses administrator authentication.</div>
             </div>
             <div id="apiKeyRevealPanel" class="api-key-reveal" hidden>
               <div class="api-key-reveal-header">
@@ -9076,6 +10920,9 @@ async fn dashboard() -> impl IntoResponse {
           if (!adminAuthenticated) return;
           refreshDashboardSnapshot(true).then(function(snapshot) {
             if (snapshot) renderDashboardSnapshot();
+            if (document.getElementById('appSettingsModal')?.style.display === 'block') {
+              refreshApiKeyQuotaSummaries();
+            }
           });
         }, 10000);
         setInterval(() => { if (adminAuthenticated) refreshContextChart(); }, 60000);
@@ -9315,16 +11162,131 @@ async fn admin_api_keys_route(
     if let Some(response) = require_admin_session_json(&state, &headers) {
         return response;
     }
-    let keys = {
-        let store = state.api_keys.lock().unwrap();
-        api_keys::public_records(&store)
+    let keys = match state.api_key_registry.public_records(state.cfg.as_ref()) {
+        Ok(keys) => keys,
+        Err(err) => {
+            error!(
+                "failed to reload API-key authority for admin listing: {}",
+                err
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "ok": false,
+                    "message": "failed to load API key store safely"
+                })),
+            )
+                .into_response();
+        }
     };
+    let quota_summaries = api_key_quota_runtime::summaries(state.cfg.as_ref(), &keys);
     axum::Json(serde_json::json!({
         "ok": true,
         "keys": keys,
+        "quota_summaries": quota_summaries,
         "accounts": notification_account_options(&state)
     }))
     .into_response()
+}
+
+#[derive(Deserialize)]
+struct ApiKeyQuotaQuery {
+    id: Option<String>,
+}
+
+async fn admin_api_key_quotas_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ApiKeyQuotaQuery>,
+) -> Response {
+    if let Some(response) = require_admin_session_json(&state, &headers) {
+        return response;
+    }
+    let mut keys = match state.api_key_registry.public_records(state.cfg.as_ref()) {
+        Ok(keys) => keys,
+        Err(err) => {
+            error!("failed to read quota authority: {}", err);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "ok": false, "message": "Quota accounting unavailable"
+                })),
+            )
+                .into_response();
+        }
+    };
+    if let Some(id) = query.id {
+        keys.retain(|key| key.id == id);
+        if keys.is_empty() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "ok": false, "message": "API key not found"
+                })),
+            )
+                .into_response();
+        }
+    }
+    api_key_quota_summaries_response(api_key_quota_runtime::summaries(state.cfg.as_ref(), &keys))
+}
+
+fn api_key_quota_summaries_response(summaries: serde_json::Value) -> Response {
+    let unavailable = summaries.as_object().is_none_or(|entries| {
+        entries
+            .values()
+            .any(|summary| summary.get("error").and_then(serde_json::Value::as_bool) == Some(true))
+    });
+    let mut body = serde_json::json!({
+        "ok": !unavailable,
+        "quota_summaries": summaries
+    });
+    if unavailable {
+        body["message"] = serde_json::json!("Quota accounting unavailable");
+    }
+    (
+        if unavailable {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::OK
+        },
+        Json(body),
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod api_key_quota_summary_response_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_summary_returns_unavailable_without_hiding_other_balances() {
+        let summaries = serde_json::json!({
+            "broken": {"error": true},
+            "healthy": {"anchor": null, "rules": []}
+        });
+        let response = api_key_quota_summaries_response(summaries.clone());
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["quota_summaries"], summaries);
+        assert_eq!(body["message"], "Quota accounting unavailable");
+    }
+
+    #[test]
+    fn empty_and_healthy_summaries_remain_successful() {
+        for summaries in [
+            serde_json::json!({}),
+            serde_json::json!({"healthy": {"anchor": null, "rules": []}}),
+        ] {
+            assert_eq!(
+                api_key_quota_summaries_response(summaries).status(),
+                StatusCode::OK
+            );
+        }
+    }
 }
 
 async fn admin_api_keys_create_route(
@@ -9337,39 +11299,53 @@ async fn admin_api_keys_create_route(
     }
     let label = payload.label.as_deref().unwrap_or("");
     let now = now_rfc3339();
-    let (created, snapshot) = {
-        let mut store = state.api_keys.lock().unwrap();
-        match api_keys::create_key(&mut store, label, &payload.access, &now) {
-            Ok(created) => (created, store.clone()),
-            Err(err) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    axum::Json(serde_json::json!({
-                        "ok": false,
-                        "message": err
-                    })),
-                )
-                    .into_response();
-            }
+    let access = match canonicalize_api_key_access_for_current_accounts(&state, &payload.access.0) {
+        Ok(access) => access,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "ok": false,
+                    "message": err
+                })),
+            )
+                .into_response();
         }
     };
-    if let Err(err) = api_keys::save(state.cfg.as_ref(), &snapshot) {
-        error!("failed to save API key store: {}", err);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(serde_json::json!({
-                "ok": false,
-                "message": "failed to save API key"
-            })),
-        )
-            .into_response();
-    }
-    state.api_key_cache.write().unwrap().clear();
+    let (created, snapshot) = match state.api_key_registry.mutate(state.cfg.as_ref(), |store| {
+        api_keys::create_key(store, label, &access, &now)
+    }) {
+        Ok(result) => result,
+        Err(ApiKeyRegistryMutationError::Rejected(err)) => {
+            error!("failed to create API key: {}", err);
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "ok": false,
+                    "message": err
+                })),
+            )
+                .into_response();
+        }
+        Err(ApiKeyRegistryMutationError::Persistence(err)) => {
+            error!("failed to persist new API key: {}", err);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "ok": false,
+                    "message": "failed to persist API key change"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let keys = api_keys::public_records(&snapshot);
     axum::Json(serde_json::json!({
         "ok": true,
         "key": created.key,
         "plain_text_key": created.plain_text_key,
-        "keys": api_keys::public_records(&snapshot),
+        "quota_summaries": api_key_quota_runtime::summaries(state.cfg.as_ref(), &keys),
+        "keys": keys,
         "accounts": notification_account_options(&state)
     }))
     .into_response()
@@ -9383,37 +11359,55 @@ async fn admin_api_keys_access_route(
     if let Some(response) = require_admin_session_json(&state, &headers) {
         return response;
     }
-    let snapshot = {
-        let mut store = state.api_keys.lock().unwrap();
-        match api_keys::update_access(&mut store, payload.id.trim(), &payload.access) {
-            Ok(_) => store.clone(),
-            Err(err) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    axum::Json(serde_json::json!({
-                        "ok": false,
-                        "message": err
-                    })),
-                )
-                    .into_response();
-            }
+    let access = match canonicalize_api_key_access_for_current_accounts(&state, &payload.access.0) {
+        Ok(access) => access,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "ok": false,
+                    "message": err
+                })),
+            )
+                .into_response();
         }
     };
-    if let Err(err) = api_keys::save(state.cfg.as_ref(), &snapshot) {
-        error!("failed to save API key access: {}", err);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(serde_json::json!({
-                "ok": false,
-                "message": "failed to save API key access"
-            })),
-        )
-            .into_response();
-    }
-    state.api_key_cache.write().unwrap().clear();
+    let (_, snapshot) = match state.api_key_registry.mutate(state.cfg.as_ref(), |store| {
+        api_keys::update_access(store, payload.id.trim(), &access)
+    }) {
+        Ok(result) => result,
+        Err(ApiKeyRegistryMutationError::Rejected(err)) => {
+            error!("failed to update API key access: {}", err);
+            return (
+                if err == "API key not found" {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                axum::Json(serde_json::json!({
+                    "ok": false,
+                    "message": err
+                })),
+            )
+                .into_response();
+        }
+        Err(ApiKeyRegistryMutationError::Persistence(err)) => {
+            error!("failed to persist API key access update: {}", err);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "ok": false,
+                    "message": "failed to persist API key change"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let keys = api_keys::public_records(&snapshot);
     axum::Json(serde_json::json!({
         "ok": true,
-        "keys": api_keys::public_records(&snapshot),
+        "quota_summaries": api_key_quota_runtime::summaries(state.cfg.as_ref(), &keys),
+        "keys": keys,
         "accounts": notification_account_options(&state)
     }))
     .into_response()
@@ -9428,39 +11422,38 @@ async fn admin_api_keys_revoke_route(
         return response;
     }
     let now = now_rfc3339();
-    let snapshot = {
-        let mut store = state.api_keys.lock().unwrap();
-        match api_keys::revoke_key(&mut store, payload.id.trim(), &now) {
-            Ok(_) => {
-                state.api_key_cache.write().unwrap().clear();
-                store.clone()
-            }
-            Err(err) => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    axum::Json(serde_json::json!({
-                        "ok": false,
-                        "message": err
-                    })),
-                )
-                    .into_response();
-            }
+    let (_, snapshot) = match state.api_key_registry.mutate(state.cfg.as_ref(), |store| {
+        api_keys::revoke_key(store, payload.id.trim(), &now)
+    }) {
+        Ok(result) => result,
+        Err(ApiKeyRegistryMutationError::Rejected(err)) => {
+            error!("failed to revoke API key: {}", err);
+            return (
+                StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({
+                    "ok": false,
+                    "message": err
+                })),
+            )
+                .into_response();
+        }
+        Err(ApiKeyRegistryMutationError::Persistence(err)) => {
+            error!("failed to persist API key revocation: {}", err);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "ok": false,
+                    "message": "failed to persist API key change"
+                })),
+            )
+                .into_response();
         }
     };
-    if let Err(err) = api_keys::save(state.cfg.as_ref(), &snapshot) {
-        error!("failed to save API key store: {}", err);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(serde_json::json!({
-                "ok": false,
-                "message": "failed to save API key changes"
-            })),
-        )
-            .into_response();
-    }
+    let keys = api_keys::public_records(&snapshot);
     axum::Json(serde_json::json!({
         "ok": true,
-        "keys": api_keys::public_records(&snapshot),
+        "quota_summaries": api_key_quota_runtime::summaries(state.cfg.as_ref(), &keys),
+        "keys": keys,
         "accounts": notification_account_options(&state)
     }))
     .into_response()
@@ -9841,6 +11834,53 @@ async fn admin_test_api_route(
         );
     }
 
+    // The normal Test API remains an operator route test. Selecting an ID
+    // switches it into managed-key mode; the raw credential is intentionally
+    // neither accepted nor needed by this endpoint.
+    let managed_api_key = match payload.api_key_id.as_deref() {
+        None => None,
+        Some(api_key_id) if api_key_id.trim().is_empty() => {
+            return admin_test_json_response(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "ok": false,
+                    "status": StatusCode::BAD_REQUEST.as_u16(),
+                    "model": model,
+                    "policy_mode": "managed_api_key",
+                    "message": "api_key_id must be a non-empty managed API key ID when supplied"
+                }),
+            );
+        }
+        Some(api_key_id) => match managed_api_key_profile_for_test(&state, api_key_id) {
+            Ok(profile) => Some(profile),
+            Err(error) => {
+                let status = match error {
+                    ManagedTestApiKeyLookupError::NotFound
+                    | ManagedTestApiKeyLookupError::Revoked => StatusCode::NOT_FOUND,
+                    ManagedTestApiKeyLookupError::NotManaged => StatusCode::BAD_REQUEST,
+                    ManagedTestApiKeyLookupError::AuthorityUnavailable => {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                };
+                return admin_test_json_response(
+                    status,
+                    serde_json::json!({
+                        "ok": false,
+                        "status": status.as_u16(),
+                        "model": model,
+                        "policy_mode": "managed_api_key",
+                        "api_key_id": api_key_id.trim(),
+                        "message": error.message()
+                    }),
+                );
+            }
+        },
+    };
+    let managed_api_key_id = managed_api_key
+        .as_ref()
+        .and_then(|profile| profile.id.as_deref())
+        .map(str::to_string);
+
     let mut request_body = serde_json::json!({
         "model": model,
         "input": prompt,
@@ -9875,6 +11915,8 @@ async fn admin_test_api_route(
                     "ok": false,
                     "status": err.status.as_u16(),
                     "model": payload.model.trim(),
+                    "policy_mode": admin_test_policy_mode(managed_api_key_id.as_deref()),
+                    "api_key_id": managed_api_key_id.as_deref(),
                     "message": err.message
                 }),
             );
@@ -9882,47 +11924,119 @@ async fn admin_test_api_route(
     };
 
     let started_at = std::time::Instant::now();
-    let response = dispatch_admin_test_routed_request(state.clone(), model_headers, routed).await;
-    admin_test_response_from_upstream(state, payload.model.trim(), response, started_at.elapsed())
+    let (policy_state, prompt) = match managed_api_key.as_ref() {
+        Some(profile) => match enforce_managed_api_key_test_policy(
+            state.clone(),
+            "/v1/responses",
+            &routed,
+            profile,
+        )
         .await
+        {
+            Ok(allowed) => allowed,
+            Err(response) => {
+                return admin_test_response_from_upstream(
+                    state,
+                    payload.model.trim(),
+                    managed_api_key_id.as_deref(),
+                    response,
+                    started_at.elapsed(),
+                )
+                .await;
+            }
+        },
+        None => {
+            let prompt = serde_json::from_slice::<serde_json::Value>(&routed.upstream_body)
+                .ok()
+                .map(|value| prompt_metrics_from_request_value(&value))
+                .unwrap_or_default();
+            (state.clone(), prompt)
+        }
+    };
+    let response = dispatch_admin_test_routed_request(
+        policy_state,
+        model_headers,
+        routed,
+        managed_api_key.map(|profile| profile.access),
+        prompt,
+    )
+    .await;
+    admin_test_response_from_upstream(
+        state,
+        payload.model.trim(),
+        managed_api_key_id.as_deref(),
+        response,
+        started_at.elapsed(),
+    )
+    .await
 }
 
 async fn dispatch_admin_test_routed_request(
     state: AppState,
     headers: HeaderMap,
     routed: RoutedRequest,
+    managed_access: Option<api_keys::ApiKeyAccess>,
+    prompt: PromptMetrics,
 ) -> Response {
     match routed.target {
         TargetModel::Custom => {
-            let prompt = serde_json::from_slice::<serde_json::Value>(&routed.upstream_body)
-                .ok()
-                .map(|value| prompt_metrics_from_request_value(&value))
-                .unwrap_or_default();
+            let unrestricted_access = api_keys::ApiKeyAccess::default();
+            let access = managed_access.as_ref().unwrap_or(&unrestricted_access);
             custom_model_response(
                 state,
                 headers,
+                SourceApi::V1,
+                "/v1/responses",
                 &routed.upstream_path,
                 routed.upstream_body,
                 routed.response_mode,
-                &api_keys::ApiKeyAccess::default(),
+                access,
                 prompt,
             )
             .await
         }
-        TargetModel::CodexModels | TargetModel::UnifiedV1Models => (
-            StatusCode::BAD_REQUEST,
-            [("Content-Type", "application/json")],
-            openai_error_body(
-                "test API requires a response model",
-                "invalid_request_error",
-                None,
-            ),
-        )
-            .into_response(),
+        TargetModel::CodexModels | TargetModel::UnifiedV1Models => {
+            if managed_access.is_some() {
+                queue_api_key_budget_settlement(
+                    &state,
+                    api_key_policy_store::ApiKeyInputTokenSettlement::Release,
+                    api_key_policy_store::ApiKeyPolicyDecision::Failed,
+                    None,
+                );
+            }
+            (
+                StatusCode::BAD_REQUEST,
+                [("Content-Type", "application/json")],
+                openai_error_body(
+                    "test API requires a response model",
+                    "invalid_request_error",
+                    None,
+                ),
+            )
+                .into_response()
+        }
         target => {
+            let model = serde_json::from_slice::<serde_json::Value>(&routed.upstream_body)
+                .ok()
+                .and_then(|value| model_from_request_value(&value));
+            let state = match managed_access.as_ref() {
+                Some(access) => match scoped_managed_test_state_for_target(
+                    state,
+                    access,
+                    target,
+                    prompt.estimated_input_tokens(),
+                    "/v1/responses",
+                    model.as_deref(),
+                ) {
+                    Ok(state) => state,
+                    Err(response) => return response,
+                },
+                None => state,
+            };
             dispatch_custom_target(
                 state,
                 headers,
+                SourceApi::V1,
                 &routed.upstream_path,
                 target,
                 routed.upstream_body,
@@ -9933,9 +12047,526 @@ async fn dispatch_admin_test_routed_request(
     }
 }
 
+/// A dashboard-selected managed key is a policy profile, not an alternate
+/// credential channel. It is read from the same in-memory authority used by
+/// bearer authentication and is never exposed outside this process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedTestApiKeyLookupError {
+    NotFound,
+    Revoked,
+    NotManaged,
+    AuthorityUnavailable,
+}
+
+impl ManagedTestApiKeyLookupError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::NotFound => "managed API key was not found",
+            Self::Revoked => "managed API key is revoked",
+            Self::NotManaged => "only managed API keys can be used for managed Test API mode",
+            Self::AuthorityUnavailable => "managed API key authority is temporarily unavailable",
+        }
+    }
+}
+
+fn managed_api_key_profile_for_test(
+    state: &AppState,
+    api_key_id: &str,
+) -> Result<AuthenticatedApiKey, ManagedTestApiKeyLookupError> {
+    let _file_lock = api_keys::lock_store_shared(state.cfg.as_ref()).map_err(|err| {
+        error!(
+            "failed to coordinate managed Test API key lookup safely: {}",
+            err
+        );
+        ManagedTestApiKeyLookupError::AuthorityUnavailable
+    })?;
+    state
+        .api_key_registry
+        .reload_from_disk_while_locked(state.cfg.as_ref())
+        .map_err(|err| {
+            error!(
+                "failed to reload managed Test API key authority safely: {}",
+                err
+            );
+            ManagedTestApiKeyLookupError::AuthorityUnavailable
+        })?;
+    let auth = state.api_key_registry.auth.read().unwrap();
+    managed_api_key_profile_from_store(&auth.store, api_key_id)
+}
+
+fn managed_api_key_profile_from_store(
+    store: &api_keys::ApiKeyStore,
+    api_key_id: &str,
+) -> Result<AuthenticatedApiKey, ManagedTestApiKeyLookupError> {
+    let api_key_id = api_key_id.trim();
+    let Some(record) = store.keys.iter().find(|record| record.id == api_key_id) else {
+        return Err(ManagedTestApiKeyLookupError::NotFound);
+    };
+    if record.revoked_at.is_some() {
+        return Err(ManagedTestApiKeyLookupError::Revoked);
+    }
+    if record.source != api_keys::ApiKeySource::Managed {
+        return Err(ManagedTestApiKeyLookupError::NotManaged);
+    }
+    Ok(AuthenticatedApiKey {
+        id: Some(record.id.clone()),
+        access: record.access.clone(),
+    })
+}
+
+fn admin_test_policy_mode(managed_api_key_id: Option<&str>) -> &'static str {
+    if managed_api_key_id.is_some() {
+        "managed_api_key"
+    } else {
+        "operator_bypass"
+    }
+}
+
+/// Apply the same pre-dispatch key checks the public proxy applies. The Test
+/// API's internal header only authenticates its hop through provider adapters;
+/// it never bypasses this selected managed-key policy.
+async fn enforce_managed_api_key_test_policy(
+    mut state: AppState,
+    request_path: &str,
+    routed: &RoutedRequest,
+    authenticated: &AuthenticatedApiKey,
+) -> Result<(AppState, PromptMetrics), Response> {
+    state.request_api_key_id = authenticated.id.clone();
+    state.request_api_key_quota = api_key_quota_runtime::request_context(&state);
+    if let Some(provider) = target_provider_access_key(routed.target) {
+        if !authenticated.access.allows_provider(provider) {
+            queue_api_key_local_policy_denial(
+                &state,
+                request_path,
+                Some(provider),
+                None,
+                api_key_policy_store::ApiKeyPolicyDecision::ScopeDenied,
+                StatusCode::FORBIDDEN,
+                None,
+                None,
+            );
+            return Err(source_error_response(
+                SourceApi::V1,
+                StatusCode::FORBIDDEN,
+                format!("API key does not have access to {}", provider),
+                "permission_error",
+                None,
+                "permission_error",
+            ));
+        }
+    }
+
+    let request_value = serde_json::from_slice::<serde_json::Value>(&routed.upstream_body).ok();
+    let model = request_value.as_ref().and_then(model_from_request_value);
+    let prompt = policy_prompt_metrics_for_routed_request(&state, routed);
+    state.request_api_key_audit =
+        unbudgeted_api_key_request_audit(authenticated, request_path, &prompt);
+    if prompt.requires_measurement() && api_key_has_input_policy(&authenticated.access) {
+        queue_api_key_local_policy_denial(
+            &state,
+            request_path,
+            target_provider_access_key(routed.target),
+            model.as_deref(),
+            api_key_policy_store::ApiKeyPolicyDecision::MeasurementRequired,
+            StatusCode::BAD_REQUEST,
+            None,
+            Some(api_key_policy_store::ApiKeyInputMeasurement::Unknown),
+        );
+        return Err(api_key_measurement_required_response(SourceApi::V1));
+    }
+    if let Some(response) = api_key_prompt_limit_response(
+        SourceApi::V1,
+        &authenticated.access,
+        None,
+        None,
+        prompt.estimated_input_tokens(),
+    ) {
+        queue_api_key_local_policy_denial(
+            &state,
+            request_path,
+            None,
+            model.as_deref(),
+            api_key_policy_store::ApiKeyPolicyDecision::RequestLimitExceeded,
+            StatusCode::TOO_MANY_REQUESTS,
+            Some(prompt.estimated_input_tokens()),
+            Some(api_key_policy_store::ApiKeyInputMeasurement::Conservative),
+        );
+        return Err(response);
+    }
+    if let Some(provider) = target_provider_access_key(routed.target) {
+        if let Some(response) = api_key_prompt_limit_response(
+            SourceApi::V1,
+            &authenticated.access,
+            Some(provider),
+            None,
+            prompt.estimated_input_tokens(),
+        ) {
+            queue_api_key_local_policy_denial(
+                &state,
+                request_path,
+                Some(provider),
+                model.as_deref(),
+                api_key_policy_store::ApiKeyPolicyDecision::RequestLimitExceeded,
+                StatusCode::TOO_MANY_REQUESTS,
+                Some(prompt.estimated_input_tokens()),
+                Some(api_key_policy_store::ApiKeyInputMeasurement::Conservative),
+            );
+            return Err(response);
+        }
+    }
+    if let Some(response) = api_key_account_prompt_limit_response_for_target(
+        SourceApi::V1,
+        &state,
+        &authenticated.access,
+        routed.target,
+        prompt.estimated_input_tokens(),
+    ) {
+        queue_api_key_local_policy_denial(
+            &state,
+            request_path,
+            target_provider_access_key(routed.target),
+            model.as_deref(),
+            api_key_policy_store::ApiKeyPolicyDecision::RequestLimitExceeded,
+            StatusCode::TOO_MANY_REQUESTS,
+            Some(prompt.estimated_input_tokens()),
+            Some(api_key_policy_store::ApiKeyInputMeasurement::Conservative),
+        );
+        return Err(response);
+    }
+
+    if let (Some(api_key_id), Some(budget)) = (
+        authenticated.id.as_ref(),
+        authenticated.access.input_token_budget.clone(),
+    ) {
+        let estimated_input_tokens = prompt.estimated_input_tokens();
+        if estimated_input_tokens > 0 {
+            let context = ApiKeyBudgetReservationContext {
+                reservation_id: Uuid::new_v4().simple().to_string(),
+                request_id: Uuid::new_v4().simple().to_string(),
+                api_key_id: api_key_id.clone(),
+                request_path: request_path.to_string(),
+                provider: target_provider_access_key(routed.target).map(str::to_string),
+                model: model.clone(),
+                estimated_input_tokens,
+                budget: budget.clone(),
+                lifecycle: Arc::new(ApiKeyBudgetReservationLifecycle::default()),
+            };
+            match reserve_api_key_input_budget(state.cfg.clone(), context.clone(), budget).await {
+                Ok(context) => {
+                    queue_api_key_policy_audit(
+                        &state,
+                        api_key_policy_store::ApiKeyRequestAuditEvent {
+                            request_id: context.request_id.clone(),
+                            api_key_id: context.api_key_id.clone(),
+                            kind: api_key_policy_store::ApiKeyPolicyEventKind::Dispatch,
+                            decision: api_key_policy_store::ApiKeyPolicyDecision::Allowed,
+                            request_path: context.request_path.clone(),
+                            provider: context.provider.clone(),
+                            model: context.model.clone(),
+                            account_key: None,
+                            status_code: None,
+                            estimated_input_tokens: Some(context.estimated_input_tokens),
+                            actual_input_tokens: None,
+                            measurement: Some(
+                                api_key_policy_store::ApiKeyInputMeasurement::Conservative,
+                            ),
+                            reservation_id: Some(context.reservation_id.clone()),
+                        },
+                    );
+                    state.request_api_key_budget = Some(context);
+                }
+                Err(ApiKeyBudgetReservationError::Denied(denied)) => {
+                    queue_api_key_policy_audit(
+                        &state,
+                        api_key_policy_store::ApiKeyRequestAuditEvent {
+                            request_id: context.request_id,
+                            api_key_id: context.api_key_id,
+                            kind: api_key_policy_store::ApiKeyPolicyEventKind::Authorization,
+                            decision: api_key_policy_store::ApiKeyPolicyDecision::BudgetExceeded,
+                            request_path: context.request_path,
+                            provider: context.provider,
+                            model: context.model,
+                            account_key: None,
+                            status_code: Some(StatusCode::TOO_MANY_REQUESTS.as_u16()),
+                            estimated_input_tokens: Some(context.estimated_input_tokens),
+                            actual_input_tokens: None,
+                            measurement: Some(
+                                api_key_policy_store::ApiKeyInputMeasurement::Conservative,
+                            ),
+                            reservation_id: Some(context.reservation_id),
+                        },
+                    );
+                    return Err(source_error_response(
+                        SourceApi::V1,
+                        StatusCode::TOO_MANY_REQUESTS,
+                        format!(
+                            "API key input-token budget exceeded: {} committed + {} reserved + {} requested exceeds {} for {}",
+                            denied.committed_input_tokens,
+                            denied.reserved_input_tokens,
+                            denied.requested_input_tokens,
+                            denied.budget_limit,
+                            match denied.period {
+                                api_keys::ApiKeyBudgetPeriod::Lifetime => "lifetime",
+                                api_keys::ApiKeyBudgetPeriod::CalendarMonth => "the current calendar month",
+                            }
+                        ),
+                        "rate_limit_error",
+                        Some("input_token_budget_exceeded"),
+                        "rate_limit_error",
+                    ));
+                }
+                Err(ApiKeyBudgetReservationError::Storage(err)) => {
+                    error!(
+                        "failed to reserve API-key input budget for Test API: {}",
+                        err
+                    );
+                    return Err(source_error_response(
+                        SourceApi::V1,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Unable to check API key input-token budget safely",
+                        "server_error",
+                        None,
+                        "api_error",
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok((state, prompt))
+}
+
+/// A direct Test API target otherwise reaches its adapter with the internal
+/// proxy secret. Preflight it first so a deterministic policy/configuration
+/// refusal neither reaches an upstream account nor leaves an active budget
+/// reservation behind.
+fn scoped_managed_test_state_for_target(
+    state: AppState,
+    access: &api_keys::ApiKeyAccess,
+    target: TargetModel,
+    estimated_input_tokens: u64,
+    request_path: &str,
+    model: Option<&str>,
+) -> Result<AppState, Response> {
+    preflight_api_key_target_dispatch(
+        &state,
+        access,
+        target,
+        estimated_input_tokens,
+        SourceApi::V1,
+        request_path,
+        model,
+    )?;
+
+    Ok(scoped_state_for_api_key_request(
+        state,
+        access,
+        Some(target),
+        Some(estimated_input_tokens),
+    ))
+}
+
+/// A local account-routing result after a managed key's provider/account
+/// scope and per-account request caps have both been applied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApiKeyTargetPreflightOutcome {
+    Allowed,
+    ScopeDenied,
+    NoEligibleAccount,
+    RequestLimitExceeded,
+}
+
+/// Keep the classification pure so every route uses the same 403/429/503
+/// precedence: account scope is an authorization failure, request caps are a
+/// rate limit, and disabled/cooling/missing credentials are availability.
+fn api_key_target_preflight_outcome(
+    target_configured: bool,
+    account_scoped_configured: bool,
+    account_scoped_dispatchable: bool,
+    limited_configured: bool,
+    limited_dispatchable: bool,
+) -> ApiKeyTargetPreflightOutcome {
+    if !account_scoped_configured {
+        return if target_configured {
+            ApiKeyTargetPreflightOutcome::ScopeDenied
+        } else {
+            ApiKeyTargetPreflightOutcome::NoEligibleAccount
+        };
+    }
+    if !account_scoped_dispatchable {
+        return ApiKeyTargetPreflightOutcome::NoEligibleAccount;
+    }
+    if !limited_configured || !limited_dispatchable {
+        return ApiKeyTargetPreflightOutcome::RequestLimitExceeded;
+    }
+    ApiKeyTargetPreflightOutcome::Allowed
+}
+
+/// Check whether a concrete provider can be dispatched after applying a
+/// managed key's account scope and account-level request caps.  This runs
+/// after the whole-key budget reservation, so every local refusal settles
+/// that reservation as a release.  It intentionally does not try to turn an
+/// upstream failure into a release: once an adapter has selected an account,
+/// an upstream request may already be billable and must be conservatively
+/// committed by its usage/error path.
+fn preflight_api_key_target_dispatch(
+    state: &AppState,
+    access: &api_keys::ApiKeyAccess,
+    target: TargetModel,
+    estimated_input_tokens: u64,
+    source_api: SourceApi,
+    request_path: &str,
+    model: Option<&str>,
+) -> Result<(), Response> {
+    let provider = target_provider_access_key(target).unwrap_or("target");
+    // Older API-key files were allowed to name an account cap by its display
+    // alias.  Runtime authorization now intentionally compares only stable
+    // canonical selectors, so silently ignoring one of those old caps would
+    // turn a bounded account into an unlimited one.  Do not dispatch through
+    // this provider until an administrator rewrites the cap at the API-key
+    // boundary (where a unique alias can be resolved safely).
+    if api_key_has_unresolved_account_limit(access, provider) {
+        queue_api_key_budget_settlement(
+            state,
+            api_key_policy_store::ApiKeyInputTokenSettlement::Release,
+            api_key_policy_store::ApiKeyPolicyDecision::ScopeDenied,
+            None,
+        );
+        queue_api_key_local_policy_denial(
+            state,
+            request_path,
+            Some(provider),
+            model,
+            api_key_policy_store::ApiKeyPolicyDecision::ScopeDenied,
+            StatusCode::FORBIDDEN,
+            Some(estimated_input_tokens),
+            Some(api_key_policy_store::ApiKeyInputMeasurement::Conservative),
+        );
+        return Err(api_key_unresolved_account_limit_response(
+            source_api, provider,
+        ));
+    }
+    let target_configured = target_has_configured_accounts(state, target);
+    let account_scoped = scoped_state_for_api_key_access(state.clone(), access, Some(target));
+    let account_scoped_configured = target_has_configured_accounts(&account_scoped, target);
+    let account_scoped_dispatchable =
+        account_scoped_configured && target_has_dispatchable_account(&account_scoped, target);
+    let limited = account_scoped_dispatchable.then(|| {
+        scoped_state_for_api_key_request(
+            account_scoped,
+            access,
+            Some(target),
+            Some(estimated_input_tokens),
+        )
+    });
+    let limited_configured = limited
+        .as_ref()
+        .is_some_and(|state| target_has_configured_accounts(state, target));
+    let limited_dispatchable = limited
+        .as_ref()
+        .is_some_and(|state| target_has_dispatchable_account(state, target));
+
+    match api_key_target_preflight_outcome(
+        target_configured,
+        account_scoped_configured,
+        account_scoped_dispatchable,
+        limited_configured,
+        limited_dispatchable,
+    ) {
+        ApiKeyTargetPreflightOutcome::Allowed => Ok(()),
+        ApiKeyTargetPreflightOutcome::ScopeDenied => {
+            queue_api_key_budget_settlement(
+                state,
+                api_key_policy_store::ApiKeyInputTokenSettlement::Release,
+                api_key_policy_store::ApiKeyPolicyDecision::ScopeDenied,
+                None,
+            );
+            queue_api_key_local_policy_denial(
+                state,
+                request_path,
+                Some(provider),
+                model,
+                api_key_policy_store::ApiKeyPolicyDecision::ScopeDenied,
+                StatusCode::FORBIDDEN,
+                Some(estimated_input_tokens),
+                Some(api_key_policy_store::ApiKeyInputMeasurement::Conservative),
+            );
+            Err(source_error_response(
+                source_api,
+                StatusCode::FORBIDDEN,
+                format!("API key does not allow any configured {} account", provider),
+                "permission_error",
+                None,
+                "permission_error",
+            ))
+        }
+        ApiKeyTargetPreflightOutcome::NoEligibleAccount => {
+            queue_api_key_budget_settlement(
+                state,
+                api_key_policy_store::ApiKeyInputTokenSettlement::Release,
+                api_key_policy_store::ApiKeyPolicyDecision::NoEligibleAccount,
+                None,
+            );
+            queue_api_key_local_policy_denial(
+                state,
+                request_path,
+                Some(provider),
+                model,
+                api_key_policy_store::ApiKeyPolicyDecision::NoEligibleAccount,
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(estimated_input_tokens),
+                Some(api_key_policy_store::ApiKeyInputMeasurement::Conservative),
+            );
+            let message = if target_configured {
+                format!("No enabled healthy {} account is available", provider)
+            } else {
+                format!("No configured {} account is available", provider)
+            };
+            Err(source_error_response(
+                source_api,
+                StatusCode::SERVICE_UNAVAILABLE,
+                message,
+                "server_error",
+                None,
+                "api_error",
+            ))
+        }
+        ApiKeyTargetPreflightOutcome::RequestLimitExceeded => {
+            queue_api_key_budget_settlement(
+                state,
+                api_key_policy_store::ApiKeyInputTokenSettlement::Release,
+                api_key_policy_store::ApiKeyPolicyDecision::RequestLimitExceeded,
+                None,
+            );
+            queue_api_key_local_policy_denial(
+                state,
+                request_path,
+                Some(provider),
+                model,
+                api_key_policy_store::ApiKeyPolicyDecision::RequestLimitExceeded,
+                StatusCode::TOO_MANY_REQUESTS,
+                Some(estimated_input_tokens),
+                Some(api_key_policy_store::ApiKeyInputMeasurement::Conservative),
+            );
+            Err(source_error_response(
+                source_api,
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "All eligible {} accounts exceed this API key's input-token limit",
+                    provider
+                ),
+                "rate_limit_error",
+                Some("token_limit_exceeded"),
+                "rate_limit_error",
+            ))
+        }
+    }
+}
+
 async fn admin_test_response_from_upstream(
     _state: AppState,
     requested_model: &str,
+    managed_api_key_id: Option<&str>,
     response: Response,
     elapsed: Duration,
 ) -> Response {
@@ -9955,6 +12586,8 @@ async fn admin_test_response_from_upstream(
                     "ok": false,
                     "status": StatusCode::BAD_GATEWAY.as_u16(),
                     "model": requested_model,
+                    "policy_mode": admin_test_policy_mode(managed_api_key_id),
+                    "api_key_id": managed_api_key_id,
                     "duration_ms": elapsed.as_millis(),
                     "message": format!("failed to read upstream response body: {}", err)
                 }),
@@ -9998,6 +12631,8 @@ async fn admin_test_response_from_upstream(
             "ok": status.is_success(),
             "status": status.as_u16(),
             "model": requested_model,
+            "policy_mode": admin_test_policy_mode(managed_api_key_id),
+            "api_key_id": managed_api_key_id,
             "duration_ms": elapsed.as_millis(),
             "content_type": content_type,
             "output_text": output_text,
@@ -10303,10 +12938,74 @@ fn model_catalog_provider_display_label(provider: Option<&str>) -> &'static str 
 
 fn internal_proxy_api_headers(state: &AppState) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    if let Ok(value) = HeaderValue::from_str(state.internal_proxy_secret.as_str()) {
+    insert_internal_proxy_header(&mut headers, state.internal_proxy_secret.as_str());
+    headers
+}
+
+/// Mark an in-process handoff to a provider adapter. The caller must use
+/// `should_drop_incoming_header` before sending headers to an upstream.
+fn insert_internal_proxy_header(headers: &mut HeaderMap, secret: &str) {
+    if let Ok(value) = HeaderValue::from_str(secret) {
         headers.insert("x-internal-proxy-key", value);
     }
-    headers
+}
+
+#[cfg(test)]
+mod internal_proxy_header_tests {
+    use super::{
+        insert_internal_proxy_header, should_drop_incoming_header,
+        strip_client_controlled_codex_routing_headers,
+    };
+    use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn in_process_adapter_header_replaces_client_value_and_is_never_forwarded() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-internal-proxy-key",
+            HeaderValue::from_static("untrusted-client-value"),
+        );
+
+        insert_internal_proxy_header(&mut headers, "process-only-secret");
+
+        assert_eq!(
+            headers
+                .get("x-internal-proxy-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("process-only-secret")
+        );
+        assert!(should_drop_incoming_header("x-internal-proxy-key"));
+    }
+
+    #[test]
+    fn client_cannot_forward_codex_account_or_context_routing_headers() {
+        let mut headers = HeaderMap::new();
+        for name in [
+            "chatgpt-account-id",
+            "chatgpt_account_id",
+            "conversation-id",
+            "conversation_id",
+            "session-id",
+            "session_id",
+            "cookie",
+        ] {
+            headers.insert(name, HeaderValue::from_static("client-controlled"));
+            assert!(should_drop_incoming_header(name), "{name} must be dropped");
+        }
+
+        strip_client_controlled_codex_routing_headers(&mut headers);
+        for name in [
+            "chatgpt-account-id",
+            "chatgpt_account_id",
+            "conversation-id",
+            "conversation_id",
+            "session-id",
+            "session_id",
+            "cookie",
+        ] {
+            assert!(headers.get(name).is_none(), "{name} must be stripped");
+        }
+    }
 }
 
 fn custom_model_options_from_catalog(models: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
@@ -12502,94 +15201,150 @@ pub(crate) fn model_from_request_value(value: &serde_json::Value) -> Option<Stri
 }
 
 pub(crate) fn prompt_metrics_from_request_value(value: &serde_json::Value) -> PromptMetrics {
-    let mut metrics = PromptMetrics::default();
-    if let Some(instructions) = value
-        .get("instructions")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-    {
-        metrics.input_chars += instructions.chars().count() as u64;
-        metrics.prompt_items += 1;
-        metrics.is_prompt = true;
+    let footprint = input_assessment::assess_request_value(value);
+    PromptMetrics {
+        input_chars: footprint.input_chars,
+        prompt_items: footprint.prompt_items,
+        // Count every non-null request value.  This includes tool-only and
+        // media-only requests, which previously disappeared from usage
+        // history because they had no familiar plain-text `input` field.
+        is_prompt: !value.is_null(),
+        estimated_input_tokens: footprint.upper_bound_tokens,
+        complete: footprint.complete,
     }
-
-    if let Some(input) = value.get("input") {
-        append_prompt_value(&mut metrics, input);
-    }
-
-    if let Some(messages) = value.get("messages") {
-        append_prompt_value(&mut metrics, messages);
-    }
-
-    if !metrics.is_prompt {
-        metrics.is_prompt = metrics.input_chars > 0 || metrics.prompt_items > 0;
-    }
-
-    metrics
 }
 
-fn append_prompt_value(metrics: &mut PromptMetrics, value: &serde_json::Value) {
-    match value {
-        serde_json::Value::String(text) => {
-            let text = text.trim();
-            if !text.is_empty() {
-                metrics.input_chars += text.chars().count() as u64;
-                metrics.prompt_items += 1;
-                metrics.is_prompt = true;
-            }
+/// Return the conservative input footprint after the selected provider route
+/// has applied its deterministic, gateway-owned body transformation.  Most
+/// providers dispatch the routed JSON as-is. Claude adds system text and a
+/// custom alias rewrites the configured upstream model, so measuring only the
+/// client-facing body would make those bytes invisible to a key policy.
+fn policy_prompt_metrics_for_routed_request(
+    state: &AppState,
+    routed: &RoutedRequest,
+) -> PromptMetrics {
+    let raw = serde_json::from_slice::<serde_json::Value>(&routed.upstream_body)
+        .ok()
+        .map(|value| prompt_metrics_from_request_value(&value))
+        .unwrap_or_default();
+    match routed.target {
+        TargetModel::Claude => {
+            target::claude::api::policy_prompt_metrics(&routed.upstream_path, &routed.upstream_body)
+                .unwrap_or(raw)
         }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                append_prompt_value(metrics, item);
-            }
+        TargetModel::Custom => {
+            custom_model_max_rewritten_prompt_metrics(state, &routed.upstream_body).unwrap_or(raw)
         }
-        serde_json::Value::Object(map) => {
-            let mut found_direct_text = false;
-            if let Some(text) = map
-                .get("text")
-                .and_then(|value| value.as_str())
-                .or_else(|| map.get("input_text").and_then(|value| value.as_str()))
-                .or_else(|| map.get("output_text").and_then(|value| value.as_str()))
-                .or_else(|| {
-                    map.get("content").and_then(|value| {
-                        if value.is_string() {
-                            value.as_str()
-                        } else {
-                            None
-                        }
-                    })
-                })
-            {
-                let text = text.trim();
-                if !text.is_empty() {
-                    metrics.input_chars += text.chars().count() as u64;
-                    metrics.prompt_items += 1;
-                    metrics.is_prompt = true;
-                    found_direct_text = true;
-                }
-            }
-            // Only recurse into content array if no direct text was found —
-            // avoids double-counting when the same content is expressed both
-            // as a top-level text field and as a structured content array.
-            if !found_direct_text {
-                if let Some(content) = map.get("content").filter(|value| value.is_array()) {
-                    append_prompt_value(metrics, content);
-                }
-            }
-            if let Some(input) = map.get("input") {
-                append_prompt_value(metrics, input);
-            }
-            if let Some(messages) = map.get("messages") {
-                append_prompt_value(metrics, messages);
-            }
+        _ => raw,
+    }
+}
+
+/// A custom alias can fall back to any enabled target. Reserve and cap against
+/// the largest final wire request it could send, rather than the shorter
+/// alias string a client supplied. This stays side-effect free: it must not
+/// advance round-robin routing merely to calculate a policy bound.
+fn custom_model_max_rewritten_prompt_metrics(
+    state: &AppState,
+    body: &Bytes,
+) -> Option<PromptMetrics> {
+    let request = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let alias = request
+        .get("model")
+        .and_then(|value| value.as_str())
+        .map(custom_models::normalize_alias)
+        .filter(|alias| !alias.is_empty())?;
+    let custom_model = find_custom_model(state, &alias)?;
+    let mut most_conservative = None;
+    for candidate in custom_model
+        .routes
+        .iter()
+        .flat_map(|group| group.targets.iter())
+        .filter(|candidate| candidate.enabled)
+    {
+        let target = source::v1::provider::target_from_model(&candidate.model);
+        if matches!(
+            target,
+            TargetModel::Custom | TargetModel::CodexModels | TargetModel::UnifiedV1Models
+        ) {
+            continue;
         }
-        _ => {}
+        let Ok(candidate_body) = rewrite_request_model(body, &candidate.model) else {
+            continue;
+        };
+        let Some(candidate_prompt) =
+            policy_prompt_metrics_for_custom_target(target, &candidate_body)
+        else {
+            // A Claude conversion failure is rejected locally by its adapter,
+            // so it cannot become an upstream input bypass. Keep measuring
+            // every other dispatchable candidate instead of discarding an
+            // already-established conservative maximum.
+            continue;
+        };
+        most_conservative = Some(match most_conservative {
+            Some(current) => more_conservative_prompt_metrics(current, candidate_prompt),
+            None => candidate_prompt,
+        });
+    }
+    most_conservative
+}
+
+fn policy_prompt_metrics_for_custom_target(
+    target: TargetModel,
+    body: &Bytes,
+) -> Option<PromptMetrics> {
+    if target == TargetModel::Claude {
+        return target::claude::api::policy_prompt_metrics("responses", body);
+    }
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .map(|value| prompt_metrics_from_request_value(&value))
+}
+
+fn more_conservative_prompt_metrics(
+    mut current: PromptMetrics,
+    candidate: PromptMetrics,
+) -> PromptMetrics {
+    current.input_chars = current.input_chars.max(candidate.input_chars);
+    current.prompt_items = current.prompt_items.max(candidate.prompt_items);
+    current.is_prompt |= candidate.is_prompt;
+    current.estimated_input_tokens = current
+        .estimated_input_tokens
+        .max(candidate.estimated_input_tokens);
+    // Any eligible fallback that relies on media or retained remote context
+    // makes the alias route unmeasurable under a constrained API key.
+    current.complete &= candidate.complete;
+    current
+}
+
+#[cfg(test)]
+mod provider_body_policy_tests {
+    use super::{
+        more_conservative_prompt_metrics, policy_prompt_metrics_for_custom_target,
+        prompt_metrics_from_request_value, rewrite_request_model, TargetModel,
+    };
+    use bytes::Bytes;
+
+    #[test]
+    fn custom_target_rewrite_is_measured_before_limit_decisions() {
+        let body = Bytes::from_static(br#"{"model":"ctm:tiny","input":"hello"}"#);
+        let raw: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let raw_metrics = prompt_metrics_from_request_value(&raw);
+        let target_model = format!("gem:{}", "x".repeat(512));
+        let rewritten = rewrite_request_model(&body, &target_model).unwrap();
+        let rewritten_metrics =
+            policy_prompt_metrics_for_custom_target(TargetModel::Gemini, &rewritten).unwrap();
+
+        assert!(rewritten_metrics.estimated_input_tokens() > raw_metrics.estimated_input_tokens());
+        let aggregate = more_conservative_prompt_metrics(raw_metrics, rewritten_metrics.clone());
+        assert_eq!(
+            aggregate.estimated_input_tokens(),
+            rewritten_metrics.estimated_input_tokens()
+        );
     }
 }
 
 pub(crate) fn usage_metrics_from_response_value(value: &serde_json::Value) -> UsageMetrics {
-    let usage = value
+    let mut usage = value
         .get("usage")
         .cloned()
         .or_else(|| {
@@ -12606,6 +15361,29 @@ pub(crate) fn usage_metrics_from_response_value(value: &serde_json::Value) -> Us
         })
         .unwrap_or(serde_json::Value::Null);
 
+    // Responses may return HTTP 200 with background work still queued, and
+    // early SSE events can carry provisional zero counters. Never let loss of
+    // their envelope turn provisional usage into refundable final usage.
+    let envelope = value.get("response").unwrap_or(value);
+    let terminal_incomplete = response_stopped_with_final_usage(envelope);
+    let nonterminal_status = envelope
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| status != "completed" && !terminal_incomplete);
+    let nonterminal_event = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| {
+            kind.starts_with("response.")
+                && kind != "response.completed"
+                && !(kind == "response.incomplete" && terminal_incomplete)
+        });
+    if nonterminal_status || nonterminal_event {
+        if let Some(usage) = usage.as_object_mut() {
+            usage.insert("_quota_final_usage".into(), serde_json::Value::Bool(false));
+        }
+    }
+
     let input_tokens = usage
         .get("input_tokens")
         .and_then(|v| v.as_u64())
@@ -12619,7 +15397,7 @@ pub(crate) fn usage_metrics_from_response_value(value: &serde_json::Value) -> Us
     let total_tokens = usage
         .get("total_tokens")
         .and_then(|v| v.as_u64())
-        .unwrap_or(input_tokens + output_tokens);
+        .unwrap_or(input_tokens.saturating_add(output_tokens));
     let cache_tokens = usage
         .get("input_tokens_details")
         .and_then(|v| v.get("cached_tokens"))
@@ -12654,6 +15432,28 @@ pub(crate) fn usage_metrics_from_response_value(value: &serde_json::Value) -> Us
         cache_tokens,
         reasoning_tokens,
         raw_usage: if usage.is_null() { None } else { Some(usage) },
+    }
+}
+
+fn response_stopped_with_final_usage(response: &serde_json::Value) -> bool {
+    // Incomplete *content* at a provider's output ceiling is terminal, unlike
+    // incomplete transport or still-running background work. Its final usage
+    // is authoritative even though the requested answer was cut short.
+    response.get("status").and_then(serde_json::Value::as_str) == Some("incomplete")
+        && response
+            .get("incomplete_details")
+            .and_then(|details| details.get("reason"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|reason| matches!(reason, "max_output_tokens" | "content_filter"))
+}
+
+fn is_terminal_responses_success_event(value: &serde_json::Value) -> bool {
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("response.completed") => true,
+        Some("response.incomplete") => value
+            .get("response")
+            .is_some_and(response_stopped_with_final_usage),
+        _ => false,
     }
 }
 
@@ -12721,23 +15521,55 @@ fn estimated_tokens_from_chars(chars: u64) -> u64 {
     }
 }
 
-fn usage_metrics_from_sse_response_body(body: &Bytes) -> Option<UsageMetrics> {
-    let text = String::from_utf8_lossy(body);
-    for line in text.lines() {
-        let data = match line.strip_prefix("data: ") {
-            Some(data) => data.trim(),
-            None => continue,
-        };
-        if data == "[DONE]" {
-            break;
+/// Split complete SSE events without assuming a space after the field colon
+/// or one JSON object per physical line. Include an unterminated final event
+/// so an error immediately followed by EOF cannot become a false success.
+pub(crate) fn sse_response_events(mut body: &[u8]) -> impl Iterator<Item = &[u8]> {
+    std::iter::from_fn(move || {
+        if body.is_empty() {
+            return None;
         }
-        let value: serde_json::Value = match serde_json::from_str(data) {
-            Ok(value) => value,
-            Err(_) => continue,
+        let (end, delimiter_len) = find_sse_event_boundary(body).unwrap_or((body.len(), 0));
+        let event = &body[..end];
+        body = &body[end + delimiter_len..];
+        Some(event)
+    })
+}
+
+fn sse_event_parts(raw_event: &[u8]) -> (Option<String>, String) {
+    let text = String::from_utf8_lossy(raw_event);
+    let mut event_name = None;
+    let mut data = Vec::new();
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("event:") {
+            event_name = Some(value.strip_prefix(' ').unwrap_or(value).to_string());
+        } else if let Some(value) = line.strip_prefix("data:") {
+            data.push(value.strip_prefix(' ').unwrap_or(value));
+        }
+    }
+    (event_name, data.join("\n"))
+}
+
+pub(crate) fn sse_event_json_value(raw_event: &[u8]) -> Option<serde_json::Value> {
+    let (event_name, data) = sse_event_parts(raw_event);
+    let mut value: serde_json::Value = serde_json::from_str(&data).ok()?;
+    if let (Some(event_name), Some(object)) = (event_name, value.as_object_mut()) {
+        if !object.get("type").is_some_and(serde_json::Value::is_string) {
+            object.insert("type".to_string(), serde_json::Value::String(event_name));
+        }
+    }
+    Some(value)
+}
+
+fn usage_metrics_from_sse_response_body(body: &Bytes) -> Option<UsageMetrics> {
+    for event in sse_response_events(body) {
+        let Some(value) = sse_event_json_value(event) else {
+            continue;
         };
-        if value.get("type").and_then(|v| v.as_str()) == Some("response.completed") {
+        if is_terminal_responses_success_event(&value) {
             if let Some(response) = value.get("response") {
-                return Some(usage_metrics_from_response_value(response));
+                let metrics = usage_metrics_from_response_value(response);
+                return metrics.raw_usage.is_some().then_some(metrics);
             }
         }
     }
@@ -12745,31 +15577,16 @@ fn usage_metrics_from_sse_response_body(body: &Bytes) -> Option<UsageMetrics> {
 }
 
 fn sse_error_message(body: &Bytes) -> Option<String> {
-    let text = String::from_utf8_lossy(body);
-    for line in text.lines() {
-        let Some(data) = line.strip_prefix("data: ").map(str::trim) else {
-            continue;
-        };
-        if data == "[DONE]" {
-            continue;
-        }
-        let value: serde_json::Value = match serde_json::from_str(data) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        if let Some(message) = sse_error_from_value(&value) {
-            return Some(message);
-        }
-    }
-    None
+    sse_response_events(body).find_map(sse_terminal_error_from_event)
 }
 
 fn sse_error_from_value(value: &serde_json::Value) -> Option<String> {
     let event_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    let error = value.get("error");
+    let error = value.get("error").filter(|error| !error.is_null());
     let response_error = value
         .get("response")
-        .and_then(|response| response.get("error"));
+        .and_then(|response| response.get("error"))
+        .filter(|error| !error.is_null());
     if event_type != "error"
         && event_type != "response.failed"
         && error.is_none()
@@ -12786,6 +15603,69 @@ fn sse_error_from_value(value: &serde_json::Value) -> Option<String> {
             .unwrap_or("upstream returned an SSE error")
             .to_string(),
     )
+}
+
+/// Returns an upstream terminal error carried by a single complete SSE event.
+///
+/// Providers are inconsistent here: some emit `{ "type": "error" }`, while
+/// others use an `event: error` envelope whose JSON data does not itself have
+/// a type marker.  Stream adapters must check both forms before accounting an
+/// EOF as a successful request.
+pub(crate) fn sse_terminal_error_from_event(raw_event: &[u8]) -> Option<String> {
+    let (event_name, data) = sse_event_parts(raw_event);
+    let event_is_error = event_name
+        .as_deref()
+        .is_some_and(|event| event.eq_ignore_ascii_case("error") || event == "response.failed");
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) {
+        if let Some(message) = sse_error_from_value(&value) {
+            return Some(message);
+        }
+        if event_is_error {
+            return Some(
+                value
+                    .get("message")
+                    .or_else(|| value.get("error").and_then(|error| error.get("message")))
+                    .and_then(|message| message.as_str())
+                    .unwrap_or("upstream returned an SSE error")
+                    .to_string(),
+            );
+        }
+    } else if event_is_error {
+        return Some("upstream returned an SSE error".to_string());
+    }
+    None
+}
+
+/// Interpret one terminal Responses event identically for buffered and live
+/// accounting. The envelope may carry the type independently of its JSON.
+fn sse_response_terminal_outcome(raw_event: &[u8]) -> Option<Result<Option<UsageMetrics>, String>> {
+    if let Some(message) = sse_terminal_error_from_event(raw_event) {
+        return Some(Err(message));
+    }
+    if sse_event_parts(raw_event).1.trim() == "[DONE]" {
+        return Some(Ok(None));
+    }
+    let value = sse_event_json_value(raw_event)?;
+    if !is_terminal_responses_success_event(&value) {
+        return None;
+    }
+    let metrics = usage_metrics_from_response_value(value.get("response")?);
+    Some(Ok(metrics.raw_usage.is_some().then_some(metrics)))
+}
+
+fn sse_response_body_outcome(body: &Bytes) -> Result<Option<UsageMetrics>, String> {
+    if let Some(message) = sse_error_message(body) {
+        return Err(message);
+    }
+    if let Some(usage) = usage_metrics_from_sse_response_body(body) {
+        return Ok(Some(usage));
+    }
+    if sse_response_events(body)
+        .any(|event| sse_response_terminal_outcome(event).is_some_and(|outcome| outcome.is_ok()))
+    {
+        return Ok(None);
+    }
+    Err("upstream SSE stream ended before a terminal response event".to_string())
 }
 
 type ReqwestByteStream =
@@ -12819,7 +15699,11 @@ async fn read_sse_prelude(
         let chunk = match next {
             Some(Ok(chunk)) => chunk,
             Some(Err(err)) => return Err(format!("upstream stream read failed: {}", err)),
-            None => return Err("upstream stream ended before producing a response".to_string()),
+            None => {
+                return Err(sse_terminal_error_from_event(&parser).unwrap_or_else(|| {
+                    "upstream stream ended before producing a response".to_string()
+                }))
+            }
         };
         prefix.extend_from_slice(&chunk);
         parser.extend_from_slice(&chunk);
@@ -12830,28 +15714,19 @@ async fn read_sse_prelude(
         while let Some((event_end, delimiter_len)) = find_sse_event_boundary(&parser) {
             let raw_event = parser.split_to(event_end + delimiter_len);
             let event = &raw_event[..event_end];
-            let text = String::from_utf8_lossy(event);
-            let data = text
-                .lines()
-                .filter_map(|line| {
-                    line.trim_end_matches('\r')
-                        .strip_prefix("data:")
-                        .map(str::trim_start)
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+            if let Some(message) = sse_terminal_error_from_event(event) {
+                return Err(message);
+            }
+            let (_, data) = sse_event_parts(event);
             if data.is_empty() {
                 continue;
             }
             if data == "[DONE]" {
                 return Ok(prefix.freeze());
             }
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) else {
+            let Some(value) = sse_event_json_value(event) else {
                 continue;
             };
-            if let Some(message) = sse_error_from_value(&value) {
-                return Err(message);
-            }
             let event_type = value
                 .get("type")
                 .and_then(|value| value.as_str())
@@ -12869,7 +15744,7 @@ async fn read_sse_prelude(
 async fn proxy(
     State(state): State<AppState>,
     method: Method,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     OriginalUri(uri): OriginalUri,
     body: Body,
 ) -> impl IntoResponse {
@@ -12877,26 +15752,26 @@ async fn proxy(
     let source_api = detect_source_api(&raw_path);
 
     let Some(authenticated) = authenticate_api_key(&state, &headers) else {
-        return if matches!(source_api, SourceApi::V1) {
-            (
-                StatusCode::UNAUTHORIZED,
-                [(
-                    axum::http::header::CONTENT_TYPE.as_str(),
-                    "application/json",
-                )],
-                openai_error_body(
-                    "Missing bearer authentication in header",
-                    "invalid_request_error",
-                    None,
-                ),
-            )
-                .into_response()
-        } else {
-            (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
-        };
+        return api_key_authentication_error_response(source_api);
     };
     let mut state = state;
     state.request_api_key_id = authenticated.id.clone();
+    state.request_source_api = source_api;
+    state.request_api_key_quota = api_key_quota_runtime::request_context(&state);
+
+    // Provider adapters are also exposed as internal route handlers and
+    // defensively call `check_api_key`.  The outer proxy has already
+    // authenticated and applied this key's complete policy before reserving
+    // a budget.  Mark this one in-process hop with the per-process secret so
+    // a concurrent revoke cannot turn the adapter's redundant recheck into a
+    // local 401 that strands the reservation.  `should_drop_incoming_header`
+    // removes this header before every upstream request.
+    insert_internal_proxy_header(&mut headers, state.internal_proxy_secret.as_str());
+    // These headers select retained ChatGPT state and the upstream account.
+    // They are gateway-controlled routing inputs, never client-controlled
+    // request metadata.  Strip them before any route or adapter sees the
+    // request; `apply_default_headers` also overwrites them defensively.
+    strip_client_controlled_codex_routing_headers(&mut headers);
 
     let body_bytes =
         match read_request_body(&state.cfg, source_api, &raw_path, &headers, body).await {
@@ -12904,51 +15779,128 @@ async fn proxy(
             Err(response) => return response,
         };
 
+    // The raw bytes are the only thing available before routing.  A content
+    // encoding other than identity means the JSON below would describe the
+    // compressed envelope (or fail to parse it), not the model-visible
+    // request the upstream may reconstruct.  Do not let an input policy
+    // treat that as a known zero-token request.
+    let has_unmeasurable_content_encoding =
+        !body_bytes.is_empty() && request_has_non_identity_content_encoding(&headers);
+
     let routed = match route_request(&raw_path, &uri, &method, &headers, body_bytes) {
         Ok(r) => r,
         Err(e) => {
-            return if matches!(source_api, SourceApi::V1) {
-                (
-                    e.status,
-                    [(
-                        axum::http::header::CONTENT_TYPE.as_str(),
-                        "application/json",
-                    )],
-                    openai_error_body(e.message, "invalid_request_error", None),
-                )
-                    .into_response()
-            } else {
-                (e.status, e.message).into_response()
-            };
+            return source_error_response(
+                source_api,
+                e.status,
+                e.message,
+                "invalid_request_error",
+                None,
+                "invalid_request_error",
+            );
         }
     };
     if let Some(provider) = target_provider_access_key(routed.target) {
         if !authenticated.access.allows_provider(provider) {
-            return if matches!(source_api, SourceApi::V1) {
-                (
-                    StatusCode::FORBIDDEN,
-                    [(
-                        axum::http::header::CONTENT_TYPE.as_str(),
-                        "application/json",
-                    )],
-                    openai_error_body(
-                        &format!("API key does not have access to {}", provider),
-                        "permission_error",
-                        None,
-                    ),
-                )
-                    .into_response()
-            } else {
-                (StatusCode::FORBIDDEN, "API key provider access denied").into_response()
-            };
+            queue_api_key_local_policy_denial(
+                &state,
+                &raw_path,
+                Some(provider),
+                None,
+                api_key_policy_store::ApiKeyPolicyDecision::ScopeDenied,
+                StatusCode::FORBIDDEN,
+                None,
+                None,
+            );
+            return source_error_response(
+                source_api,
+                StatusCode::FORBIDDEN,
+                format!("API key does not have access to {}", provider),
+                "permission_error",
+                None,
+                "permission_error",
+            );
         }
     }
-    let request_value_for_limits: Option<serde_json::Value> =
-        serde_json::from_slice(&routed.upstream_body).ok();
-    let prompt_for_limits = request_value_for_limits
+    // Only creation/generation requests submit model-visible input. Status,
+    // retrieval, and deletion routes may legally carry an ignored body at
+    // the HTTP layer; treating that body as prompt input used to create a
+    // budget hold that no adapter could ever settle.
+    let request_carries_model_input = routed_request_carries_model_input(&method);
+    let request_value_for_limits: Option<serde_json::Value> = request_carries_model_input
+        .then(|| serde_json::from_slice(&routed.upstream_body).ok())
+        .flatten();
+    // A nonempty routed body that is not JSON is opaque to the conservative
+    // byte accounting model.  This covers compressed payloads, multipart or
+    // binary request bodies, and malformed JSON.  Under a cap or cumulative
+    // budget, fail closed instead of silently reserving/charging zero.
+    let has_opaque_routed_body =
+        request_carries_model_input && api_key_input_body_is_opaque(&routed.upstream_body);
+    let model_for_limits = request_value_for_limits
         .as_ref()
-        .map(prompt_metrics_from_request_value)
-        .unwrap_or_default();
+        .and_then(model_from_request_value);
+    let prompt_for_limits = if request_carries_model_input {
+        policy_prompt_metrics_for_routed_request(&state, &routed)
+    } else {
+        PromptMetrics::default()
+    };
+    state.request_api_key_audit =
+        unbudgeted_api_key_request_audit(&authenticated, &raw_path, &prompt_for_limits);
+    if api_key_has_input_policy(&authenticated.access)
+        && ((request_carries_model_input && has_unmeasurable_content_encoding)
+            || has_opaque_routed_body)
+    {
+        queue_api_key_local_policy_denial(
+            &state,
+            &raw_path,
+            target_provider_access_key(routed.target),
+            None,
+            api_key_policy_store::ApiKeyPolicyDecision::MeasurementRequired,
+            StatusCode::BAD_REQUEST,
+            None,
+            Some(api_key_policy_store::ApiKeyInputMeasurement::Unknown),
+        );
+        return api_key_measurement_required_response(source_api);
+    }
+    if request_carries_model_input {
+        if let Err(message) = validate_generation_request_body(
+            &routed.upstream_path,
+            &routed.upstream_body,
+            has_unmeasurable_content_encoding,
+        ) {
+            queue_api_key_local_policy_denial(
+                &state,
+                &raw_path,
+                target_provider_access_key(routed.target),
+                None,
+                api_key_policy_store::ApiKeyPolicyDecision::Failed,
+                StatusCode::BAD_REQUEST,
+                None,
+                None,
+            );
+            return source_error_response(
+                source_api,
+                StatusCode::BAD_REQUEST,
+                message,
+                "invalid_request_error",
+                Some("invalid_request_body"),
+                "invalid_request_error",
+            );
+        }
+    }
+    if prompt_for_limits.requires_measurement() && api_key_has_input_policy(&authenticated.access) {
+        queue_api_key_local_policy_denial(
+            &state,
+            &raw_path,
+            target_provider_access_key(routed.target),
+            model_for_limits.as_deref(),
+            api_key_policy_store::ApiKeyPolicyDecision::MeasurementRequired,
+            StatusCode::BAD_REQUEST,
+            None,
+            Some(api_key_policy_store::ApiKeyInputMeasurement::Unknown),
+        );
+        return api_key_measurement_required_response(source_api);
+    }
     if let Some(response) = api_key_prompt_limit_response(
         source_api,
         &authenticated.access,
@@ -12956,6 +15908,16 @@ async fn proxy(
         None,
         prompt_for_limits.estimated_input_tokens(),
     ) {
+        queue_api_key_local_policy_denial(
+            &state,
+            &raw_path,
+            None,
+            model_for_limits.as_deref(),
+            api_key_policy_store::ApiKeyPolicyDecision::RequestLimitExceeded,
+            StatusCode::TOO_MANY_REQUESTS,
+            Some(prompt_for_limits.estimated_input_tokens()),
+            Some(api_key_policy_store::ApiKeyInputMeasurement::Conservative),
+        );
         return response;
     }
     if let Some(provider) = target_provider_access_key(routed.target) {
@@ -12966,6 +15928,16 @@ async fn proxy(
             None,
             prompt_for_limits.estimated_input_tokens(),
         ) {
+            queue_api_key_local_policy_denial(
+                &state,
+                &raw_path,
+                Some(provider),
+                model_for_limits.as_deref(),
+                api_key_policy_store::ApiKeyPolicyDecision::RequestLimitExceeded,
+                StatusCode::TOO_MANY_REQUESTS,
+                Some(prompt_for_limits.estimated_input_tokens()),
+                Some(api_key_policy_store::ApiKeyInputMeasurement::Conservative),
+            );
             return response;
         }
     }
@@ -12976,21 +15948,151 @@ async fn proxy(
         routed.target,
         prompt_for_limits.estimated_input_tokens(),
     ) {
+        queue_api_key_local_policy_denial(
+            &state,
+            &raw_path,
+            target_provider_access_key(routed.target),
+            model_for_limits.as_deref(),
+            api_key_policy_store::ApiKeyPolicyDecision::RequestLimitExceeded,
+            StatusCode::TOO_MANY_REQUESTS,
+            Some(prompt_for_limits.estimated_input_tokens()),
+            Some(api_key_policy_store::ApiKeyInputMeasurement::Conservative),
+        );
         return response;
+    }
+    // Cumulative budgets are reserved before dispatch.  The reservation uses
+    // the same conservative full-request bound as the per-request limit and
+    // is later settled by the usage/error path (or conservatively retained if
+    // the upstream outcome is ambiguous).
+    if let (Some(api_key_id), Some(budget)) = (
+        authenticated.id.as_ref(),
+        authenticated.access.input_token_budget.clone(),
+    ) {
+        let estimated_input_tokens = prompt_for_limits.estimated_input_tokens();
+        if estimated_input_tokens > 0 {
+            let context = ApiKeyBudgetReservationContext {
+                reservation_id: Uuid::new_v4().simple().to_string(),
+                request_id: Uuid::new_v4().simple().to_string(),
+                api_key_id: api_key_id.clone(),
+                request_path: raw_path.clone(),
+                provider: target_provider_access_key(routed.target).map(str::to_string),
+                model: model_for_limits.clone(),
+                estimated_input_tokens,
+                budget: budget.clone(),
+                lifecycle: Arc::new(ApiKeyBudgetReservationLifecycle::default()),
+            };
+            match reserve_api_key_input_budget(state.cfg.clone(), context.clone(), budget).await {
+                Ok(context) => {
+                    queue_api_key_policy_audit(
+                        &state,
+                        api_key_policy_store::ApiKeyRequestAuditEvent {
+                            request_id: context.request_id.clone(),
+                            api_key_id: context.api_key_id.clone(),
+                            kind: api_key_policy_store::ApiKeyPolicyEventKind::Dispatch,
+                            decision: api_key_policy_store::ApiKeyPolicyDecision::Allowed,
+                            request_path: context.request_path.clone(),
+                            provider: context.provider.clone(),
+                            model: context.model.clone(),
+                            account_key: None,
+                            status_code: None,
+                            estimated_input_tokens: Some(context.estimated_input_tokens),
+                            actual_input_tokens: None,
+                            measurement: Some(
+                                api_key_policy_store::ApiKeyInputMeasurement::Conservative,
+                            ),
+                            reservation_id: Some(context.reservation_id.clone()),
+                        },
+                    );
+                    state.request_api_key_budget = Some(context);
+                }
+                Err(ApiKeyBudgetReservationError::Denied(denied)) => {
+                    queue_api_key_policy_audit(
+                        &state,
+                        api_key_policy_store::ApiKeyRequestAuditEvent {
+                            request_id: context.request_id,
+                            api_key_id: context.api_key_id,
+                            kind: api_key_policy_store::ApiKeyPolicyEventKind::Authorization,
+                            decision: api_key_policy_store::ApiKeyPolicyDecision::BudgetExceeded,
+                            request_path: context.request_path,
+                            provider: context.provider,
+                            model: context.model,
+                            account_key: None,
+                            status_code: Some(StatusCode::TOO_MANY_REQUESTS.as_u16()),
+                            estimated_input_tokens: Some(context.estimated_input_tokens),
+                            actual_input_tokens: None,
+                            measurement: Some(
+                                api_key_policy_store::ApiKeyInputMeasurement::Conservative,
+                            ),
+                            reservation_id: Some(context.reservation_id),
+                        },
+                    );
+                    return source_error_response(
+                        source_api,
+                        StatusCode::TOO_MANY_REQUESTS,
+                        format!(
+                            "API key input-token budget exceeded: {} committed + {} reserved + {} requested exceeds {} for {}",
+                            denied.committed_input_tokens,
+                            denied.reserved_input_tokens,
+                            denied.requested_input_tokens,
+                            denied.budget_limit,
+                            match denied.period {
+                                api_keys::ApiKeyBudgetPeriod::Lifetime => "lifetime",
+                                api_keys::ApiKeyBudgetPeriod::CalendarMonth => "the current calendar month",
+                            }
+                        ),
+                        "rate_limit_error",
+                        Some("input_token_budget_exceeded"),
+                        "rate_limit_error",
+                    );
+                }
+                Err(ApiKeyBudgetReservationError::Storage(err)) => {
+                    error!("failed to reserve API-key input budget: {}", err);
+                    return source_error_response(
+                        source_api,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Unable to check API key input-token budget safely",
+                        "server_error",
+                        None,
+                        "api_error",
+                    );
+                }
+            }
+        }
     }
     match routed.target {
         TargetModel::CodexModels => {
+            // Catalog requests do not submit model-visible input. A malformed
+            // but JSON GET/HEAD body could otherwise have created a budget
+            // hold above even though this branch never dispatches that body.
+            queue_api_key_budget_settlement(
+                &state,
+                api_key_policy_store::ApiKeyInputTokenSettlement::Release,
+                api_key_policy_store::ApiKeyPolicyDecision::Cancelled,
+                None,
+            );
             let state = scoped_state_for_api_key_access(
                 state,
                 &authenticated.access,
-                Some(TargetModel::Codex),
+                // The Codex model response includes gateway-provided aliases
+                // for other providers. Scope every account collection before
+                // building that catalog, not only the raw Codex fetcher.
+                None,
             );
-            return codex_models_response(state, headers).await;
+            return codex_models_response(state, headers, &authenticated.access).await;
         }
         TargetModel::UnifiedV1Models => {
+            // See the matching Codex catalog branch above. A model catalog
+            // lookup is not a billable input request for this API key.
+            queue_api_key_budget_settlement(
+                &state,
+                api_key_policy_store::ApiKeyInputTokenSettlement::Release,
+                api_key_policy_store::ApiKeyPolicyDecision::Cancelled,
+                None,
+            );
             return unified_v1_models_response(
                 state,
                 headers,
+                source_api,
                 &routed.upstream_path,
                 &authenticated.access,
             )
@@ -13000,6 +16102,8 @@ async fn proxy(
             return custom_model_response(
                 state,
                 headers,
+                source_api,
+                &raw_path,
                 &routed.upstream_path,
                 routed.upstream_body,
                 routed.response_mode,
@@ -13010,10 +16114,33 @@ async fn proxy(
         }
         _ => {}
     }
+    // A budget hold has already been made at this point.  Check the concrete
+    // provider/account route before handing it to an adapter: adapters cannot
+    // always distinguish an empty scoped account set from an upstream error,
+    // and a deterministic local refusal must release the hold rather than
+    // charging a request that was never dispatched.
+    if let Err(response) = preflight_api_key_target_dispatch(
+        &state,
+        &authenticated.access,
+        routed.target,
+        prompt_for_limits.estimated_input_tokens(),
+        source_api,
+        &raw_path,
+        model_for_limits.as_deref(),
+    ) {
+        return response;
+    }
     let state = scoped_state_for_api_key_request(
         state,
         &authenticated.access,
-        Some(routed.target),
+        // A native Codex models request is augmented later with gateway
+        // provider aliases, so carry the full account scope in that state.
+        // Other target collections are unused for ordinary Codex dispatch.
+        if routed.target == TargetModel::Codex {
+            None
+        } else {
+            Some(routed.target)
+        },
         Some(prompt_for_limits.estimated_input_tokens()),
     );
     match routed.target {
@@ -13173,6 +16300,25 @@ async fn proxy(
     };
     let token_candidates = candidate_tokens_with_reservation(&state, true);
     if token_candidates.is_empty() {
+        // Account state can change between the targeted preflight above and
+        // candidate selection.  This is still a local, pre-dispatch refusal,
+        // so do not leave its conservative budget reservation active.
+        queue_api_key_local_policy_denial(
+            &state,
+            &raw_path,
+            Some("codex"),
+            model_for_limits.as_deref(),
+            api_key_policy_store::ApiKeyPolicyDecision::NoEligibleAccount,
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some(prompt_for_limits.estimated_input_tokens()),
+            Some(api_key_policy_store::ApiKeyInputMeasurement::Conservative),
+        );
+        queue_api_key_budget_settlement(
+            &state,
+            api_key_policy_store::ApiKeyInputTokenSettlement::Release,
+            api_key_policy_store::ApiKeyPolicyDecision::NoEligibleAccount,
+            None,
+        );
         return codex_error_response(
             source_api,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -13197,8 +16343,6 @@ async fn proxy(
             routed.upstream_path.clone(),
             prompt.clone(),
         );
-        record_codex_request(&state, &codex_context);
-
         let body_bytes = target::codex::gateway::build_request_body(
             &method,
             &routed.upstream_path,
@@ -13206,6 +16350,19 @@ async fn proxy(
             routed.upstream_body.clone(),
             &session_id,
         );
+        if routed_request_carries_model_input(&method) {
+            if let Err(response) = reserve_api_key_budgets_for_prepared_dispatch(
+                &state,
+                "codex",
+                &codex_context.key,
+                &body_bytes,
+            )
+            .await
+            {
+                return response;
+            }
+        }
+        record_codex_request(&state, &codex_context);
         let mut req = state
             .client
             .request(method.clone(), upstream.clone())
@@ -13311,23 +16468,29 @@ async fn proxy(
                     break;
                 }
             };
-            if let Some(message) = sse_error_message(&body_bytes) {
-                let affects_account_health = codex_error_affects_account_health(&message);
-                record_codex_error_with_health(
-                    &state,
-                    &codex_context,
-                    &message,
-                    affects_account_health,
-                );
-                last_error = Some((StatusCode::BAD_GATEWAY, message.clone()));
-                if affects_account_health && attempt_idx + 1 < token_candidates.len() {
-                    continue;
+            let usage = match sse_response_body_outcome(&body_bytes) {
+                Ok(usage) => usage,
+                Err(message) => {
+                    let affects_account_health = codex_error_affects_account_health(&message);
+                    record_codex_error_with_health(
+                        &state,
+                        &codex_context,
+                        &message,
+                        affects_account_health,
+                    );
+                    last_error = Some((StatusCode::BAD_GATEWAY, message.clone()));
+                    if affects_account_health && attempt_idx + 1 < token_candidates.len() {
+                        continue;
+                    }
+                    let status = codex_error_status_from_message(&message, StatusCode::BAD_GATEWAY);
+                    return codex_error_response(source_api, status, message);
                 }
-                let status = codex_error_status_from_message(&message, StatusCode::BAD_GATEWAY);
-                return codex_error_response(source_api, status, message);
+            };
+            if let Some(metrics) = usage {
+                record_usage_success(&state, &codex_context, &metrics);
+            } else {
+                record_request_completed_with_unknown_usage(&state, &codex_context);
             }
-            let metrics = usage_metrics_from_sse_response_body(&body_bytes).unwrap_or_default();
-            record_usage_success(&state, &codex_context, &metrics);
             return (
                 status,
                 [("Content-Type", "application/json")],
@@ -13416,23 +16579,11 @@ async fn proxy(
             Ok(b) => b,
             Err(err) => {
                 error!("upstream error body read failed: {}", err);
-                return if matches!(source_api, SourceApi::V1) {
-                    (
-                        StatusCode::BAD_GATEWAY,
-                        [(
-                            axum::http::header::CONTENT_TYPE.as_str(),
-                            "application/json",
-                        )],
-                        openai_error_body("Upstream error", "server_error", None),
-                    )
-                        .into_response()
-                } else {
-                    (
-                        StatusCode::BAD_GATEWAY,
-                        "upstream error (failed to read body)",
-                    )
-                        .into_response()
-                };
+                return codex_error_response(
+                    source_api,
+                    StatusCode::BAD_GATEWAY,
+                    "upstream error (failed to read body)",
+                );
             }
         };
         return if matches!(source_api, SourceApi::V1) {
@@ -13458,22 +16609,28 @@ async fn proxy(
             Err(err) => {
                 error!("upstream body read failed: {}", err);
                 record_codex_error(&state, &codex_context, "failed to read upstream body");
-                return (StatusCode::BAD_GATEWAY, "upstream error").into_response();
+                return codex_error_response(source_api, StatusCode::BAD_GATEWAY, "upstream error");
             }
         };
-        if let Some(message) = sse_error_message(&body_bytes) {
-            let status = codex_error_status_from_message(&message, StatusCode::BAD_GATEWAY);
-            let affects_account_health = codex_error_affects_account_health(&message);
-            record_codex_error_with_health(
-                &state,
-                &codex_context,
-                &message,
-                affects_account_health,
-            );
-            return codex_error_response(source_api, status, message);
+        let usage = match sse_response_body_outcome(&body_bytes) {
+            Ok(usage) => usage,
+            Err(message) => {
+                let status = codex_error_status_from_message(&message, StatusCode::BAD_GATEWAY);
+                let affects_account_health = codex_error_affects_account_health(&message);
+                record_codex_error_with_health(
+                    &state,
+                    &codex_context,
+                    &message,
+                    affects_account_health,
+                );
+                return codex_error_response(source_api, status, message);
+            }
+        };
+        if let Some(metrics) = usage {
+            record_usage_success(&state, &codex_context, &metrics);
+        } else {
+            record_request_completed_with_unknown_usage(&state, &codex_context);
         }
-        let metrics = usage_metrics_from_sse_response_body(&body_bytes).unwrap_or_default();
-        record_usage_success(&state, &codex_context, &metrics);
         let json_body = sse_to_response_json(&body_bytes);
         let mut headers = out_headers;
         headers.insert(
@@ -13492,7 +16649,7 @@ async fn proxy(
                     return (StatusCode::BAD_GATEWAY, "upstream error").into_response();
                 }
             };
-            let body_bytes = augment_codex_models_json(&body_bytes, &state);
+            let body_bytes = augment_codex_models_json(&body_bytes, &state, &authenticated.access);
             let mut headers = out_headers;
             headers.insert(
                 axum::http::header::CONTENT_TYPE,
@@ -13602,6 +16759,84 @@ async fn proxy(
         );
     }
     (status, out_headers, body).into_response()
+}
+
+/// The public API routes that can carry model-visible input are POST-only.
+/// In particular, `/v1/responses/{id}` GET/DELETE and `/v1/videos/{id}` GET
+/// are non-generation operations even if a client sends a stray JSON body.
+/// Keeping this deliberately method-based also makes future status/delete
+/// routes bodyless for API-key caps and budgets by default.
+fn routed_request_carries_model_input(method: &Method) -> bool {
+    *method == Method::POST
+}
+
+fn validate_generation_request_body(
+    path: &str,
+    body: &[u8],
+    encoded: bool,
+) -> Result<(), &'static str> {
+    if encoded {
+        return Err("Generation requests require an uncompressed JSON body");
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| "Generation request body must be valid JSON")?;
+    if !value.is_object() {
+        return Err("Generation request body must be a JSON object");
+    }
+    if matches!(
+        path,
+        "responses" | "responses/compact" | "chat/completions" | "messages"
+    ) && !value
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|model| !model.trim().is_empty())
+    {
+        return Err("Generation request requires a non-empty model string");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod billable_request_method_tests {
+    use super::{routed_request_carries_model_input, validate_generation_request_body};
+    use axum::http::Method;
+
+    #[test]
+    fn ignored_bodies_on_retrieval_and_deletion_routes_are_not_prompt_input() {
+        assert!(!routed_request_carries_model_input(&Method::GET));
+        assert!(!routed_request_carries_model_input(&Method::DELETE));
+        assert!(!routed_request_carries_model_input(&Method::HEAD));
+        assert!(routed_request_carries_model_input(&Method::POST));
+    }
+
+    #[test]
+    fn renewable_request_only_quota_cannot_anchor_on_malformed_generations() {
+        for invalid in [
+            b"{".as_slice(),
+            b"",
+            b"null",
+            b"[]",
+            b"42",
+            br#""text""#,
+            br#"{}"#,
+            br#"{"model":null}"#,
+            br#"{"model":" "}"#,
+            br#"{"input":"no model"}"#,
+        ] {
+            assert!(validate_generation_request_body("responses", invalid, false).is_err());
+        }
+        let valid = br#"{"model":"cod:gpt-5","input":"hello"}"#;
+        assert!(validate_generation_request_body("responses", valid, false).is_ok());
+        assert!(validate_generation_request_body("responses", valid, true).is_err());
+        // Some media APIs have their own default model; their adapters perform
+        // provider-specific validation before taking a quota reservation.
+        assert!(validate_generation_request_body(
+            "images/generations",
+            br#"{"prompt":"hello"}"#,
+            false
+        )
+        .is_ok());
+    }
 }
 
 fn request_body_limit_layer(cfg: &Config) -> axum::extract::DefaultBodyLimit {
@@ -13737,25 +16972,29 @@ fn oversized_request_body_response(
             Bytes::from(serde_json::to_vec(&body).unwrap_or_default()),
         )
             .into_response()
+    } else if matches!(source_api, SourceApi::Claude) {
+        source_error_response(
+            source_api,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            message,
+            "invalid_request_error",
+            Some("request_body_too_large"),
+            "invalid_request_error",
+        )
     } else {
         (StatusCode::PAYLOAD_TOO_LARGE, message).into_response()
     }
 }
 
 fn invalid_request_body_response(source_api: SourceApi) -> Response {
-    if matches!(source_api, SourceApi::V1) {
-        (
-            StatusCode::BAD_REQUEST,
-            [(
-                axum::http::header::CONTENT_TYPE.as_str(),
-                "application/json",
-            )],
-            openai_error_body("Invalid request body", "invalid_request_error", None),
-        )
-            .into_response()
-    } else {
-        (StatusCode::BAD_REQUEST, "invalid body").into_response()
-    }
+    source_error_response(
+        source_api,
+        StatusCode::BAD_REQUEST,
+        "Invalid request body",
+        "invalid_request_error",
+        None,
+        "invalid_request_error",
+    )
 }
 
 #[cfg(test)]
@@ -14021,9 +17260,197 @@ fn codex_live_stream_response(
     (status, out_headers, Body::from_stream(stream)).into_response()
 }
 
+/// A custom alias can fan out to targets with different provider, account,
+/// and limit eligibility. Keep local-policy outcomes separate so an account
+/// cap is never rendered as a scope denial, and an unavailable route is never
+/// rendered as a rate limit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CustomAliasPreflightOutcome {
+    ScopeDenied,
+    RequestLimitExceeded,
+    NoEligibleAccount,
+}
+
+fn custom_alias_preflight_decision(
+    outcomes: &[CustomAliasPreflightOutcome],
+) -> CustomAliasPreflightOutcome {
+    let has_limit = outcomes
+        .iter()
+        .any(|outcome| *outcome == CustomAliasPreflightOutcome::RequestLimitExceeded);
+    let has_unavailable = outcomes
+        .iter()
+        .any(|outcome| *outcome == CustomAliasPreflightOutcome::NoEligibleAccount);
+    if has_limit && !has_unavailable {
+        CustomAliasPreflightOutcome::RequestLimitExceeded
+    } else if has_unavailable {
+        CustomAliasPreflightOutcome::NoEligibleAccount
+    } else {
+        // A custom model with no enabled targets is an operational routing
+        // issue, not permission denial.
+        if outcomes.is_empty() {
+            CustomAliasPreflightOutcome::NoEligibleAccount
+        } else {
+            CustomAliasPreflightOutcome::ScopeDenied
+        }
+    }
+}
+
+fn custom_alias_preflight_status(outcome: CustomAliasPreflightOutcome) -> StatusCode {
+    match outcome {
+        CustomAliasPreflightOutcome::ScopeDenied => StatusCode::FORBIDDEN,
+        CustomAliasPreflightOutcome::RequestLimitExceeded => StatusCode::TOO_MANY_REQUESTS,
+        CustomAliasPreflightOutcome::NoEligibleAccount => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+#[cfg(test)]
+mod managed_test_api_policy_tests {
+    use super::{
+        admin_test_policy_mode, api_key_target_preflight_outcome, custom_alias_preflight_decision,
+        custom_alias_preflight_status, managed_api_key_profile_from_store, AdminTestApiRequest,
+        ApiKeyTargetPreflightOutcome, CustomAliasPreflightOutcome, ManagedTestApiKeyLookupError,
+    };
+    use crate::api_keys::{ApiKeyRecord, ApiKeySource, ApiKeyStore};
+    use axum::http::StatusCode;
+
+    fn test_record(id: &str, source: ApiKeySource, revoked: bool) -> ApiKeyRecord {
+        ApiKeyRecord {
+            id: id.to_string(),
+            source,
+            revoked_at: revoked.then(|| "2026-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn managed_test_mode_uses_only_an_active_managed_key_profile() {
+        let store = ApiKeyStore {
+            keys: vec![
+                test_record("managed", ApiKeySource::Managed, false),
+                test_record("revoked", ApiKeySource::Managed, true),
+                test_record("legacy", ApiKeySource::LegacyConfig, false),
+            ],
+        };
+
+        let profile = managed_api_key_profile_from_store(&store, " managed ").unwrap();
+        assert_eq!(profile.id.as_deref(), Some("managed"));
+        assert!(matches!(
+            managed_api_key_profile_from_store(&store, "revoked"),
+            Err(ManagedTestApiKeyLookupError::Revoked)
+        ));
+        assert!(matches!(
+            managed_api_key_profile_from_store(&store, "legacy"),
+            Err(ManagedTestApiKeyLookupError::NotManaged)
+        ));
+        assert!(matches!(
+            managed_api_key_profile_from_store(&store, "missing"),
+            Err(ManagedTestApiKeyLookupError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn test_api_accepts_only_key_ids_and_declares_bypass_mode() {
+        let request: AdminTestApiRequest = serde_json::from_value(serde_json::json!({
+            "model": "cod:test",
+            "prompt": "hello",
+            "api_key_id": "managed"
+        }))
+        .unwrap();
+        assert_eq!(request.api_key_id.as_deref(), Some("managed"));
+        assert_eq!(admin_test_policy_mode(Some("managed")), "managed_api_key");
+        assert_eq!(admin_test_policy_mode(None), "operator_bypass");
+
+        // Do not silently accept a field that invites an operator to send a
+        // secret into a browser request or dashboard log.
+        assert!(
+            serde_json::from_value::<AdminTestApiRequest>(serde_json::json!({
+                "model": "cod:test",
+                "prompt": "hello",
+                "api_key": "plaintext-secret"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn custom_alias_preflight_keeps_scope_limits_and_availability_distinct() {
+        let scope = custom_alias_preflight_decision(&[CustomAliasPreflightOutcome::ScopeDenied]);
+        assert_eq!(custom_alias_preflight_status(scope), StatusCode::FORBIDDEN);
+
+        let capped = custom_alias_preflight_decision(&[
+            CustomAliasPreflightOutcome::ScopeDenied,
+            CustomAliasPreflightOutcome::RequestLimitExceeded,
+        ]);
+        assert_eq!(
+            custom_alias_preflight_status(capped),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        let unavailable = custom_alias_preflight_decision(&[
+            CustomAliasPreflightOutcome::RequestLimitExceeded,
+            CustomAliasPreflightOutcome::NoEligibleAccount,
+        ]);
+        assert_eq!(
+            custom_alias_preflight_status(unavailable),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            custom_alias_preflight_status(custom_alias_preflight_decision(&[])),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn direct_target_preflight_keeps_scope_caps_and_availability_distinct() {
+        assert_eq!(
+            api_key_target_preflight_outcome(false, false, false, false, false),
+            ApiKeyTargetPreflightOutcome::NoEligibleAccount
+        );
+        assert_eq!(
+            api_key_target_preflight_outcome(true, false, false, false, false),
+            ApiKeyTargetPreflightOutcome::ScopeDenied
+        );
+        assert_eq!(
+            api_key_target_preflight_outcome(true, true, false, false, false),
+            ApiKeyTargetPreflightOutcome::NoEligibleAccount
+        );
+        assert_eq!(
+            api_key_target_preflight_outcome(true, true, true, false, false),
+            ApiKeyTargetPreflightOutcome::RequestLimitExceeded
+        );
+        assert_eq!(
+            api_key_target_preflight_outcome(true, true, true, true, true),
+            ApiKeyTargetPreflightOutcome::Allowed
+        );
+    }
+}
+
+/// Render a custom-alias routing failure in the client protocol that entered
+/// the gateway. Custom aliases are reachable from the OpenAI, Codex, and
+/// Claude compatibility surfaces, so their local failures must not always
+/// look like OpenAI errors.
+fn custom_model_error_response(
+    source_api: SourceApi,
+    status: StatusCode,
+    message: impl AsRef<str>,
+    openai_type: &str,
+    openai_code: Option<&str>,
+) -> Response {
+    source_error_response(
+        source_api,
+        status,
+        message,
+        openai_type,
+        openai_code,
+        anthropic_error_type_for_status(status),
+    )
+}
+
 async fn custom_model_response(
     state: AppState,
     headers: HeaderMap,
+    source_api: SourceApi,
+    request_path: &str,
     upstream_path: &str,
     body: Bytes,
     response_mode: ResponseMode,
@@ -14031,27 +17458,37 @@ async fn custom_model_response(
     prompt: PromptMetrics,
 ) -> axum::response::Response {
     if upstream_path != "responses" {
-        return (
+        queue_api_key_budget_settlement(
+            &state,
+            api_key_policy_store::ApiKeyInputTokenSettlement::Release,
+            api_key_policy_store::ApiKeyPolicyDecision::Failed,
+            None,
+        );
+        return custom_model_error_response(
+            source_api,
             StatusCode::BAD_REQUEST,
-            [("Content-Type", "application/json")],
-            openai_error_body(
-                "custom models currently support /responses requests",
-                "invalid_request_error",
-                None,
-            ),
-        )
-            .into_response();
+            "custom models currently support /responses requests",
+            "invalid_request_error",
+            None,
+        );
     }
 
     let request_value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => {
-            return (
+            queue_api_key_budget_settlement(
+                &state,
+                api_key_policy_store::ApiKeyInputTokenSettlement::Release,
+                api_key_policy_store::ApiKeyPolicyDecision::Failed,
+                None,
+            );
+            return custom_model_error_response(
+                source_api,
                 StatusCode::BAD_REQUEST,
-                [("Content-Type", "application/json")],
-                openai_error_body("Invalid request body", "invalid_request_error", None),
-            )
-                .into_response();
+                "Invalid request body",
+                "invalid_request_error",
+                None,
+            );
         }
     };
     let alias = request_value
@@ -14060,121 +17497,214 @@ async fn custom_model_response(
         .map(custom_models::normalize_alias)
         .unwrap_or_default();
     if alias.is_empty() {
-        return (
+        queue_api_key_budget_settlement(
+            &state,
+            api_key_policy_store::ApiKeyInputTokenSettlement::Release,
+            api_key_policy_store::ApiKeyPolicyDecision::Failed,
+            None,
+        );
+        return custom_model_error_response(
+            source_api,
             StatusCode::BAD_REQUEST,
-            [("Content-Type", "application/json")],
-            openai_error_body(
-                "custom model alias is required",
-                "invalid_request_error",
-                None,
-            ),
-        )
-            .into_response();
+            "custom model alias is required",
+            "invalid_request_error",
+            None,
+        );
     }
 
     let Some(custom_model) = find_custom_model(&state, &alias) else {
-        return (
+        queue_api_key_budget_settlement(
+            &state,
+            api_key_policy_store::ApiKeyInputTokenSettlement::Release,
+            api_key_policy_store::ApiKeyPolicyDecision::Failed,
+            None,
+        );
+        return custom_model_error_response(
+            source_api,
             StatusCode::NOT_FOUND,
-            [("Content-Type", "application/json")],
-            openai_error_body(
-                &format!("The custom model '{}' does not exist", alias),
-                "invalid_request_error",
-                Some("model_not_found"),
-            ),
-        )
-            .into_response();
+            format!("The custom model '{}' does not exist", alias),
+            "invalid_request_error",
+            Some("model_not_found"),
+        );
     };
     if !custom_model.enabled {
-        return (
+        queue_api_key_local_policy_denial(
+            &state,
+            request_path,
+            None,
+            Some(alias.as_str()),
+            api_key_policy_store::ApiKeyPolicyDecision::NoEligibleAccount,
             StatusCode::SERVICE_UNAVAILABLE,
-            [("Content-Type", "application/json")],
-            openai_error_body(
-                &format!("The custom model '{}' is disabled", alias),
-                "server_error",
-                None,
-            ),
-        )
-            .into_response();
+            Some(prompt.estimated_input_tokens()),
+            Some(api_key_policy_store::ApiKeyInputMeasurement::Conservative),
+        );
+        queue_api_key_budget_settlement(
+            &state,
+            api_key_policy_store::ApiKeyInputTokenSettlement::Release,
+            api_key_policy_store::ApiKeyPolicyDecision::NoEligibleAccount,
+            None,
+        );
+        return custom_model_error_response(
+            source_api,
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("The custom model '{}' is disabled", alias),
+            "server_error",
+            None,
+        );
     }
 
     let prompt_tokens = prompt.estimated_input_tokens();
-    let candidates = custom_model_candidate_order(&state, &custom_model)
-        .into_iter()
-        .filter(|candidate| {
-            target_provider_access_key(source::v1::provider::target_from_model(&candidate.model))
-                .is_some_and(|provider| {
-                    access.allows_provider(provider)
-                        && api_key_prompt_limit_violation(
-                            access,
-                            Some(provider),
-                            None,
-                            prompt_tokens,
-                        )
-                        .is_none()
-                })
-        })
-        .collect::<Vec<_>>();
-    if candidates.is_empty() {
-        return (
-            StatusCode::FORBIDDEN,
-            [("Content-Type", "application/json")],
-            openai_error_body(
-                &format!(
-                    "API key does not have access to any target for custom model '{}'",
-                    alias
-                ),
-                "permission_error",
-                None,
-            ),
-        )
-            .into_response();
-    }
-
+    let candidates = custom_model_candidate_order(&state, &custom_model);
+    let mut preflight_outcomes = Vec::new();
     let mut failures = Vec::new();
+    let mut had_dispatchable_target = false;
+
     for (idx, candidate) in candidates.iter().enumerate() {
         let is_last = idx + 1 == candidates.len();
+        let candidate_label = custom_models::target_label(candidate);
         let target = source::v1::provider::target_from_model(&candidate.model);
-        if matches!(
-            target,
-            TargetModel::Custom | TargetModel::CodexModels | TargetModel::UnifiedV1Models
-        ) {
-            failures.push(format!("{}: unsupported target", candidate.model));
+        let Some(provider) = target_provider_access_key(target) else {
+            preflight_outcomes.push(CustomAliasPreflightOutcome::NoEligibleAccount);
+            failures.push(format!("{}: unsupported target", candidate_label));
+            continue;
+        };
+        // See `preflight_api_key_target_dispatch`: an old display alias in
+        // an account-level cap cannot be matched safely after canonical
+        // selector enforcement.  This candidate may not bypass that cap; a
+        // different custom-alias target can still be used if its own policy
+        // is fully resolvable.
+        if api_key_has_unresolved_account_limit(access, provider) {
+            preflight_outcomes.push(CustomAliasPreflightOutcome::ScopeDenied);
+            failures.push(format!(
+                "{}: API key has an unresolved legacy account input-token limit",
+                candidate_label
+            ));
             continue;
         }
-
-        let candidate_label = custom_models::target_label(candidate);
+        if !access.allows_provider(provider) {
+            preflight_outcomes.push(CustomAliasPreflightOutcome::ScopeDenied);
+            failures.push(format!(
+                "{}: API key provider scope denied",
+                candidate_label
+            ));
+            continue;
+        }
         let candidate_body = match rewrite_request_model(&body, &candidate.model) {
             Ok(body) => body,
             Err(err) => {
+                preflight_outcomes.push(CustomAliasPreflightOutcome::NoEligibleAccount);
                 failures.push(format!("{}: {}", candidate_label, err));
                 continue;
             }
         };
-        let scoped_state =
+        // The alias itself never reaches an upstream model. Re-measure after
+        // substituting the configured target model (and, for Claude, after
+        // its deterministic provider transformation) before every
+        // provider/account limit decision.
+        let candidate_prompt =
+            match policy_prompt_metrics_for_custom_target(target, &candidate_body) {
+                Some(prompt) => prompt,
+                None => {
+                    preflight_outcomes.push(CustomAliasPreflightOutcome::NoEligibleAccount);
+                    failures.push(format!(
+                        "{}: unable to safely measure rewritten target request",
+                        candidate_label
+                    ));
+                    continue;
+                }
+            };
+        let candidate_prompt_tokens = candidate_prompt.estimated_input_tokens();
+        if api_key_prompt_limit_violation(access, Some(provider), None, candidate_prompt_tokens)
+            .is_some()
+        {
+            preflight_outcomes.push(CustomAliasPreflightOutcome::RequestLimitExceeded);
+            failures.push(format!(
+                "{}: API key provider input-token limit exceeded",
+                candidate_label
+            ));
+            continue;
+        }
+        let alias_scoped =
             match scoped_state_for_custom_target_account(state.clone(), target, candidate) {
                 Ok(state) => state,
                 Err(err) => {
+                    preflight_outcomes.push(CustomAliasPreflightOutcome::NoEligibleAccount);
                     failures.push(format!("{}: {}", candidate_label, err));
                     continue;
                 }
             };
-        let scoped_state = scoped_state_for_api_key_request(
-            scoped_state,
+        if !target_has_configured_accounts(&alias_scoped, target) {
+            preflight_outcomes.push(CustomAliasPreflightOutcome::NoEligibleAccount);
+            failures.push(format!(
+                "{}: no configured account matched the alias route",
+                candidate_label
+            ));
+            continue;
+        }
+
+        // Separate account authorization from account request caps. Applying
+        // both in one filter used to turn an all-account-cap condition into a
+        // 403 scope denial, and allowed disabled/cooling accounts to distort
+        // the result.
+        let account_scoped =
+            scoped_state_for_api_key_access(alias_scoped.clone(), access, Some(target));
+        if !target_has_configured_accounts(&account_scoped, target) {
+            preflight_outcomes.push(CustomAliasPreflightOutcome::ScopeDenied);
+            failures.push(format!("{}: API key account scope denied", candidate_label));
+            continue;
+        }
+        if !target_has_dispatchable_account(&account_scoped, target) {
+            preflight_outcomes.push(CustomAliasPreflightOutcome::NoEligibleAccount);
+            failures.push(format!(
+                "{}: no enabled healthy account is available",
+                candidate_label
+            ));
+            continue;
+        }
+        let limited_state = scoped_state_for_api_key_request(
+            account_scoped,
             access,
             Some(target),
-            Some(prompt_tokens),
+            Some(candidate_prompt_tokens),
         );
-        let response = dispatch_custom_target(
-            scoped_state,
-            headers.clone(),
-            upstream_path,
-            target,
-            candidate_body,
-            response_mode,
-        )
-        .await;
+        if !target_has_configured_accounts(&limited_state, target)
+            || !target_has_dispatchable_account(&limited_state, target)
+        {
+            preflight_outcomes.push(CustomAliasPreflightOutcome::RequestLimitExceeded);
+            failures.push(format!(
+                "{}: all eligible accounts exceed the API key input-token limit",
+                candidate_label
+            ));
+            continue;
+        }
+
+        had_dispatchable_target = true;
+        // A provider adapter can reject this candidate while converting a
+        // valid generic request into its provider-native payload. Retain the
+        // shared reservation until the alias router decides whether another
+        // candidate will dispatch.
+        let response = {
+            let _release_guard = defer_api_key_budget_release_for_custom_target(&state);
+            dispatch_custom_target(
+                limited_state,
+                headers.clone(),
+                source_api,
+                upstream_path,
+                target,
+                candidate_body,
+                response_mode,
+            )
+            .await
+        };
         let status = response.status();
-        if status.is_success() || !should_custom_model_fallback(status) || is_last {
+        if status.is_success() {
+            return response;
+        }
+        if !should_custom_model_fallback(status) || is_last {
+            release_api_key_budget_if_no_custom_target_dispatched(
+                &state,
+                api_key_policy_store::ApiKeyPolicyDecision::Failed,
+            );
             return response;
         }
 
@@ -14195,20 +17725,72 @@ async fn custom_model_response(
         ));
     }
 
-    (
-        StatusCode::BAD_GATEWAY,
-        [("Content-Type", "application/json")],
-        openai_error_body(
-            &format!(
-                "All targets failed for custom model '{}': {}",
-                alias,
-                failures.join(" | ")
+    if !had_dispatchable_target {
+        let outcome = custom_alias_preflight_decision(&preflight_outcomes);
+        let status = custom_alias_preflight_status(outcome);
+        let (decision, error_type, code, message) = match outcome {
+            CustomAliasPreflightOutcome::ScopeDenied => (
+                api_key_policy_store::ApiKeyPolicyDecision::ScopeDenied,
+                "permission_error",
+                None,
+                format!(
+                    "API key does not have access to any target for custom model '{}'",
+                    alias
+                ),
             ),
-            "server_error",
+            CustomAliasPreflightOutcome::RequestLimitExceeded => (
+                api_key_policy_store::ApiKeyPolicyDecision::RequestLimitExceeded,
+                "rate_limit_error",
+                Some("token_limit_exceeded"),
+                format!(
+                    "All permitted targets for custom model '{}' exceed this API key's input-token limit",
+                    alias
+                ),
+            ),
+            CustomAliasPreflightOutcome::NoEligibleAccount => (
+                api_key_policy_store::ApiKeyPolicyDecision::NoEligibleAccount,
+                "server_error",
+                None,
+                format!(
+                    "No enabled healthy upstream account is available for custom model '{}'",
+                    alias
+                ),
+            ),
+        };
+        queue_api_key_local_policy_denial(
+            &state,
+            request_path,
             None,
+            Some(alias.as_str()),
+            decision,
+            status,
+            Some(prompt_tokens),
+            Some(api_key_policy_store::ApiKeyInputMeasurement::Conservative),
+        );
+        queue_api_key_budget_settlement(
+            &state,
+            api_key_policy_store::ApiKeyInputTokenSettlement::Release,
+            decision,
+            None,
+        );
+        return custom_model_error_response(source_api, status, &message, error_type, code);
+    }
+
+    release_api_key_budget_if_no_custom_target_dispatched(
+        &state,
+        api_key_policy_store::ApiKeyPolicyDecision::Failed,
+    );
+    custom_model_error_response(
+        source_api,
+        StatusCode::BAD_GATEWAY,
+        format!(
+            "All targets failed for custom model '{}': {}",
+            alias,
+            failures.join(" | ")
         ),
+        "server_error",
+        None,
     )
-        .into_response()
 }
 
 fn find_custom_model(state: &AppState, alias: &str) -> Option<custom_models::CustomModel> {
@@ -14647,6 +18229,121 @@ fn account_filter_matches(filter: &str, values: impl IntoIterator<Item = String>
             .any(|value| value.eq_ignore_ascii_case(filter))
 }
 
+/// API-key account scopes deliberately use one canonical, stable identifier
+/// per configured credential.  The more permissive alias matcher below is
+/// still useful for operator-owned custom routing, but it is unsafe as an
+/// authorization boundary: labels and emails can be shared by two saved
+/// credentials.
+fn api_key_canonical_account_selector_matches(
+    provider: &str,
+    canonical_key: &str,
+    selector: &str,
+) -> bool {
+    let canonical_key = canonical_key.trim();
+    let selector = selector.trim();
+    !selector.is_empty()
+        && selector == canonical_key
+        && is_stable_api_key_account_selector(provider, canonical_key)
+}
+
+/// Stable selectors are the account keys emitted by the gateway when a
+/// credential has an account identity, credential file, or provider-stable
+/// fallback identifier.  Label-based keys are intentionally excluded: labels
+/// are display text and can collide across credentials.
+fn is_stable_api_key_account_selector(provider: &str, selector: &str) -> bool {
+    let selector = selector.trim();
+    let Some(rest) = selector.strip_prefix(&format!("{}:", provider.trim())) else {
+        return false;
+    };
+    let Some((kind, value)) = rest.split_once(':') else {
+        return false;
+    };
+    if value.trim().is_empty() {
+        return false;
+    }
+
+    match provider {
+        "codex" => matches!(kind, "account_id" | "file"),
+        "agw" => matches!(kind, "email" | "file" | "project"),
+        "gemini" => matches!(kind, "email" | "file"),
+        "qwen" => matches!(kind, "subject" | "email" | "file" | "resource"),
+        "deepseek" => matches!(kind, "account_id" | "file"),
+        "grok" => matches!(kind, "user_id" | "email" | "file"),
+        "minimax" => matches!(kind, "account_id" | "file"),
+        "copilot" => matches!(kind, "account_id" | "login" | "file"),
+        "claude" => matches!(kind, "organization" | "account_id" | "email" | "file"),
+        "glm" => matches!(kind, "account_id" | "file"),
+        _ => false,
+    }
+}
+
+fn codex_token_matches_api_key_account(token: &UpstreamToken, selector: &str) -> bool {
+    api_key_canonical_account_selector_matches("codex", &codex_stats_key(token), selector)
+}
+
+fn antigravity_account_matches_api_key_account(
+    account: &target::antigravity::accounts::AntigravityAccount,
+    selector: &str,
+) -> bool {
+    api_key_canonical_account_selector_matches("agw", &antigravity_stats_key(account), selector)
+}
+
+fn gemini_account_matches_api_key_account(
+    account: &target::gemini::accounts::GeminiAccount,
+    selector: &str,
+) -> bool {
+    api_key_canonical_account_selector_matches("gemini", &gemini_stats_key(account), selector)
+}
+
+fn qwen_account_matches_api_key_account(
+    account: &target::qwen::accounts::QwenAccount,
+    selector: &str,
+) -> bool {
+    api_key_canonical_account_selector_matches("qwen", &qwen_stats_key(account), selector)
+}
+
+fn deepseek_account_matches_api_key_account(
+    account: &target::deepseek::accounts::DeepSeekAccount,
+    selector: &str,
+) -> bool {
+    api_key_canonical_account_selector_matches("deepseek", &deepseek_stats_key(account), selector)
+}
+
+fn grok_account_matches_api_key_account(
+    account: &target::grok::accounts::GrokAccount,
+    selector: &str,
+) -> bool {
+    api_key_canonical_account_selector_matches("grok", &grok_stats_key(account), selector)
+}
+
+fn minimax_account_matches_api_key_account(
+    account: &target::minimax::accounts::MiniMaxAccount,
+    selector: &str,
+) -> bool {
+    api_key_canonical_account_selector_matches("minimax", &minimax_stats_key(account), selector)
+}
+
+fn copilot_account_matches_api_key_account(
+    account: &target::copilot::accounts::CopilotAccount,
+    selector: &str,
+) -> bool {
+    api_key_canonical_account_selector_matches("copilot", &copilot_stats_key(account), selector)
+}
+
+fn claude_account_matches_api_key_account(
+    account: &target::claude::accounts::ClaudeAccount,
+    selector: &str,
+) -> bool {
+    api_key_canonical_account_selector_matches("claude", &claude_stats_key(account), selector)
+}
+
+fn glm_account_matches_api_key_account(
+    account: &target::glm::accounts::GlmAccount,
+    selector: &str,
+) -> bool {
+    api_key_canonical_account_selector_matches("glm", &glm_stats_key(account), selector)
+}
+
 fn codex_token_matches_account(token: &UpstreamToken, filter: &str) -> bool {
     account_filter_matches(
         filter,
@@ -14818,9 +18515,9 @@ where
     if access.all {
         return true;
     }
-    access.provider_rule(provider).is_some_and(|rule| {
-        rule.accounts.is_empty() || rule.accounts.iter().any(|account| matches(account))
-    })
+    access
+        .provider_rule(provider)
+        .is_some_and(|rule| rule.allows_account(|account| matches(account)))
 }
 
 fn api_key_prompt_limit_response(
@@ -14832,19 +18529,1111 @@ fn api_key_prompt_limit_response(
 ) -> Option<Response> {
     let message =
         api_key_prompt_limit_violation(access, provider, account_limit, estimated_tokens)?;
-    Some(if matches!(source_api, SourceApi::V1) {
-        (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(
-                axum::http::header::CONTENT_TYPE.as_str(),
-                "application/json",
-            )],
-            openai_error_body(&message, "rate_limit_error", Some("token_limit_exceeded")),
-        )
-            .into_response()
-    } else {
-        (StatusCode::TOO_MANY_REQUESTS, message).into_response()
+    Some(source_error_response(
+        source_api,
+        StatusCode::TOO_MANY_REQUESTS,
+        message,
+        "rate_limit_error",
+        Some("token_limit_exceeded"),
+        "rate_limit_error",
+    ))
+}
+
+fn api_key_has_input_policy(access: &api_keys::ApiKeyAccess) -> bool {
+    access.prompt_token_limit.is_some()
+        || access.input_token_budget.is_some()
+        || access
+            .quota
+            .as_ref()
+            .is_some_and(|quota| quota.needs_input_measurement())
+        || access.providers.iter().any(|rule| {
+            rule.prompt_token_limit.is_some()
+                || rule
+                    .account_limits
+                    .iter()
+                    .any(|limit| limit.prompt_token_limit.is_some())
+        })
+}
+
+/// A persisted pre-canonicalization account cap must never be treated as a
+/// cap that simply happens not to match.  Stable selectors can safely stay in
+/// a key while their account is temporarily offline; any other selector needs
+/// an admin write, which can uniquely resolve it against the current account
+/// inventory or reject ambiguity.
+fn api_key_has_unresolved_account_limit(access: &api_keys::ApiKeyAccess, provider: &str) -> bool {
+    access.provider_rule(provider).is_some_and(|rule| {
+        rule.account_limits.iter().any(|limit| {
+            limit.prompt_token_limit.is_some()
+                && !is_stable_api_key_account_selector(provider, &limit.account)
+        })
     })
+}
+
+fn api_key_unresolved_account_limit_response(source_api: SourceApi, provider: &str) -> Response {
+    source_error_response(
+        source_api,
+        StatusCode::FORBIDDEN,
+        format!(
+            "API key has an unresolved legacy {} account input-token limit; an administrator must update it with a canonical account key before requests can be sent",
+            provider
+        ),
+        "permission_error",
+        None,
+        "permission_error",
+    )
+}
+
+/// Surface unsafe legacy records at startup as well as refusing them at every
+/// runtime dispatch.  Do not log the account selector itself: it can contain
+/// a provider email or a human label.
+fn warn_unresolved_legacy_api_key_account_limits(store: &api_keys::ApiKeyStore) {
+    for record in store
+        .keys
+        .iter()
+        .filter(|record| record.revoked_at.is_none())
+    {
+        for rule in &record.access.providers {
+            if api_key_has_unresolved_account_limit(&record.access, &rule.provider) {
+                warn!(
+                    api_key_id = %record.id,
+                    provider = %rule.provider,
+                    "API key has an unresolved legacy account input-token limit; provider dispatch will fail closed until the key is updated"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod unresolved_api_key_account_limit_tests {
+    use super::api_key_has_unresolved_account_limit;
+    use crate::api_keys::{
+        ApiKeyAccess, ApiKeyAccountLimit, ApiKeyAccountScope, ApiKeyProviderAccess,
+    };
+
+    fn access_with_codex_account_limit(selector: &str) -> ApiKeyAccess {
+        ApiKeyAccess {
+            all: false,
+            prompt_token_limit: None,
+            input_token_budget: None,
+            quota: None,
+            providers: vec![ApiKeyProviderAccess {
+                provider: "codex".to_string(),
+                account_scope: ApiKeyAccountScope::All,
+                accounts: Vec::new(),
+                prompt_token_limit: None,
+                account_limits: vec![ApiKeyAccountLimit {
+                    account: selector.to_string(),
+                    prompt_token_limit: Some(100),
+                }],
+            }],
+        }
+        .normalized()
+        .expect("valid restricted account-limit policy")
+    }
+
+    #[test]
+    fn unresolved_legacy_account_caps_fail_closed_while_offline_canonical_caps_remain_valid() {
+        // This is the legacy shape that used to match a credential filename
+        // as an alias. It must not silently become unlimited after runtime
+        // matching switched to canonical selectors.
+        let legacy = access_with_codex_account_limit("first.json");
+        assert!(api_key_has_unresolved_account_limit(&legacy, "codex"));
+
+        // A stable key is intentionally allowed even before its account is
+        // currently loaded, so a temporary credential outage does not erase
+        // the cap when that account returns.
+        let canonical = access_with_codex_account_limit("codex:file:offline.json");
+        assert!(!api_key_has_unresolved_account_limit(&canonical, "codex"));
+
+        // A key from another provider cannot identify a Codex account.
+        let wrong_provider = access_with_codex_account_limit("gemini:file:first.json");
+        assert!(api_key_has_unresolved_account_limit(
+            &wrong_provider,
+            "codex"
+        ));
+    }
+}
+
+/// Returns true when a request body cannot be assessed as the exact bytes the
+/// upstream will decode.  `identity` is the only content coding that leaves
+/// the input unchanged.  Invalid, empty, combined, or non-UTF-8 header values
+/// are deliberately treated as non-identity so a future coding cannot become
+/// a policy bypass.
+fn request_has_non_identity_content_encoding(headers: &HeaderMap) -> bool {
+    let values = headers.get_all(axum::http::header::CONTENT_ENCODING);
+    if values.iter().next().is_none() {
+        return false;
+    }
+
+    values.iter().any(|value| {
+        let Ok(value) = value.to_str() else {
+            return true;
+        };
+        let mut saw_encoding = false;
+        for encoding in value.split(',') {
+            let encoding = encoding.trim();
+            if encoding.is_empty() || !encoding.eq_ignore_ascii_case("identity") {
+                return true;
+            }
+            saw_encoding = true;
+        }
+        !saw_encoding
+    })
+}
+
+fn api_key_input_body_is_opaque(body: &[u8]) -> bool {
+    !body.is_empty() && serde_json::from_slice::<serde_json::Value>(body).is_err()
+}
+
+#[cfg(test)]
+mod api_key_input_measurement_guard_tests {
+    use super::{api_key_input_body_is_opaque, request_has_non_identity_content_encoding};
+    use axum::http::{header::CONTENT_ENCODING, HeaderMap, HeaderValue};
+
+    #[test]
+    fn non_identity_content_encodings_fail_closed() {
+        let mut identity = HeaderMap::new();
+        identity.insert(
+            CONTENT_ENCODING,
+            HeaderValue::from_static("identity, identity"),
+        );
+        assert!(!request_has_non_identity_content_encoding(&identity));
+
+        for encoding in ["gzip", "br", "identity, gzip", "", "unknown-coding"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_ENCODING, HeaderValue::from_str(encoding).unwrap());
+            assert!(
+                request_has_non_identity_content_encoding(&headers),
+                "{encoding:?} must not be treated as measurable identity bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_nonempty_bodies_cannot_be_zero_cost_input() {
+        assert!(!api_key_input_body_is_opaque(
+            br#"{"model":"gpt-test","input":"hi"}"#
+        ));
+        assert!(!api_key_input_body_is_opaque(b""));
+        assert!(api_key_input_body_is_opaque(b"not-json-at-all"));
+        // This is the compressed-looking binary shape that previously reached
+        // upstream with a zero-token policy measurement.
+        assert!(api_key_input_body_is_opaque(&[0x1f, 0x8b, 0x08, 0x00]));
+    }
+}
+
+fn api_key_measurement_required_response(source_api: SourceApi) -> Response {
+    source_error_response(
+        source_api,
+        StatusCode::BAD_REQUEST,
+        "Input-token policy cannot safely measure this request body, media, or retained remote context. Remove the unmeasurable input or use an API key without an input-token cap or budget.",
+        "invalid_request_error",
+        Some("prompt_measurement_required"),
+        "invalid_request_error",
+    )
+}
+
+/// Build a privacy-preserving authorization audit for a refusal that happens
+/// before an upstream adapter receives the request. Budget-backed requests
+/// keep their reservation request ID so their dispatch, denial, and
+/// settlement records remain correlated; other policy-only requests receive a
+/// fresh audit ID.
+fn api_key_local_denial_audit_event(
+    api_key_id: Option<&str>,
+    request_id: Option<&str>,
+    reservation_id: Option<&str>,
+    request_path: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+    decision: api_key_policy_store::ApiKeyPolicyDecision,
+    status: StatusCode,
+    estimated_input_tokens: Option<u64>,
+    measurement: Option<api_key_policy_store::ApiKeyInputMeasurement>,
+) -> Option<api_key_policy_store::ApiKeyRequestAuditEvent> {
+    let api_key_id = api_key_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let request_id = request_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("req_{}", Uuid::new_v4().simple()));
+    let optional_identifier = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    Some(api_key_policy_store::ApiKeyRequestAuditEvent {
+        request_id,
+        api_key_id: api_key_id.to_string(),
+        kind: api_key_policy_store::ApiKeyPolicyEventKind::Authorization,
+        decision,
+        request_path: request_path.to_string(),
+        provider: optional_identifier(provider),
+        model: optional_identifier(model),
+        account_key: None,
+        status_code: Some(status.as_u16()),
+        estimated_input_tokens,
+        actual_input_tokens: None,
+        measurement,
+        reservation_id: optional_identifier(reservation_id),
+    })
+}
+
+/// Queue a deterministic local API-key denial without affecting the response
+/// path. Internal adapter calls deliberately have no managed-key ID, so they
+/// do not create audit records.
+fn queue_api_key_local_policy_denial(
+    state: &AppState,
+    request_path: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+    decision: api_key_policy_store::ApiKeyPolicyDecision,
+    status: StatusCode,
+    estimated_input_tokens: Option<u64>,
+    measurement: Option<api_key_policy_store::ApiKeyInputMeasurement>,
+) {
+    let api_key_id = state.request_api_key_id.as_deref();
+    let reservation = state
+        .request_api_key_budget
+        .as_ref()
+        .filter(|context| Some(context.api_key_id.as_str()) == api_key_id);
+    let Some(event) = api_key_local_denial_audit_event(
+        api_key_id,
+        reservation.map(|context| context.request_id.as_str()),
+        reservation.map(|context| context.reservation_id.as_str()),
+        request_path,
+        provider,
+        model,
+        decision,
+        status,
+        estimated_input_tokens,
+        measurement,
+    ) else {
+        return;
+    };
+    queue_api_key_policy_audit(state, event);
+}
+
+fn queue_api_key_policy_audit(
+    state: &AppState,
+    event: api_key_policy_store::ApiKeyRequestAuditEvent,
+) {
+    if state
+        .persistence_tx
+        .send(PersistenceEvent::ApiKeyPolicyAudit(event))
+        .is_err()
+    {
+        error!("persistence worker is unavailable; API-key policy audit was dropped");
+    }
+}
+
+fn unbudgeted_api_key_request_audit(
+    authenticated: &AuthenticatedApiKey,
+    request_path: &str,
+    prompt: &PromptMetrics,
+) -> Option<Arc<api_key_request_audit::RequestAudit>> {
+    // Budgeted requests already emit dispatch/settlement events. Catalog and
+    // retrieval requests have no model input and must not become generations.
+    if authenticated.access.input_token_budget.is_some() || !prompt.is_prompt {
+        return None;
+    }
+    Some(Arc::new(api_key_request_audit::RequestAudit::new(
+        authenticated.id.clone()?,
+        request_path.to_string(),
+        prompt.estimated_input_tokens(),
+        prompt.complete,
+    )))
+}
+
+fn settle_unbudgeted_api_key_request_audit(
+    state: &AppState,
+    decision: api_key_policy_store::ApiKeyPolicyDecision,
+    actual_input_tokens: Option<u64>,
+) {
+    if let Some(event) = state
+        .request_api_key_audit
+        .as_ref()
+        .and_then(|audit| audit.settle(decision, actual_input_tokens))
+    {
+        queue_api_key_policy_audit(state, event);
+    }
+}
+
+#[cfg(test)]
+mod api_key_local_policy_audit_tests {
+    use super::{
+        api_key_local_denial_audit_event, unbudgeted_api_key_request_audit, AuthenticatedApiKey,
+        PromptMetrics,
+    };
+    use crate::api_key_policy_store::{
+        ApiKeyInputMeasurement, ApiKeyPolicyDecision, ApiKeyPolicyEventKind,
+    };
+    use axum::http::StatusCode;
+
+    #[test]
+    fn allowed_generation_audit_covers_cap_only_without_duplicating_budget_events() {
+        let prompt = PromptMetrics {
+            is_prompt: true,
+            complete: true,
+            estimated_input_tokens: 106,
+            ..Default::default()
+        };
+        let mut authenticated = AuthenticatedApiKey {
+            id: Some("cap-only".into()),
+            access: serde_json::from_value(serde_json::json!({
+                "all": true,
+                "max_estimated_input_tokens_per_request": 106
+            }))
+            .unwrap(),
+        };
+        let audit =
+            unbudgeted_api_key_request_audit(&authenticated, "/v1/responses", &prompt).unwrap();
+        assert_eq!(
+            audit.begin("deepseek", "account-one").unwrap().api_key_id,
+            "cap-only"
+        );
+        assert!(unbudgeted_api_key_request_audit(
+            &authenticated,
+            "/v1/models",
+            &PromptMetrics::default(),
+        )
+        .is_none());
+        authenticated.access.input_token_budget = Some(crate::api_keys::ApiKeyInputTokenBudget {
+            limit: 1000,
+            period: crate::api_keys::ApiKeyBudgetPeriod::Lifetime,
+        });
+        assert!(
+            unbudgeted_api_key_request_audit(&authenticated, "/v1/responses", &prompt).is_none()
+        );
+        authenticated.access.input_token_budget = None;
+        authenticated.id = None;
+        assert!(
+            unbudgeted_api_key_request_audit(&authenticated, "/v1/responses", &prompt).is_none()
+        );
+    }
+
+    #[test]
+    fn local_denial_audit_reuses_reservation_context_and_omits_secrets() {
+        let event = api_key_local_denial_audit_event(
+            Some("managed-key"),
+            Some("request-1"),
+            Some("reservation-1"),
+            "/v1/responses",
+            Some("claude"),
+            Some("cld:claude-sonnet"),
+            ApiKeyPolicyDecision::ScopeDenied,
+            StatusCode::FORBIDDEN,
+            Some(123),
+            Some(ApiKeyInputMeasurement::Conservative),
+        )
+        .unwrap();
+
+        assert_eq!(event.request_id, "request-1");
+        assert_eq!(event.api_key_id, "managed-key");
+        assert_eq!(event.kind, ApiKeyPolicyEventKind::Authorization);
+        assert_eq!(event.decision, ApiKeyPolicyDecision::ScopeDenied);
+        assert_eq!(event.status_code, Some(403));
+        assert_eq!(event.provider.as_deref(), Some("claude"));
+        assert_eq!(event.model.as_deref(), Some("cld:claude-sonnet"));
+        assert_eq!(event.estimated_input_tokens, Some(123));
+        assert_eq!(event.actual_input_tokens, None);
+        assert_eq!(event.reservation_id.as_deref(), Some("reservation-1"));
+    }
+
+    #[test]
+    fn local_denial_audit_skips_internal_requests_without_a_managed_key_id() {
+        assert!(api_key_local_denial_audit_event(
+            None,
+            None,
+            None,
+            "/v1/responses",
+            Some("codex"),
+            None,
+            ApiKeyPolicyDecision::NoEligibleAccount,
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
+            None,
+        )
+        .is_none());
+    }
+}
+
+fn queue_api_key_budget_settlement(
+    state: &AppState,
+    settlement: api_key_policy_store::ApiKeyInputTokenSettlement,
+    decision: api_key_policy_store::ApiKeyPolicyDecision,
+    actual_input_tokens: Option<u64>,
+) {
+    let Some(reservation) = state.request_api_key_budget.clone() else {
+        return;
+    };
+    match settlement {
+        // A commit is only requested for a completed request or an outcome
+        // that may have reached an upstream provider. Remember that fact for
+        // custom-model fallback handling even if the persistence worker is
+        // temporarily unavailable.
+        api_key_policy_store::ApiKeyInputTokenSettlement::Commit { .. } => {
+            reservation.lifecycle.mark_may_have_dispatched();
+        }
+        // An adapter's local validation/setup failure is safe to release only
+        // when it is the terminal route. A custom alias shares this hold over
+        // several candidates, so defer releases until the outer router knows
+        // that none of them dispatched.
+        api_key_policy_store::ApiKeyInputTokenSettlement::Release
+            if reservation.lifecycle.local_release_is_deferred() =>
+        {
+            return;
+        }
+        api_key_policy_store::ApiKeyInputTokenSettlement::Release => {}
+    }
+    queue_api_key_budget_context_settlement(
+        state,
+        reservation,
+        settlement,
+        decision,
+        actual_input_tokens,
+    );
+}
+
+fn queue_api_key_budget_context_settlement(
+    state: &AppState,
+    reservation: ApiKeyBudgetReservationContext,
+    settlement: api_key_policy_store::ApiKeyInputTokenSettlement,
+    decision: api_key_policy_store::ApiKeyPolicyDecision,
+    actual_input_tokens: Option<u64>,
+) {
+    if state
+        .persistence_tx
+        .send(PersistenceEvent::ApiKeyBudgetSettlement {
+            reservation,
+            settlement,
+            decision,
+            actual_input_tokens,
+        })
+        .is_err()
+    {
+        error!("persistence worker is unavailable; API-key budget settlement was deferred");
+    }
+}
+
+fn budget_context_for_dispatch_attempt(
+    original: &ApiKeyBudgetReservationContext,
+    attempt: ApiKeyBudgetDispatchAttempt,
+) -> ApiKeyBudgetReservationContext {
+    ApiKeyBudgetReservationContext {
+        reservation_id: attempt.reservation_id,
+        request_id: attempt.request_id,
+        api_key_id: attempt.api_key_id,
+        request_path: attempt.request_path,
+        provider: attempt.provider,
+        model: attempt.model,
+        estimated_input_tokens: attempt.estimated_input_tokens,
+        budget: original.budget.clone(),
+        lifecycle: original.lifecycle.clone(),
+    }
+}
+
+/// Settle precisely the hold assigned to the currently attempted upstream
+/// dispatch. The boolean says whether an attempt was consumed (including a
+/// release that was deferred for a custom-model fallback), so callers do not
+/// accidentally settle the original hold a second time.
+fn queue_active_api_key_budget_settlement(
+    state: &AppState,
+    settlement: api_key_policy_store::ApiKeyInputTokenSettlement,
+    decision: api_key_policy_store::ApiKeyPolicyDecision,
+    actual_input_tokens: Option<u64>,
+) -> bool {
+    let Some(original) = state.request_api_key_budget.as_ref() else {
+        return false;
+    };
+    match original.lifecycle.take_active_for_settlement(settlement) {
+        ApiKeyBudgetActiveSettlement::None => false,
+        ApiKeyBudgetActiveSettlement::Deferred => true,
+        ApiKeyBudgetActiveSettlement::Attempt(attempt) => {
+            if matches!(
+                settlement,
+                api_key_policy_store::ApiKeyInputTokenSettlement::Commit { .. }
+            ) {
+                original.lifecycle.mark_may_have_dispatched();
+            }
+            queue_api_key_budget_context_settlement(
+                state,
+                budget_context_for_dispatch_attempt(original, attempt),
+                settlement,
+                decision,
+                actual_input_tokens,
+            );
+            true
+        }
+    }
+}
+
+fn release_reusable_api_key_budget_dispatch_attempt(state: &AppState) -> bool {
+    let Some(original) = state.request_api_key_budget.as_ref() else {
+        return false;
+    };
+    let Some(attempt) = original.lifecycle.take_reusable_for_release() else {
+        return false;
+    };
+    queue_api_key_budget_context_settlement(
+        state,
+        budget_context_for_dispatch_attempt(original, attempt),
+        api_key_policy_store::ApiKeyInputTokenSettlement::Release,
+        api_key_policy_store::ApiKeyPolicyDecision::Failed,
+        None,
+    );
+    true
+}
+
+/// Keeps an API-key budget hold alive while one custom alias candidate is
+/// evaluated. The guard is intentionally scoped around dispatch only, so
+/// normal direct routes still release immediately on local failures.
+fn defer_api_key_budget_release_for_custom_target(
+    state: &AppState,
+) -> DeferredApiKeyBudgetReleaseGuard {
+    let lifecycle = state
+        .request_api_key_budget
+        .as_ref()
+        .map(|reservation| reservation.lifecycle.clone());
+    if let Some(lifecycle) = &lifecycle {
+        lifecycle.defer_local_release();
+    }
+    DeferredApiKeyBudgetReleaseGuard { lifecycle }
+}
+
+/// Returns true if this reservation has a terminal outcome that may have
+/// reached an upstream provider. In that case releasing it would undercount a
+/// potentially billable request, so the conservative hold is retained.
+fn api_key_budget_may_have_dispatched(state: &AppState) -> bool {
+    state
+        .request_api_key_budget
+        .as_ref()
+        .is_some_and(|reservation| reservation.lifecycle.may_have_dispatched())
+}
+
+fn release_api_key_budget_if_no_custom_target_dispatched(
+    state: &AppState,
+    decision: api_key_policy_store::ApiKeyPolicyDecision,
+) {
+    if !api_key_budget_may_have_dispatched(state) {
+        release_api_key_budget_before_dispatch_with_decision(state, decision);
+    }
+    // A later custom target may have failed locally after an earlier target
+    // was dispatched. Its distinct retry hold was never used and must not
+    // remain active merely because the original hold was correctly charged.
+    release_reusable_api_key_budget_dispatch_attempt(state);
+}
+
+#[cfg(test)]
+mod api_key_budget_lifecycle_tests {
+    use super::{
+        ApiKeyBudgetActiveSettlement, ApiKeyBudgetDispatchAttempt, ApiKeyBudgetDispatchBegin,
+        ApiKeyBudgetReservationLifecycle, DeferredApiKeyBudgetReleaseGuard,
+    };
+    use crate::api_key_policy_store::ApiKeyInputTokenSettlement;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    fn attempt(id: &str) -> ApiKeyBudgetDispatchAttempt {
+        ApiKeyBudgetDispatchAttempt {
+            reservation_id: id.to_string(),
+            request_id: "request-one".to_string(),
+            api_key_id: "key-one".to_string(),
+            request_path: "/v1/responses".to_string(),
+            provider: Some("codex".to_string()),
+            model: Some("gpt-test".to_string()),
+            estimated_input_tokens: 13,
+        }
+    }
+
+    #[test]
+    fn custom_candidate_guards_defer_local_release_until_the_last_candidate_finishes() {
+        let lifecycle = Arc::new(ApiKeyBudgetReservationLifecycle::default());
+        assert!(!lifecycle.local_release_is_deferred());
+        assert!(!lifecycle.may_have_dispatched());
+
+        lifecycle.defer_local_release();
+        let first = DeferredApiKeyBudgetReleaseGuard {
+            lifecycle: Some(lifecycle.clone()),
+        };
+        lifecycle.defer_local_release();
+        let second = DeferredApiKeyBudgetReleaseGuard {
+            lifecycle: Some(lifecycle.clone()),
+        };
+        assert!(lifecycle.local_release_is_deferred());
+
+        drop(first);
+        assert!(lifecycle.local_release_is_deferred());
+        drop(second);
+        assert!(!lifecycle.local_release_is_deferred());
+
+        lifecycle.mark_may_have_dispatched();
+        assert!(lifecycle.may_have_dispatched());
+    }
+
+    #[test]
+    fn retry_after_a_dispatched_attempt_requires_a_distinct_hold() {
+        let lifecycle = ApiKeyBudgetReservationLifecycle::default();
+        let original = attempt("hold-original");
+        assert!(matches!(
+            lifecycle.begin_dispatch(original.clone()),
+            ApiKeyBudgetDispatchBegin::Existing
+        ));
+        let first = match lifecycle.take_active_for_settlement(ApiKeyInputTokenSettlement::Commit {
+            actual_input_tokens: None,
+        }) {
+            ApiKeyBudgetActiveSettlement::Attempt(attempt) => attempt,
+            _ => panic!("first dispatch must own the original hold"),
+        };
+        assert_eq!(first.reservation_id, "hold-original");
+        assert!(matches!(
+            lifecycle.begin_dispatch(original),
+            ApiKeyBudgetDispatchBegin::AdditionalReservationNeeded
+        ));
+
+        let retry = attempt("hold-retry");
+        assert!(lifecycle.activate_additional_dispatch(retry.clone()));
+        let second =
+            match lifecycle.take_active_for_settlement(ApiKeyInputTokenSettlement::Commit {
+                actual_input_tokens: Some(9),
+            }) {
+                ApiKeyBudgetActiveSettlement::Attempt(attempt) => attempt,
+                _ => panic!("retry dispatch must own a distinct hold"),
+            };
+        assert_eq!(second.reservation_id, retry.reservation_id);
+        assert_ne!(first.reservation_id, second.reservation_id);
+    }
+
+    #[test]
+    fn pre_dispatch_retry_reuses_its_unspent_hold() {
+        let lifecycle = ApiKeyBudgetReservationLifecycle::default();
+        let original = attempt("hold-original");
+        assert!(matches!(
+            lifecycle.begin_dispatch(original.clone()),
+            ApiKeyBudgetDispatchBegin::Existing
+        ));
+        lifecycle.cancel_active_for_retry();
+        assert!(matches!(
+            lifecycle.begin_dispatch(original),
+            ApiKeyBudgetDispatchBegin::Existing
+        ));
+        let reused =
+            match lifecycle.take_active_for_settlement(ApiKeyInputTokenSettlement::Commit {
+                actual_input_tokens: Some(7),
+            }) {
+                ApiKeyBudgetActiveSettlement::Attempt(attempt) => attempt,
+                _ => panic!("retry must keep the original unspent hold"),
+            };
+        assert_eq!(reused.reservation_id, "hold-original");
+    }
+
+    #[test]
+    fn separately_reserved_retry_hold_is_budget_checked_before_dispatch() {
+        let directory = std::env::temp_dir().join(format!(
+            "io-gateway-retry-budget-lifecycle-{}",
+            Uuid::new_v4()
+        ));
+        let auth_dir = directory.join("auth");
+        std::fs::create_dir_all(&auth_dir).unwrap();
+        let cfg: crate::Config = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1:0",
+            "upstream_base": "https://example.test",
+            "proxy_api_key": "",
+            "tokens": [],
+            "auth_dir": auth_dir.to_string_lossy(),
+        }))
+        .unwrap();
+        let budget = crate::api_keys::ApiKeyInputTokenBudget {
+            limit: 20,
+            period: crate::api_keys::ApiKeyBudgetPeriod::Lifetime,
+        };
+        let reserve = |reservation_id: &str| {
+            crate::api_key_policy_store::reserve_input_tokens(
+                &cfg,
+                &crate::api_key_policy_store::ApiKeyInputTokenReservationRequest {
+                    reservation_id: reservation_id.to_string(),
+                    request_id: "client-request-one".to_string(),
+                    api_key_id: "managed-key-one".to_string(),
+                    budget: budget.clone(),
+                    reserved_input_tokens: 11,
+                },
+            )
+        };
+
+        assert!(matches!(
+            reserve("first-dispatch").unwrap(),
+            crate::api_key_policy_store::ApiKeyInputTokenReservationResult::Reserved { .. }
+        ));
+        let denied = reserve("retry-dispatch").unwrap();
+        assert!(matches!(
+            denied,
+            crate::api_key_policy_store::ApiKeyInputTokenReservationResult::Denied(ref value)
+                if value.committed_input_tokens == 0
+                    && value.reserved_input_tokens == 11
+                    && value.requested_input_tokens == 11
+        ));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+/// Release a hold only when no model-generation request has been sent to an
+/// upstream provider (for example, local validation or credential setup).
+pub(crate) fn release_api_key_budget_before_dispatch(state: &AppState) {
+    release_api_key_budget_before_dispatch_with_decision(
+        state,
+        api_key_policy_store::ApiKeyPolicyDecision::Failed,
+    );
+}
+
+fn release_api_key_budget_before_dispatch_with_decision(
+    state: &AppState,
+    decision: api_key_policy_store::ApiKeyPolicyDecision,
+) {
+    api_key_quota_runtime::release_before_dispatch(state);
+    if queue_active_api_key_budget_settlement(
+        state,
+        api_key_policy_store::ApiKeyInputTokenSettlement::Release,
+        decision,
+        None,
+    ) {
+        return;
+    }
+    if release_reusable_api_key_budget_dispatch_attempt(state) {
+        return;
+    }
+    // No provider attempt has been prepared yet. This is the normal local
+    // validation/configuration path and releases the original preflight hold.
+    if state
+        .request_api_key_budget
+        .as_ref()
+        .is_some_and(|reservation| !reservation.lifecycle.original_was_assigned())
+    {
+        queue_api_key_budget_settlement(
+            state,
+            api_key_policy_store::ApiKeyInputTokenSettlement::Release,
+            decision,
+            None,
+        );
+    }
+}
+
+/// Retain a conservative charge when a request may have reached the provider
+/// but its final usage signal is unavailable.
+pub(crate) fn commit_api_key_budget_unknown(state: &AppState) {
+    commit_api_key_budget_unknown_with_decision(
+        state,
+        api_key_policy_store::ApiKeyPolicyDecision::Failed,
+    );
+}
+
+fn commit_api_key_budget_unknown_with_decision(
+    state: &AppState,
+    decision: api_key_policy_store::ApiKeyPolicyDecision,
+) {
+    api_key_quota_runtime::settle_unknown(state);
+    settle_unbudgeted_api_key_request_audit(state, decision, None);
+    let settlement = api_key_policy_store::ApiKeyInputTokenSettlement::Commit {
+        actual_input_tokens: None,
+    };
+    if !queue_active_api_key_budget_settlement(state, settlement, decision, None)
+        && state
+            .request_api_key_budget
+            .as_ref()
+            .is_some_and(|reservation| !reservation.lifecycle.original_was_assigned())
+    {
+        // Defensive compatibility for an adapter that has not yet been
+        // converted to prepare a dispatch attempt. It remains conservative,
+        // while converted adapters settle their exact attempt above.
+        queue_api_key_budget_settlement(state, settlement, decision, None);
+    }
+}
+
+/// The upstream request completed, but its response did not contain a usable
+/// usage record. Finish account routing without treating the account as
+/// unhealthy, then retain the reservation conservatively rather than leaving
+/// an active hold for the stale-reservation sweeper.
+pub(crate) fn record_request_completed_with_unknown_usage(
+    state: &AppState,
+    context: &UsageContext,
+) {
+    router_request_finished_neutral(state, context.provider_name, &context.key);
+    commit_api_key_budget_unknown_with_decision(
+        state,
+        api_key_policy_store::ApiKeyPolicyDecision::Completed,
+    );
+    let observed_at = now_rfc3339();
+    update_account_counters(
+        state,
+        context.provider,
+        context.key.clone(),
+        context.label.clone(),
+        context.account_id.clone(),
+        CounterDelta {
+            observed_at: Some(observed_at.clone()),
+            success_at: Some(observed_at.clone()),
+            ..Default::default()
+        },
+    );
+    append_usage_history(
+        state,
+        completed_history_without_usage(context, state.request_api_key_id.clone(), observed_at),
+    );
+}
+
+fn completed_history_without_usage(
+    context: &UsageContext,
+    api_key_id: Option<String>,
+    recorded_at: String,
+) -> usage_store::UsageHistoryEntry {
+    usage_store::UsageHistoryEntry {
+        recorded_at,
+        provider: context.provider_name.to_string(),
+        account_key: context.key.clone(),
+        account_label: context.label.clone(),
+        account_id: context.account_id.clone(),
+        credential_file: context.credential_file.clone(),
+        model: context.model.clone(),
+        request_path: context.request_path.clone(),
+        api_key_id,
+        success: true,
+        error: false,
+        request_total: 1,
+        prompt_total: 1,
+        prompt_error_total: 0,
+        // These are additive history counters, not a measured zero. Preserve
+        // the missing-usage marker; policy settlement retains actual=None and
+        // conservatively charges the reservation independently of history.
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        cache_tokens: 0,
+        reasoning_tokens: 0,
+        input_chars: context.prompt.input_chars,
+        prompt_items: context.prompt.prompt_items,
+        error_message: None,
+        raw_usage: Some(serde_json::json!({"usage_unavailable": true})),
+    }
+}
+
+#[cfg(test)]
+mod unknown_usage_history_tests {
+    #[test]
+    fn completed_request_is_visible_without_fabricating_measured_usage() {
+        let context = super::UsageContext {
+            provider: super::Provider::Codex,
+            provider_name: "codex",
+            key: "account-one".into(),
+            label: "mock".into(),
+            account_id: "account-id".into(),
+            credential_file: None,
+            model: None,
+            request_path: "/v1/responses".into(),
+            prompt: super::PromptMetrics {
+                input_chars: 100,
+                prompt_items: 2,
+                is_prompt: true,
+                ..Default::default()
+            },
+        };
+        let entry = super::completed_history_without_usage(
+            &context,
+            Some("cap-only-key".into()),
+            "2026-09-20T00:00:00Z".into(),
+        );
+        assert!(entry.success && !entry.error);
+        assert_eq!(entry.request_total, 1);
+        assert_eq!(entry.api_key_id.as_deref(), Some("cap-only-key"));
+        assert_eq!(entry.input_chars, 100);
+        assert_eq!(entry.prompt_items, 2);
+        assert_eq!(entry.input_tokens, 0);
+        assert_eq!(
+            entry.raw_usage,
+            Some(serde_json::json!({"usage_unavailable": true}))
+        );
+        assert!(entry.error_message.is_none());
+    }
+}
+
+async fn reserve_api_key_input_budget(
+    cfg: Arc<Config>,
+    context: ApiKeyBudgetReservationContext,
+    budget: api_keys::ApiKeyInputTokenBudget,
+) -> Result<ApiKeyBudgetReservationContext, ApiKeyBudgetReservationError> {
+    let request = api_key_policy_store::ApiKeyInputTokenReservationRequest {
+        reservation_id: context.reservation_id.clone(),
+        request_id: context.request_id.clone(),
+        api_key_id: context.api_key_id.clone(),
+        budget,
+        reserved_input_tokens: context.estimated_input_tokens,
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        api_key_policy_store::reserve_input_tokens(&cfg, &request)
+    })
+    .await
+    .map_err(|err| ApiKeyBudgetReservationError::Storage(format!("budget worker failed: {}", err)))?
+    .map_err(ApiKeyBudgetReservationError::Storage)?;
+    match result {
+        api_key_policy_store::ApiKeyInputTokenReservationResult::Reserved { .. } => Ok(context),
+        api_key_policy_store::ApiKeyInputTokenReservationResult::Denied(denied) => {
+            Err(ApiKeyBudgetReservationError::Denied(denied))
+        }
+    }
+}
+
+fn queue_api_key_budget_dispatch_audit(state: &AppState, context: &ApiKeyBudgetReservationContext) {
+    queue_api_key_policy_audit(
+        state,
+        api_key_policy_store::ApiKeyRequestAuditEvent {
+            request_id: context.request_id.clone(),
+            api_key_id: context.api_key_id.clone(),
+            kind: api_key_policy_store::ApiKeyPolicyEventKind::Dispatch,
+            decision: api_key_policy_store::ApiKeyPolicyDecision::Allowed,
+            request_path: context.request_path.clone(),
+            provider: context.provider.clone(),
+            model: context.model.clone(),
+            account_key: None,
+            status_code: None,
+            estimated_input_tokens: Some(context.estimated_input_tokens),
+            actual_input_tokens: None,
+            measurement: Some(api_key_policy_store::ApiKeyInputMeasurement::Conservative),
+            reservation_id: Some(context.reservation_id.clone()),
+        },
+    );
+}
+
+/// Bind a durable managed-key budget hold to the next provider/account
+/// dispatch. The first actual dispatch consumes the original preflight hold;
+/// every later retry or custom-alias fallback receives a separate hold before
+/// it can send a prompt upstream. This is deliberately async because SQLite
+/// reservation checks must complete before the network request starts.
+pub(crate) async fn reserve_api_key_budget_for_upstream_dispatch(
+    state: &AppState,
+) -> Result<(), Response> {
+    let Some(original) = state.request_api_key_budget.clone() else {
+        return Ok(());
+    };
+
+    match original.lifecycle.begin_dispatch((&original).into()) {
+        ApiKeyBudgetDispatchBegin::Existing => return Ok(()),
+        ApiKeyBudgetDispatchBegin::AlreadyActive => {
+            error!(
+                request_id = %original.request_id,
+                "attempted a second upstream dispatch while the prior API-key budget attempt is active"
+            );
+            return Err(source_error_response(
+                state.request_source_api,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Unable to prepare API key input-token budget safely",
+                "server_error",
+                None,
+                "api_error",
+            ));
+        }
+        ApiKeyBudgetDispatchBegin::AdditionalReservationNeeded => {}
+    }
+
+    let context = ApiKeyBudgetReservationContext {
+        reservation_id: Uuid::new_v4().simple().to_string(),
+        // All attempts belong to one client request. Their distinct
+        // reservation IDs make both the budget total and the audit trail
+        // reflect every provider dispatch.
+        request_id: original.request_id.clone(),
+        api_key_id: original.api_key_id.clone(),
+        request_path: original.request_path.clone(),
+        provider: original.provider.clone(),
+        model: original.model.clone(),
+        estimated_input_tokens: original.estimated_input_tokens,
+        budget: original.budget.clone(),
+        lifecycle: original.lifecycle.clone(),
+    };
+
+    match reserve_api_key_input_budget(state.cfg.clone(), context.clone(), context.budget.clone())
+        .await
+    {
+        Ok(context) => {
+            queue_api_key_budget_dispatch_audit(state, &context);
+            let attempt = (&context).into();
+            if context.lifecycle.activate_additional_dispatch(attempt) {
+                Ok(())
+            } else {
+                // A conflicting dispatch should never happen in a sequential
+                // provider retry loop. Release this never-used extra hold and
+                // fail closed instead of risking an untracked request.
+                queue_api_key_budget_context_settlement(
+                    state,
+                    context,
+                    api_key_policy_store::ApiKeyInputTokenSettlement::Release,
+                    api_key_policy_store::ApiKeyPolicyDecision::Cancelled,
+                    None,
+                );
+                Err(source_error_response(
+                    state.request_source_api,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Unable to prepare API key input-token budget safely",
+                    "server_error",
+                    None,
+                    "api_error",
+                ))
+            }
+        }
+        Err(ApiKeyBudgetReservationError::Denied(denied)) => {
+            queue_api_key_policy_audit(
+                state,
+                api_key_policy_store::ApiKeyRequestAuditEvent {
+                    request_id: context.request_id,
+                    api_key_id: context.api_key_id,
+                    kind: api_key_policy_store::ApiKeyPolicyEventKind::Authorization,
+                    decision: api_key_policy_store::ApiKeyPolicyDecision::BudgetExceeded,
+                    request_path: context.request_path,
+                    provider: context.provider,
+                    model: context.model,
+                    account_key: None,
+                    status_code: Some(StatusCode::TOO_MANY_REQUESTS.as_u16()),
+                    estimated_input_tokens: Some(context.estimated_input_tokens),
+                    actual_input_tokens: None,
+                    measurement: Some(api_key_policy_store::ApiKeyInputMeasurement::Conservative),
+                    reservation_id: Some(context.reservation_id),
+                },
+            );
+            Err(source_error_response(
+                state.request_source_api,
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "API key input-token budget exceeded: {} committed + {} reserved + {} requested exceeds {} for {}",
+                    denied.committed_input_tokens,
+                    denied.reserved_input_tokens,
+                    denied.requested_input_tokens,
+                    denied.budget_limit,
+                    match denied.period {
+                        api_keys::ApiKeyBudgetPeriod::Lifetime => "lifetime",
+                        api_keys::ApiKeyBudgetPeriod::CalendarMonth => "the current calendar month",
+                    }
+                ),
+                "rate_limit_error",
+                Some("input_token_budget_exceeded"),
+                "rate_limit_error",
+            ))
+        }
+        Err(ApiKeyBudgetReservationError::Storage(err)) => {
+            error!(
+                request_id = %original.request_id,
+                "failed to reserve API-key budget for retry/fallback dispatch: {}",
+                err
+            );
+            Err(source_error_response(
+                state.request_source_api,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Unable to check API key input-token budget safely",
+                "server_error",
+                None,
+                "api_error",
+            ))
+        }
+    }
 }
 
 fn api_key_prompt_limit_violation(
@@ -14919,7 +19708,11 @@ fn api_key_account_prompt_limit_response_for_target(
                 access,
                 provider,
                 estimated_tokens,
-                |token, filter| codex_token_matches_account(token, filter),
+                |token, filter| codex_token_matches_api_key_account(token, filter),
+                |token| {
+                    token.enabled
+                        && router_account_eligible(state, provider, &codex_stats_key(token))
+                },
             )
         }
         TargetModel::Antigravity => {
@@ -14929,7 +19722,11 @@ fn api_key_account_prompt_limit_response_for_target(
                 access,
                 provider,
                 estimated_tokens,
-                |account, filter| antigravity_account_matches(account, filter),
+                |account, filter| antigravity_account_matches_api_key_account(account, filter),
+                |account| {
+                    account.enabled
+                        && router_account_eligible(state, provider, &antigravity_stats_key(account))
+                },
             )
         }
         TargetModel::Gemini => {
@@ -14939,7 +19736,11 @@ fn api_key_account_prompt_limit_response_for_target(
                 access,
                 provider,
                 estimated_tokens,
-                |account, filter| gemini_account_matches(account, filter),
+                |account, filter| gemini_account_matches_api_key_account(account, filter),
+                |account| {
+                    account.enabled
+                        && router_account_eligible(state, provider, &gemini_stats_key(account))
+                },
             )
         }
         TargetModel::Qwen => {
@@ -14949,7 +19750,11 @@ fn api_key_account_prompt_limit_response_for_target(
                 access,
                 provider,
                 estimated_tokens,
-                |account, filter| qwen_account_matches(account, filter),
+                |account, filter| qwen_account_matches_api_key_account(account, filter),
+                |account| {
+                    account.enabled
+                        && router_account_eligible(state, provider, &qwen_stats_key(account))
+                },
             )
         }
         TargetModel::DeepSeek => {
@@ -14959,7 +19764,11 @@ fn api_key_account_prompt_limit_response_for_target(
                 access,
                 provider,
                 estimated_tokens,
-                |account, filter| deepseek_account_matches(account, filter),
+                |account, filter| deepseek_account_matches_api_key_account(account, filter),
+                |account| {
+                    account.enabled
+                        && router_account_eligible(state, provider, &deepseek_stats_key(account))
+                },
             )
         }
         TargetModel::Grok => {
@@ -14969,7 +19778,11 @@ fn api_key_account_prompt_limit_response_for_target(
                 access,
                 provider,
                 estimated_tokens,
-                |account, filter| grok_account_matches(account, filter),
+                |account, filter| grok_account_matches_api_key_account(account, filter),
+                |account| {
+                    account.enabled
+                        && router_account_eligible(state, provider, &grok_stats_key(account))
+                },
             )
         }
         TargetModel::MiniMax => {
@@ -14979,7 +19792,11 @@ fn api_key_account_prompt_limit_response_for_target(
                 access,
                 provider,
                 estimated_tokens,
-                |account, filter| minimax_account_matches(account, filter),
+                |account, filter| minimax_account_matches_api_key_account(account, filter),
+                |account| {
+                    account.enabled
+                        && router_account_eligible(state, provider, &minimax_stats_key(account))
+                },
             )
         }
         TargetModel::Copilot => {
@@ -14989,7 +19806,11 @@ fn api_key_account_prompt_limit_response_for_target(
                 access,
                 provider,
                 estimated_tokens,
-                |account, filter| copilot_account_matches(account, filter),
+                |account, filter| copilot_account_matches_api_key_account(account, filter),
+                |account| {
+                    account.enabled
+                        && router_account_eligible(state, provider, &copilot_stats_key(account))
+                },
             )
         }
         TargetModel::Claude => {
@@ -14999,7 +19820,11 @@ fn api_key_account_prompt_limit_response_for_target(
                 access,
                 provider,
                 estimated_tokens,
-                |account, filter| claude_account_matches(account, filter),
+                |account, filter| claude_account_matches_api_key_account(account, filter),
+                |account| {
+                    account.enabled
+                        && router_account_eligible(state, provider, &claude_stats_key(account))
+                },
             )
         }
         TargetModel::Glm => {
@@ -15009,7 +19834,11 @@ fn api_key_account_prompt_limit_response_for_target(
                 access,
                 provider,
                 estimated_tokens,
-                |account, filter| glm_account_matches(account, filter),
+                |account, filter| glm_account_matches_api_key_account(account, filter),
+                |account| {
+                    account.enabled
+                        && router_account_eligible(state, provider, &glm_stats_key(account))
+                },
             )
         }
         TargetModel::CodexModels | TargetModel::Custom | TargetModel::UnifiedV1Models => None,
@@ -15024,15 +19853,17 @@ fn api_key_account_prompt_limit_response_for_target(
     )
 }
 
-fn api_key_account_prompt_limit_blocked<T, F>(
+fn api_key_account_prompt_limit_blocked<T, F, E>(
     accounts: &[T],
     access: &api_keys::ApiKeyAccess,
     provider: &str,
     estimated_tokens: u64,
     mut matches: F,
+    mut eligible: E,
 ) -> Option<u64>
 where
     F: FnMut(&T, &str) -> bool,
+    E: FnMut(&T) -> bool,
 {
     if estimated_tokens == 0 {
         return None;
@@ -15045,6 +19876,9 @@ where
     let mut saw_allowed_account = false;
     let mut strictest_blocked_limit = None;
     for account in accounts {
+        if !eligible(account) {
+            continue;
+        }
         if !api_key_rule_allows_account(access, provider, |filter| matches(account, filter)) {
             continue;
         }
@@ -15105,11 +19939,11 @@ fn scoped_state_for_api_key_request(
                 .iter()
                 .filter(|token| {
                     api_key_rule_allows_account(access, "codex", |account| {
-                        codex_token_matches_account(token, account)
+                        codex_token_matches_api_key_account(token, account)
                     }) && api_key_account_prompt_limit_allows(
                         access,
                         "codex",
-                        |account| codex_token_matches_account(token, account),
+                        |account| codex_token_matches_api_key_account(token, account),
                         estimated_prompt_tokens,
                     )
                 })
@@ -15126,11 +19960,11 @@ fn scoped_state_for_api_key_request(
                 .iter()
                 .filter(|account| {
                     api_key_rule_allows_account(access, "agw", |filter| {
-                        antigravity_account_matches(account, filter)
+                        antigravity_account_matches_api_key_account(account, filter)
                     }) && api_key_account_prompt_limit_allows(
                         access,
                         "agw",
-                        |filter| antigravity_account_matches(account, filter),
+                        |filter| antigravity_account_matches_api_key_account(account, filter),
                         estimated_prompt_tokens,
                     )
                 })
@@ -15147,11 +19981,11 @@ fn scoped_state_for_api_key_request(
                 .iter()
                 .filter(|account| {
                     api_key_rule_allows_account(access, "gemini", |filter| {
-                        gemini_account_matches(account, filter)
+                        gemini_account_matches_api_key_account(account, filter)
                     }) && api_key_account_prompt_limit_allows(
                         access,
                         "gemini",
-                        |filter| gemini_account_matches(account, filter),
+                        |filter| gemini_account_matches_api_key_account(account, filter),
                         estimated_prompt_tokens,
                     )
                 })
@@ -15168,11 +20002,11 @@ fn scoped_state_for_api_key_request(
                 .iter()
                 .filter(|account| {
                     api_key_rule_allows_account(access, "qwen", |filter| {
-                        qwen_account_matches(account, filter)
+                        qwen_account_matches_api_key_account(account, filter)
                     }) && api_key_account_prompt_limit_allows(
                         access,
                         "qwen",
-                        |filter| qwen_account_matches(account, filter),
+                        |filter| qwen_account_matches_api_key_account(account, filter),
                         estimated_prompt_tokens,
                     )
                 })
@@ -15189,11 +20023,11 @@ fn scoped_state_for_api_key_request(
                 .iter()
                 .filter(|account| {
                     api_key_rule_allows_account(access, "deepseek", |filter| {
-                        deepseek_account_matches(account, filter)
+                        deepseek_account_matches_api_key_account(account, filter)
                     }) && api_key_account_prompt_limit_allows(
                         access,
                         "deepseek",
-                        |filter| deepseek_account_matches(account, filter),
+                        |filter| deepseek_account_matches_api_key_account(account, filter),
                         estimated_prompt_tokens,
                     )
                 })
@@ -15210,11 +20044,11 @@ fn scoped_state_for_api_key_request(
                 .iter()
                 .filter(|account| {
                     api_key_rule_allows_account(access, "grok", |filter| {
-                        grok_account_matches(account, filter)
+                        grok_account_matches_api_key_account(account, filter)
                     }) && api_key_account_prompt_limit_allows(
                         access,
                         "grok",
-                        |filter| grok_account_matches(account, filter),
+                        |filter| grok_account_matches_api_key_account(account, filter),
                         estimated_prompt_tokens,
                     )
                 })
@@ -15231,11 +20065,11 @@ fn scoped_state_for_api_key_request(
                 .iter()
                 .filter(|account| {
                     api_key_rule_allows_account(access, "minimax", |filter| {
-                        minimax_account_matches(account, filter)
+                        minimax_account_matches_api_key_account(account, filter)
                     }) && api_key_account_prompt_limit_allows(
                         access,
                         "minimax",
-                        |filter| minimax_account_matches(account, filter),
+                        |filter| minimax_account_matches_api_key_account(account, filter),
                         estimated_prompt_tokens,
                     )
                 })
@@ -15252,11 +20086,11 @@ fn scoped_state_for_api_key_request(
                 .iter()
                 .filter(|account| {
                     api_key_rule_allows_account(access, "copilot", |filter| {
-                        copilot_account_matches(account, filter)
+                        copilot_account_matches_api_key_account(account, filter)
                     }) && api_key_account_prompt_limit_allows(
                         access,
                         "copilot",
-                        |filter| copilot_account_matches(account, filter),
+                        |filter| copilot_account_matches_api_key_account(account, filter),
                         estimated_prompt_tokens,
                     )
                 })
@@ -15273,11 +20107,11 @@ fn scoped_state_for_api_key_request(
                 .iter()
                 .filter(|account| {
                     api_key_rule_allows_account(access, "claude", |filter| {
-                        claude_account_matches(account, filter)
+                        claude_account_matches_api_key_account(account, filter)
                     }) && api_key_account_prompt_limit_allows(
                         access,
                         "claude",
-                        |filter| claude_account_matches(account, filter),
+                        |filter| claude_account_matches_api_key_account(account, filter),
                         estimated_prompt_tokens,
                     )
                 })
@@ -15294,11 +20128,11 @@ fn scoped_state_for_api_key_request(
                 .iter()
                 .filter(|account| {
                     api_key_rule_allows_account(access, "glm", |filter| {
-                        glm_account_matches(account, filter)
+                        glm_account_matches_api_key_account(account, filter)
                     }) && api_key_account_prompt_limit_allows(
                         access,
                         "glm",
-                        |filter| glm_account_matches(account, filter),
+                        |filter| glm_account_matches_api_key_account(account, filter),
                         estimated_prompt_tokens,
                     )
                 })
@@ -15307,6 +20141,96 @@ fn scoped_state_for_api_key_request(
         ));
     }
     scoped
+}
+
+fn target_has_configured_accounts(state: &AppState, target: TargetModel) -> bool {
+    match target {
+        TargetModel::Codex => !state.tokens.lock().unwrap().is_empty(),
+        TargetModel::Antigravity => !state.agw_accounts.lock().unwrap().is_empty(),
+        TargetModel::Gemini => !state.gemini_accounts.lock().unwrap().is_empty(),
+        TargetModel::Qwen => !state.qwen_accounts.lock().unwrap().is_empty(),
+        TargetModel::DeepSeek => !state.deepseek_accounts.lock().unwrap().is_empty(),
+        TargetModel::Grok => !state.grok_accounts.lock().unwrap().is_empty(),
+        TargetModel::MiniMax => !state.minimax_accounts.lock().unwrap().is_empty(),
+        TargetModel::Copilot => !state.copilot_accounts.lock().unwrap().is_empty(),
+        TargetModel::Claude => !state.claude_accounts.lock().unwrap().is_empty(),
+        TargetModel::Glm => !state.glm_accounts.lock().unwrap().is_empty(),
+        TargetModel::Custom | TargetModel::CodexModels | TargetModel::UnifiedV1Models => false,
+    }
+}
+
+/// Catalogs should not advertise a route that has no enabled credential, but
+/// they deliberately do not require the account to be immediately healthy:
+/// cooldown is transient routing state, not an authorization boundary.
+fn target_has_enabled_account(state: &AppState, target: TargetModel) -> bool {
+    match target {
+        TargetModel::Codex => has_enabled_codex_account(state),
+        TargetModel::Antigravity => has_enabled_antigravity_account(state),
+        TargetModel::Gemini => has_enabled_gemini_account(state),
+        TargetModel::Qwen => has_enabled_qwen_account(state),
+        TargetModel::DeepSeek => has_enabled_deepseek_account(state),
+        TargetModel::Grok => has_enabled_grok_account(state),
+        TargetModel::MiniMax => has_enabled_minimax_account(state),
+        TargetModel::Copilot => has_enabled_copilot_account(state),
+        TargetModel::Claude => has_enabled_claude_account(state),
+        TargetModel::Glm => has_enabled_glm_account(state),
+        TargetModel::Custom | TargetModel::CodexModels | TargetModel::UnifiedV1Models => false,
+    }
+}
+
+fn target_has_dispatchable_account(state: &AppState, target: TargetModel) -> bool {
+    match target {
+        TargetModel::Codex => state.tokens.lock().unwrap().iter().any(|account| {
+            account.enabled && router_account_eligible(state, "codex", &codex_stats_key(account))
+        }),
+        TargetModel::Antigravity => state.agw_accounts.lock().unwrap().iter().any(|account| {
+            account.enabled
+                && router_account_eligible(state, "agw", &antigravity_stats_key(account))
+        }),
+        TargetModel::Gemini => state.gemini_accounts.lock().unwrap().iter().any(|account| {
+            account.enabled && router_account_eligible(state, "gemini", &gemini_stats_key(account))
+        }),
+        TargetModel::Qwen => state.qwen_accounts.lock().unwrap().iter().any(|account| {
+            account.enabled && router_account_eligible(state, "qwen", &qwen_stats_key(account))
+        }),
+        TargetModel::DeepSeek => state
+            .deepseek_accounts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|account| {
+                account.enabled
+                    && router_account_eligible(state, "deepseek", &deepseek_stats_key(account))
+            }),
+        TargetModel::Grok => state.grok_accounts.lock().unwrap().iter().any(|account| {
+            account.enabled && router_account_eligible(state, "grok", &grok_stats_key(account))
+        }),
+        TargetModel::MiniMax => state
+            .minimax_accounts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|account| {
+                account.enabled
+                    && router_account_eligible(state, "minimax", &minimax_stats_key(account))
+            }),
+        TargetModel::Copilot => state
+            .copilot_accounts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|account| {
+                account.enabled
+                    && router_account_eligible(state, "copilot", &copilot_stats_key(account))
+            }),
+        TargetModel::Claude => state.claude_accounts.lock().unwrap().iter().any(|account| {
+            account.enabled && router_account_eligible(state, "claude", &claude_stats_key(account))
+        }),
+        TargetModel::Glm => state.glm_accounts.lock().unwrap().iter().any(|account| {
+            account.enabled && router_account_eligible(state, "glm", &glm_stats_key(account))
+        }),
+        TargetModel::Custom | TargetModel::CodexModels | TargetModel::UnifiedV1Models => false,
+    }
 }
 
 fn scoped_state_for_custom_target_account(
@@ -15647,6 +20571,7 @@ pub(crate) fn should_retry_account_error(status: StatusCode, message: &str) -> b
 async fn dispatch_custom_target(
     state: AppState,
     headers: HeaderMap,
+    source_api: SourceApi,
     upstream_path: &str,
     target: TargetModel,
     body: Bytes,
@@ -15654,7 +20579,15 @@ async fn dispatch_custom_target(
 ) -> axum::response::Response {
     match target {
         TargetModel::Codex => {
-            dispatch_codex_custom_target(state, headers, upstream_path, body, response_mode).await
+            dispatch_codex_custom_target(
+                state,
+                headers,
+                source_api,
+                upstream_path,
+                body,
+                response_mode,
+            )
+            .await
         }
         TargetModel::Antigravity => match upstream_path {
             "responses/compact" => target::antigravity::api::compact(State(state), headers, body)
@@ -15700,18 +20633,23 @@ async fn dispatch_custom_target(
                 .await
                 .into_response(),
         },
-        TargetModel::Custom | TargetModel::CodexModels | TargetModel::UnifiedV1Models => (
-            StatusCode::BAD_REQUEST,
-            [("Content-Type", "application/json")],
-            openai_error_body("unsupported custom target", "invalid_request_error", None),
-        )
-            .into_response(),
+        TargetModel::Custom | TargetModel::CodexModels | TargetModel::UnifiedV1Models => {
+            source_error_response(
+                source_api,
+                StatusCode::BAD_REQUEST,
+                "unsupported custom target",
+                "invalid_request_error",
+                None,
+                "invalid_request_error",
+            )
+        }
     }
 }
 
 async fn dispatch_codex_custom_target(
     state: AppState,
     headers: HeaderMap,
+    source_api: SourceApi,
     upstream_path: &str,
     body: Bytes,
     response_mode: ResponseMode,
@@ -15720,12 +20658,21 @@ async fn dispatch_codex_custom_target(
         target::codex::gateway::build_upstream_url(&state.cfg.upstream_base, upstream_path, None);
     let token_candidates = candidate_tokens_with_reservation(&state, true);
     if token_candidates.is_empty() {
-        return (
+        // The custom-alias preflight normally catches this. If account
+        // runtime state changes between that check and selection, however,
+        // no upstream request has been sent and the held input budget must
+        // remain available to the key.
+        queue_api_key_budget_settlement(
+            &state,
+            api_key_policy_store::ApiKeyInputTokenSettlement::Release,
+            api_key_policy_store::ApiKeyPolicyDecision::NoEligibleAccount,
+            None,
+        );
+        return codex_error_response(
+            source_api,
             StatusCode::SERVICE_UNAVAILABLE,
-            [("Content-Type", "application/json")],
-            openai_error_body("No upstream credentials configured", "server_error", None),
-        )
-            .into_response();
+            "No upstream credentials configured",
+        );
     }
     let request_value: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
     let model = request_value.as_ref().and_then(model_from_request_value);
@@ -15742,8 +20689,6 @@ async fn dispatch_codex_custom_target(
             upstream_path.to_string(),
             prompt.clone(),
         );
-        record_codex_request(&state, &context);
-
         let session_id = Uuid::new_v4().to_string();
         let request_body = target::codex::gateway::build_request_body(
             &Method::POST,
@@ -15752,6 +20697,17 @@ async fn dispatch_codex_custom_target(
             body.clone(),
             &session_id,
         );
+        if let Err(response) = reserve_api_key_budgets_for_prepared_dispatch(
+            &state,
+            "codex",
+            &context.key,
+            &request_body,
+        )
+        .await
+        {
+            return response;
+        }
+        record_codex_request(&state, &context);
         let mut req = state.client.request(Method::POST, upstream.clone());
         for (key, value) in headers.iter() {
             if should_drop_incoming_header(key.as_str()) {
@@ -15806,39 +20762,37 @@ async fn dispatch_codex_custom_target(
                 .map(|value| value.contains("text/event-stream"))
                 .unwrap_or(false);
             if is_sse {
-                if let Some(message) = sse_error_message(&body_bytes) {
-                    let status = codex_error_status_from_message(&message, StatusCode::BAD_GATEWAY);
-                    let affects_account_health = codex_error_affects_account_health(&message);
-                    record_codex_error_with_health(
-                        &state,
-                        &context,
-                        &message,
-                        affects_account_health,
-                    );
-                    if affects_account_health
-                        && attempt_idx + 1 < token_candidates.len()
-                        && should_retry_account_error(StatusCode::TOO_MANY_REQUESTS, &message)
-                    {
-                        last_error = Some((StatusCode::TOO_MANY_REQUESTS, message));
-                        continue;
-                    }
-                    out_headers.insert(
-                        axum::http::header::CONTENT_TYPE,
-                        HeaderValue::from_static("application/json"),
-                    );
-                    return (
-                        status,
-                        out_headers,
-                        openai_error_body(
+                let usage = match sse_response_body_outcome(&body_bytes) {
+                    Ok(usage) => usage,
+                    Err(message) => {
+                        let status =
+                            codex_error_status_from_message(&message, StatusCode::BAD_GATEWAY);
+                        let affects_account_health = codex_error_affects_account_health(&message);
+                        record_codex_error_with_health(
+                            &state,
+                            &context,
                             &message,
-                            status_to_error_type(status),
-                            status_to_error_code(status),
-                        ),
-                    )
-                        .into_response();
-                }
-                if let Some(metrics) = usage_metrics_from_sse_response_body(&body_bytes) {
+                            affects_account_health,
+                        );
+                        if affects_account_health
+                            && attempt_idx + 1 < token_candidates.len()
+                            && should_retry_account_error(StatusCode::TOO_MANY_REQUESTS, &message)
+                        {
+                            last_error = Some((StatusCode::TOO_MANY_REQUESTS, message));
+                            continue;
+                        }
+                        return codex_error_response(source_api, status, message);
+                    }
+                };
+                if let Some(metrics) = usage {
                     record_usage_success(&state, &context, &metrics);
+                } else {
+                    // This custom route buffers the entire SSE body before
+                    // returning it. A successful stream without a terminal
+                    // usage event may still have been billed, so settle now
+                    // rather than leaving the reservation active until the
+                    // stale-hold sweeper runs.
+                    record_request_completed_with_unknown_usage(&state, &context);
                 }
                 if matches!(response_mode, ResponseMode::SseToJson) {
                     out_headers.insert(
@@ -15848,13 +20802,13 @@ async fn dispatch_codex_custom_target(
                     return (status, out_headers, sse_to_response_json(&body_bytes))
                         .into_response();
                 }
-            } else {
-                let value = serde_json::from_slice::<serde_json::Value>(&body_bytes).ok();
-                let metrics = value
-                    .as_ref()
-                    .map(usage_metrics_from_response_value)
-                    .unwrap_or_default();
+            } else if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                let metrics = usage_metrics_from_response_value(&value);
                 record_usage_success(&state, &context, &metrics);
+            } else {
+                // A non-JSON 2xx response has already completed upstream;
+                // its billable input is unknown, not zero.
+                record_request_completed_with_unknown_usage(&state, &context);
             }
             return (status, out_headers, body_bytes).into_response();
         } else {
@@ -15880,16 +20834,11 @@ async fn dispatch_codex_custom_target(
         )
     });
     let status = codex_error_status_from_message(&message, status);
-    (
+    codex_error_response(
+        source_api,
         status,
-        [("Content-Type", "application/json")],
-        openai_error_body(
-            &format!("All Codex accounts failed; last error: {}", message),
-            status_to_error_type(status),
-            status_to_error_code(status),
-        ),
+        format!("All Codex accounts failed; last error: {}", message),
     )
-        .into_response()
 }
 
 fn upstream_failure_message(status: StatusCode, retry_after: Option<&str>, body: &[u8]) -> String {
@@ -15959,36 +20908,67 @@ fn codex_error_response(
     message: impl Into<String>,
 ) -> Response {
     let message = message.into();
-    if matches!(source_api, SourceApi::V1) {
-        (
-            status,
-            [(
-                axum::http::header::CONTENT_TYPE.as_str(),
-                "application/json",
-            )],
-            openai_error_body(
-                &message,
-                status_to_error_type(status),
-                status_to_error_code(status),
-            ),
-        )
-            .into_response()
-    } else {
-        (status, message).into_response()
+    source_error_response(
+        source_api,
+        status,
+        message,
+        status_to_error_type(status),
+        status_to_error_code(status),
+        anthropic_error_type_for_status(status),
+    )
+}
+
+fn anthropic_error_type_for_status(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::UNAUTHORIZED => "authentication_error",
+        StatusCode::FORBIDDEN => "permission_error",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+        status if status.is_client_error() => "invalid_request_error",
+        _ => "api_error",
     }
 }
 
-async fn codex_models_response(state: AppState, headers: HeaderMap) -> axum::response::Response {
-    let body_bytes = cached_raw_codex_models_body(&state, &headers)
-        .await
-        .unwrap_or_else(|| Bytes::from_static(br#"{"models":[]}"#));
-    let body_bytes = augment_codex_models_json(&body_bytes, &state);
+async fn codex_models_response(
+    state: AppState,
+    headers: HeaderMap,
+    access: &api_keys::ApiKeyAccess,
+) -> axum::response::Response {
+    let body_bytes = if access.all {
+        cached_raw_codex_models_body(&state, &headers).await
+    } else {
+        // A global cache could have been filled by a different Codex account.
+        // Restricted managed keys must fetch through their already-scoped
+        // account set instead of reusing it.
+        fetch_raw_codex_models_body(&state, &headers).await
+    }
+    .unwrap_or_else(|| Bytes::from_static(br#"{"models":[]}"#));
+    let body_bytes = augment_codex_models_json(&body_bytes, &state, access);
     (
         StatusCode::OK,
         [("Content-Type", "application/json")],
         body_bytes,
     )
         .into_response()
+}
+
+/// Unified model catalog routes are shared by `/v1/models` and Claude's
+/// compatibility paths. Keep their local failures in the request protocol
+/// even though their successful catalog payload is intentionally unified.
+fn unified_model_catalog_error_response(
+    source_api: SourceApi,
+    status: StatusCode,
+    message: impl AsRef<str>,
+    openai_type: &str,
+    openai_code: Option<&str>,
+) -> Response {
+    source_error_response(
+        source_api,
+        status,
+        message,
+        openai_type,
+        openai_code,
+        anthropic_error_type_for_status(status),
+    )
 }
 
 async fn cached_raw_codex_models_body(state: &AppState, headers: &HeaderMap) -> Option<Bytes> {
@@ -16069,18 +21049,27 @@ fn model_cache_is_fresh(fetched_at: std::time::Instant) -> bool {
 async fn unified_v1_models_response(
     state: AppState,
     headers: HeaderMap,
+    source_api: SourceApi,
     upstream_path: &str,
     access: &api_keys::ApiKeyAccess,
 ) -> axum::response::Response {
-    let mut models = collect_unified_v1_models(&state, &headers).await;
+    let mut models = if access.all {
+        collect_unified_v1_models(&state, &headers).await
+    } else {
+        // The shared catalog may have been populated through an account this
+        // key cannot use. Fetching with a scoped state is intentionally less
+        // cache-efficient but prevents cross-account model disclosure.
+        collect_scoped_unified_v1_models(&state, &headers, access).await
+    };
     models.retain(|model| model_entry_allowed_for_api_key(model, &state, access));
     if models.is_empty() {
-        return (
+        return unified_model_catalog_error_response(
+            source_api,
             StatusCode::SERVICE_UNAVAILABLE,
-            [("Content-Type", "application/json")],
-            openai_error_body("No upstream credentials configured", "server_error", None),
-        )
-            .into_response();
+            "No upstream credentials configured",
+            "server_error",
+            None,
+        );
     }
 
     models.sort_by(|left, right| {
@@ -16100,12 +21089,13 @@ async fn unified_v1_models_response(
     }
 
     let Some(model_id) = upstream_path.strip_prefix("models/") else {
-        return (
+        return unified_model_catalog_error_response(
+            source_api,
             StatusCode::NOT_FOUND,
-            [("Content-Type", "application/json")],
-            openai_error_body("v1 endpoint not found", "invalid_request_error", None),
-        )
-            .into_response();
+            "v1 endpoint not found",
+            "invalid_request_error",
+            None,
+        );
     };
 
     let model = models
@@ -16119,17 +21109,28 @@ async fn unified_v1_models_response(
             serde_json::to_vec(&model).unwrap_or_default(),
         )
             .into_response(),
-        None => (
+        None => unified_model_catalog_error_response(
+            source_api,
             StatusCode::NOT_FOUND,
-            [("Content-Type", "application/json")],
-            openai_error_body(
-                &format!("The model '{}' does not exist", model_id),
-                "invalid_request_error",
-                Some("model_not_found"),
-            ),
-        )
-            .into_response(),
+            format!("The model '{}' does not exist", model_id),
+            "invalid_request_error",
+            Some("model_not_found"),
+        ),
     }
+}
+
+async fn collect_scoped_unified_v1_models(
+    state: &AppState,
+    headers: &HeaderMap,
+    access: &api_keys::ApiKeyAccess,
+) -> Vec<serde_json::Value> {
+    let scoped = scoped_state_for_api_key_access(state.clone(), access, None);
+    let provider_models =
+        fetch_unified_model_provider_updates(&scoped, headers, &HashMap::new(), None)
+            .await
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+    merge_unified_model_catalog(&scoped, &provider_models)
 }
 
 fn model_entry_allowed_for_api_key(
@@ -16137,9 +21138,6 @@ fn model_entry_allowed_for_api_key(
     state: &AppState,
     access: &api_keys::ApiKeyAccess,
 ) -> bool {
-    if access.all {
-        return true;
-    }
     let prefix = model
         .get("provider_prefix")
         .and_then(|value| value.as_str())
@@ -16164,20 +21162,47 @@ fn model_entry_allowed_for_api_key(
             return false;
         };
         return find_custom_model(state, alias).is_some_and(|custom_model| {
-            custom_model.routes.iter().any(|group| {
-                group.targets.iter().any(|target| {
-                    target.enabled
-                        && target_provider_access_key(source::v1::provider::target_from_model(
-                            &target.model,
-                        ))
-                        .is_some_and(|provider| access.allows_provider(provider))
-                })
-            })
+            custom_model_allowed_for_api_key(state, access, &custom_model)
         });
+    }
+    if access.all {
+        return true;
     }
     normalize_model_catalog_provider(prefix)
         .and_then(model_catalog_prefix_to_access_provider)
         .is_some_and(|provider| access.allows_provider(provider))
+}
+
+/// A custom alias is visible only when it has at least one enabled route that
+/// intersects both its own account selector and the API key's provider and
+/// account scope.  Reuse this for every catalog surface so a readable alias
+/// cannot become a side channel for a different account's model inventory.
+fn custom_model_allowed_for_api_key(
+    state: &AppState,
+    access: &api_keys::ApiKeyAccess,
+    custom_model: &custom_models::CustomModel,
+) -> bool {
+    custom_model.routes.iter().any(|group| {
+        group.targets.iter().any(|candidate| {
+            if !candidate.enabled {
+                return false;
+            }
+            let target = source::v1::provider::target_from_model(&candidate.model);
+            let Some(provider) = target_provider_access_key(target) else {
+                return false;
+            };
+            if !access.allows_provider(provider) {
+                return false;
+            }
+            let Ok(custom_scoped) =
+                scoped_state_for_custom_target_account(state.clone(), target, candidate)
+            else {
+                return false;
+            };
+            let scoped = scoped_state_for_api_key_access(custom_scoped, access, Some(target));
+            target_has_enabled_account(&scoped, target)
+        })
+    })
 }
 
 fn model_catalog_prefix_to_access_provider(prefix: &str) -> Option<&'static str> {
@@ -16644,21 +21669,91 @@ fn custom_model_openai_entries(state: &AppState) -> Vec<serde_json::Value> {
         .unwrap()
         .iter()
         .filter(|model| model.enabled)
-        .map(|model| {
-            serde_json::json!({
-                "id": custom_models::public_model_id(&model.alias),
-                "object": "model",
-                "created": 0,
-                "owned_by": "custom",
-                "display_name": model.display_name.clone().unwrap_or_else(|| model.alias.clone()),
-                "provider_prefix": "ctm",
-                "upstream_model": model.alias,
-                "routes": model.routes.clone(),
-                "route_group_count": custom_models::route_group_count(model),
-                "target_count": custom_models::target_count(model)
-            })
-        })
+        .map(custom_model_openai_entry)
         .collect()
+}
+
+/// Public catalogs may identify a custom alias, but must not disclose its
+/// route graph. A managed key that can use one route must not learn fallback
+/// providers or account selectors for routes it cannot use.
+fn custom_model_openai_entry(model: &custom_models::CustomModel) -> serde_json::Value {
+    serde_json::json!({
+        "id": custom_models::public_model_id(&model.alias),
+        "object": "model",
+        "created": 0,
+        "owned_by": "custom",
+        "display_name": model.display_name.clone().unwrap_or_else(|| model.alias.clone()),
+        "provider_prefix": "ctm",
+        "upstream_model": model.alias,
+    })
+}
+
+#[cfg(test)]
+mod custom_model_catalog_visibility_tests {
+    use super::{custom_model_codex_catalog_entry, custom_model_openai_entry};
+    use crate::custom_models::{CustomModel, CustomModelRouteGroup, CustomModelTarget};
+
+    fn alias_with_an_allowed_and_private_route() -> CustomModel {
+        CustomModel {
+            alias: "workhorse".to_string(),
+            display_name: Some("Workhorse".to_string()),
+            enabled: true,
+            load_balance: true,
+            routes: vec![
+                CustomModelRouteGroup {
+                    targets: vec![CustomModelTarget {
+                        model: "dsk:deepseek-chat".to_string(),
+                        account: Some("deepseek:account_id:permitted".to_string()),
+                        account_condition: Default::default(),
+                        enabled: true,
+                        weight: 1,
+                    }],
+                },
+                CustomModelRouteGroup {
+                    targets: vec![CustomModelTarget {
+                        model: "cld:claude-private".to_string(),
+                        account: Some("claude:organization:private-org".to_string()),
+                        account_condition: Default::default(),
+                        enabled: true,
+                        weight: 1,
+                    }],
+                },
+            ],
+            primary_models: Vec::new(),
+            fallback_models: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn v1_and_codex_catalogs_retain_allowed_alias_without_route_disclosure() {
+        // The caller has already determined that the DeepSeek route is in
+        // scope. The Claude fallback remains private metadata.
+        let model = alias_with_an_allowed_and_private_route();
+        let v1_entry = custom_model_openai_entry(&model);
+        let codex_entry = custom_model_codex_catalog_entry(&model);
+
+        assert_eq!(v1_entry["id"], "ctm:workhorse");
+        assert_eq!(codex_entry["slug"], "ctm:workhorse");
+        assert!(v1_entry.get("routes").is_none());
+        assert!(v1_entry.get("route_group_count").is_none());
+        assert!(v1_entry.get("target_count").is_none());
+
+        let v1_metadata = serde_json::to_string(&v1_entry).unwrap();
+        let codex_metadata = serde_json::to_string(&codex_entry).unwrap();
+        for private_value in [
+            "cld:claude-private",
+            "claude:organization:private-org",
+            "dsk:deepseek-chat",
+            "deepseek:account_id:permitted",
+        ] {
+            assert!(!v1_metadata.contains(private_value));
+            assert!(!codex_metadata.contains(private_value));
+        }
+        assert_eq!(
+            codex_entry["description"],
+            "Custom model alias routed through an allowed configured target."
+        );
+    }
 }
 
 fn provider_prefixed_models(
@@ -16736,10 +21831,11 @@ fn is_supported_provider_prefix(prefix: &str) -> bool {
 #[cfg(test)]
 mod unified_model_catalog_tests {
     use super::{
-        is_safe_credential_file_name, model_entry_matches_id, normalize_model_catalog_provider,
-        provider_prefixed_model, quota_refresh_interval_for_snapshot, read_sse_prelude,
-        split_provider_prefixed_model_id, sse_error_message, ReqwestByteStream,
-        EXHAUSTED_QUOTA_REFRESH_SECONDS, MODEL_CACHE_TTL_SECONDS, QUOTA_REFRESH_SECONDS,
+        is_safe_credential_file_name, model_catalog_prefix_to_access_provider,
+        model_entry_matches_id, normalize_model_catalog_provider, provider_prefixed_model,
+        quota_refresh_interval_for_snapshot, read_sse_prelude, split_provider_prefixed_model_id,
+        sse_error_message, ReqwestByteStream, EXHAUSTED_QUOTA_REFRESH_SECONDS,
+        MODEL_CACHE_TTL_SECONDS, QUOTA_REFRESH_SECONDS,
     };
     use std::time::Duration;
 
@@ -16760,6 +21856,26 @@ mod unified_model_catalog_tests {
         assert_eq!(normalize_model_catalog_provider("claude"), Some("cld"));
         assert_eq!(normalize_model_catalog_provider("glm"), Some("glm"));
         assert_eq!(normalize_model_catalog_provider("unknown"), None);
+    }
+
+    #[test]
+    fn catalog_prefixes_map_to_the_api_key_provider_scope() {
+        assert_eq!(
+            normalize_model_catalog_provider("codex")
+                .and_then(model_catalog_prefix_to_access_provider),
+            Some("codex")
+        );
+        assert_eq!(
+            normalize_model_catalog_provider("Anthropic")
+                .and_then(model_catalog_prefix_to_access_provider),
+            Some("claude")
+        );
+        assert_eq!(
+            normalize_model_catalog_provider("github-copilot")
+                .and_then(model_catalog_prefix_to_access_provider),
+            Some("copilot")
+        );
+        assert_eq!(model_catalog_prefix_to_access_provider("unknown"), None);
     }
 
     #[test]
@@ -16878,6 +21994,169 @@ data: [DONE]
         assert_eq!(
             sse_error_message(&body).as_deref(),
             Some("rate limit exceeded")
+        );
+    }
+
+    #[test]
+    fn sse_accounting_accepts_no_space_data_fields() {
+        let body = bytes::Bytes::from_static(
+            b"data:{\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":17,\"output_tokens\":3}}}\n\n",
+        );
+        let usage = super::usage_metrics_from_sse_response_body(&body).expect("terminal usage");
+        assert_eq!(usage.input_tokens, 17);
+        assert_eq!(usage.output_tokens, 3);
+    }
+
+    #[test]
+    fn quota_response_envelopes_preserve_provisional_usage_finality() {
+        for envelope in [
+            serde_json::json!({"status":"queued","usage":{"input_tokens":3,"output_tokens":0}}),
+            serde_json::json!({"status":"in_progress","usage":{"input_tokens":3,"output_tokens":0}}),
+            serde_json::json!({"type":"response.created","response":{"usage":{"input_tokens":3,"output_tokens":0}}}),
+            serde_json::json!({"type":"response.in_progress","response":{"usage":{"input_tokens":3,"output_tokens":0}}}),
+        ] {
+            let metrics = super::usage_metrics_from_response_value(&envelope);
+            let normalized =
+                crate::quota_usage::normalize("codex", metrics.raw_usage.as_ref().unwrap(), true);
+            assert!(!normalized.trustworthy_final, "{envelope}");
+        }
+        let metrics = super::usage_metrics_from_response_value(&serde_json::json!({
+            "status":"completed", "usage":{"input_tokens":3,"output_tokens":2}
+        }));
+        assert!(
+            crate::quota_usage::normalize("codex", metrics.raw_usage.as_ref().unwrap(), true)
+                .trustworthy_final
+        );
+    }
+
+    #[test]
+    fn quota_responses_sse_only_uses_completed_event_usage() {
+        let early = bytes::Bytes::from_static(
+            b"event: response.created\ndata: {\"response\":{\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\ndata: [DONE]\n\n"
+        );
+        assert!(super::usage_metrics_from_sse_response_body(&early).is_none());
+        assert!(super::sse_response_body_outcome(&early).unwrap().is_none());
+        let final_only = bytes::Bytes::from_static(
+            b"event: response.created\ndata: {\"response\":{\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\nevent: response.completed\ndata: {\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}}\n\n"
+        );
+        let metrics = super::sse_response_body_outcome(&final_only)
+            .unwrap()
+            .unwrap();
+        assert_eq!((metrics.input_tokens, metrics.output_tokens), (7, 9));
+    }
+
+    #[test]
+    fn quota_responses_token_ceiling_is_final_usage_not_partial_transport() {
+        let value = serde_json::json!({"type":"response.incomplete","response":{
+            "status":"incomplete", "incomplete_details":{"reason":"max_output_tokens"},
+            "usage":{"input_tokens":17,"output_tokens":32}
+        }});
+        let metrics = super::usage_metrics_from_response_value(&value);
+        assert!(
+            crate::quota_usage::normalize("codex", metrics.raw_usage.as_ref().unwrap(), true)
+                .trustworthy_final
+        );
+        let event = format!("data: {value}");
+        let metrics = super::sse_response_terminal_outcome(event.as_bytes())
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(metrics.output_tokens, 32);
+        let unknown_reason = serde_json::json!({"status":"incomplete","usage":{"input_tokens":17,"output_tokens":2}});
+        let metrics = super::usage_metrics_from_response_value(&unknown_reason);
+        assert!(
+            !crate::quota_usage::normalize("codex", metrics.raw_usage.as_ref().unwrap(), true)
+                .trustworthy_final
+        );
+    }
+
+    #[test]
+    fn sse_accounting_preserves_envelope_only_error_messages() {
+        for body in [
+            b"event:error\ndata:{\"message\":\"upstream account rejected\"}\n\n".as_slice(),
+            b"event: error\r\ndata: {\"message\":\"upstream account rejected\"}\r\n\r\n".as_slice(),
+            b"event:error\ndata:{\"message\":\ndata:\"upstream account rejected\"}\n\n".as_slice(),
+        ] {
+            assert_eq!(
+                sse_error_message(&bytes::Bytes::copy_from_slice(body)).as_deref(),
+                Some("upstream account rejected")
+            );
+        }
+    }
+
+    #[test]
+    fn sse_accounting_does_not_treat_null_response_error_as_failure() {
+        let body = bytes::Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"error\":null,\"usage\":{\"input_tokens\":17}}}\n\n",
+        );
+        assert_eq!(sse_error_message(&body), None);
+    }
+
+    #[test]
+    fn sse_accounting_terminal_outcome_checks_envelope_before_done() {
+        let error = super::sse_response_terminal_outcome(
+            b"event:error\ndata:{\"message\":\"upstream rejected request\"}",
+        )
+        .expect("terminal event");
+        assert_eq!(error.err().as_deref(), Some("upstream rejected request"));
+    }
+
+    #[test]
+    fn sse_accounting_buffered_partial_error_is_failure() {
+        let body = bytes::Bytes::from_static(
+            b"data:{\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\nevent:error\ndata:{\"message\":\"failed\"}\n\ndata:[DONE]\n\n",
+        );
+        assert_eq!(
+            super::sse_response_body_outcome(&body).err().as_deref(),
+            Some("failed")
+        );
+    }
+
+    #[test]
+    fn sse_accounting_buffered_eof_requires_terminal_completion() {
+        let body = bytes::Bytes::from_static(
+            b"data:{\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+        );
+        assert!(super::sse_response_body_outcome(&body).is_err());
+        for completed in [
+            b"data:[DONE]\n\n".as_slice(),
+            b"data:{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_test\",\"usage\":null}}\n\n".as_slice(),
+        ] {
+            assert!(super::sse_response_body_outcome(&bytes::Bytes::copy_from_slice(completed)).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn sse_accounting_multiline_usage_is_one_json_event() {
+        let body = bytes::Bytes::from_static(
+            b"event:response.completed\r\ndata:{\"response\":\r\ndata:{\"usage\":{\"input_tokens\":19,\"output_tokens\":2}}}\r\n\r\n",
+        );
+        let usage = super::sse_response_body_outcome(&body).unwrap().unwrap();
+        assert_eq!(usage.input_tokens, 19);
+        assert_eq!(usage.output_tokens, 2);
+    }
+
+    #[test]
+    fn sse_accounting_boundaries_support_crlf_and_mixed_line_endings() {
+        let crlf = b"event:error\r\ndata:{}\r\n\r\n";
+        assert_eq!(super::find_sse_event_boundary(crlf), Some((20, 4)));
+        let mixed = b"data:{}\n\nevent:error\r\ndata:{}\r\n\r\n";
+        assert_eq!(super::find_sse_event_boundary(mixed), Some((7, 2)));
+    }
+
+    #[tokio::test]
+    async fn sse_accounting_prelude_rejects_envelope_only_terminal_errors() {
+        let mut stream: ReqwestByteStream =
+            Box::pin(futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(
+                bytes::Bytes::from_static(
+                    b"event:error\r\ndata:{\"message\":\"provider rejected request\"}\r\n\r\n",
+                ),
+            )]));
+        assert_eq!(
+            read_sse_prelude(&mut stream, Duration::from_secs(1))
+                .await
+                .unwrap_err(),
+            "provider rejected request"
         );
     }
 
@@ -17124,41 +22403,18 @@ impl CodexSseUsageTracker {
     }
 
     fn handle_event(&mut self, raw_event: &[u8]) {
-        let text = String::from_utf8_lossy(raw_event);
-        let mut data_lines = Vec::new();
-        for line in text.lines() {
-            let line = line.trim_end_matches('\r');
-            if let Some(value) = line.strip_prefix("data:") {
-                data_lines.push(value.trim_start().to_string());
+        match sse_response_terminal_outcome(raw_event) {
+            Some(Err(message)) => self.fail(&message),
+            Some(Ok(Some(metrics))) => {
+                record_usage_success(&self.state, &self.context, &metrics);
+                self.recorded = true;
             }
+            Some(Ok(None)) => {
+                record_request_completed_with_unknown_usage(&self.state, &self.context);
+                self.recorded = true;
+            }
+            None => {}
         }
-        if data_lines.is_empty() {
-            return;
-        }
-
-        let data_text = data_lines.join("\n");
-        if data_text == "[DONE]" {
-            record_usage_success(&self.state, &self.context, &UsageMetrics::default());
-            self.recorded = true;
-            return;
-        }
-        let value: serde_json::Value = match serde_json::from_str(&data_text) {
-            Ok(value) => value,
-            Err(_) => return,
-        };
-        if let Some(message) = sse_error_from_value(&value) {
-            self.fail(&message);
-            return;
-        }
-        if value.get("type").and_then(|v| v.as_str()) != Some("response.completed") {
-            return;
-        }
-        let Some(response) = value.get("response") else {
-            return;
-        };
-        let metrics = usage_metrics_from_response_value(response);
-        record_usage_success(&self.state, &self.context, &metrics);
-        self.recorded = true;
     }
 
     fn fail(&mut self, message: &str) {
@@ -17172,8 +22428,15 @@ impl CodexSseUsageTracker {
 
 impl Drop for CodexSseUsageTracker {
     fn drop(&mut self) {
+        if !self.recorded && !self.buffer.is_empty() {
+            let final_event = self.buffer.split().freeze();
+            self.handle_event(&final_event);
+        }
         if !self.recorded {
             router_request_abandoned(&self.state, self.context.provider_name, &self.context.key);
+            // The stream reached Codex but was dropped before an observed
+            // terminal event, so its billable outcome is indeterminate.
+            commit_api_key_budget_unknown(&self.state);
         }
     }
 }
@@ -17237,26 +22500,21 @@ fn push_compat_sse_event<S>(state: &mut CompatSseState<S>, raw_event: &[u8], use
 }
 
 fn find_sse_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
-    buffer
-        .windows(4)
-        .position(|window| {
-            window
-                == b"
-
-"
-        })
-        .map(|idx| (idx, 4))
-        .or_else(|| {
-            buffer
-                .windows(2)
-                .position(|window| {
-                    window
-                        == b"
-
-"
-                })
-                .map(|idx| (idx, 2))
-        })
+    // Match the earliest boundary, including streams that switch between LF
+    // and CRLF. Looking for any CRLF delimiter before an earlier LF delimiter
+    // would merge unrelated events and can hide a terminal provider error.
+    for (idx, byte) in buffer.iter().enumerate() {
+        if !matches!(byte, b'\r' | b'\n') {
+            continue;
+        }
+        let remaining = &buffer[idx..];
+        for delimiter in [b"\r\n\r\n".as_slice(), b"\r\n\n", b"\n\r\n", b"\n\n"] {
+            if remaining.starts_with(delimiter) {
+                return Some((idx, delimiter.len()));
+            }
+        }
+    }
+    None
 }
 
 fn rewrite_v1_sse_event(
@@ -19125,18 +24383,23 @@ pub(crate) fn glm_usage_context(
 fn start_persistence_worker(
     cfg: Arc<Config>,
     persisted_stats: Arc<Mutex<stats_store::StatsStore>>,
+    api_key_registry: ApiKeyRegistry,
     receiver: mpsc::Receiver<PersistenceEvent>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("gateway-persistence".to_string())
         .spawn(move || {
             let mut stats_dirty = false;
-            let mut pending_api_keys = None;
+            let mut pending_api_key_touches = HashMap::new();
+            let mut pending_api_key_policy_audits = Vec::new();
             let mut pending_history = Vec::new();
             let flush_interval = Duration::from_secs(2);
             let mut next_flush = std::time::Instant::now() + flush_interval;
             let mut last_history_maintenance = std::time::Instant::now()
                 .checked_sub(Duration::from_secs(3600))
+                .unwrap_or_else(std::time::Instant::now);
+            let mut last_api_key_budget_maintenance = std::time::Instant::now()
+                .checked_sub(API_KEY_BUDGET_SWEEP_INTERVAL)
                 .unwrap_or_else(std::time::Instant::now);
 
             loop {
@@ -19144,13 +24407,40 @@ fn start_persistence_worker(
                 match receiver.recv_timeout(wait) {
                     Ok(PersistenceEvent::StatsDirty) => stats_dirty = true,
                     Ok(PersistenceEvent::History(entry)) => pending_history.push(entry),
-                    Ok(PersistenceEvent::ApiKeys(snapshot)) => pending_api_keys = Some(snapshot),
+                    Ok(PersistenceEvent::ApiKeyTouch { id, timestamp }) => {
+                        pending_api_key_touches.insert(id, timestamp);
+                    }
+                    Ok(PersistenceEvent::ApiKeyPolicyAudit(event)) => {
+                        pending_api_key_policy_audits.push(event);
+                    }
+                    Ok(PersistenceEvent::ApiKeyBudgetSettlement {
+                        reservation,
+                        settlement,
+                        decision,
+                        actual_input_tokens,
+                    }) => {
+                        // The dispatch/authorization event is queued before
+                        // its settlement by the same request. Flush it now
+                        // instead of waiting for the two-second batch timer,
+                        // otherwise the settlement can be inserted first and
+                        // make a per-key audit trail read backwards.
+                        flush_api_key_policy_audits(&cfg, &mut pending_api_key_policy_audits);
+                        settle_api_key_budget_reservation_in_worker(
+                            &cfg,
+                            reservation,
+                            settlement,
+                            decision,
+                            actual_input_tokens,
+                        );
+                    }
                     Ok(PersistenceEvent::Shutdown(flushed)) => {
                         flush_persistence(
                             &cfg,
                             &persisted_stats,
+                            &api_key_registry,
                             &mut stats_dirty,
-                            &mut pending_api_keys,
+                            &mut pending_api_key_touches,
+                            &mut pending_api_key_policy_audits,
                             &mut pending_history,
                         );
                         let _ = flushed.send(());
@@ -19161,8 +24451,10 @@ fn start_persistence_worker(
                         flush_persistence(
                             &cfg,
                             &persisted_stats,
+                            &api_key_registry,
                             &mut stats_dirty,
-                            &mut pending_api_keys,
+                            &mut pending_api_key_touches,
+                            &mut pending_api_key_policy_audits,
                             &mut pending_history,
                         );
                         break;
@@ -19174,8 +24466,10 @@ fn start_persistence_worker(
                     flush_persistence(
                         &cfg,
                         &persisted_stats,
+                        &api_key_registry,
                         &mut stats_dirty,
-                        &mut pending_api_keys,
+                        &mut pending_api_key_touches,
+                        &mut pending_api_key_policy_audits,
                         &mut pending_history,
                     );
                     next_flush = now + flush_interval;
@@ -19190,16 +24484,67 @@ fn start_persistence_worker(
                     }
                     last_history_maintenance = std::time::Instant::now();
                 }
+                if last_api_key_budget_maintenance.elapsed() >= API_KEY_BUDGET_SWEEP_INTERVAL {
+                    api_key_quota_runtime::recover(&cfg);
+                    sweep_stale_api_key_budget_reservations(&cfg);
+                    last_api_key_budget_maintenance = std::time::Instant::now();
+                }
             }
         })
         .expect("failed to start persistence worker")
 }
 
+fn sweep_stale_api_key_budget_reservations(cfg: &Config) {
+    let result = match api_key_policy_store::sweep_stale_input_token_reservations(
+        cfg,
+        API_KEY_BUDGET_STALE_RESERVATION_AGE,
+        API_KEY_BUDGET_SWEEP_BATCH_SIZE,
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            error!(
+                "failed to sweep stale API-key input-budget reservations: {}",
+                err
+            );
+            return;
+        }
+    };
+    for reservation in result.committed {
+        // The dispatch event already retains the safe path/provider/model
+        // metadata. A sweeper runs after a crash, so only the durable
+        // reservation identifiers remain available here; do not invent or
+        // reconstruct request content to enrich this audit record.
+        let event = api_key_policy_store::ApiKeyRequestAuditEvent {
+            request_id: reservation.request_id,
+            api_key_id: reservation.api_key_id,
+            kind: api_key_policy_store::ApiKeyPolicyEventKind::Settlement,
+            decision: api_key_policy_store::ApiKeyPolicyDecision::Failed,
+            request_path: "/".to_string(),
+            provider: None,
+            model: None,
+            account_key: None,
+            status_code: None,
+            estimated_input_tokens: Some(reservation.reserved_input_tokens),
+            actual_input_tokens: None,
+            measurement: Some(api_key_policy_store::ApiKeyInputMeasurement::Conservative),
+            reservation_id: Some(reservation.reservation_id),
+        };
+        if let Err(err) = api_key_policy_store::append_event(cfg, &event) {
+            error!(
+                "failed to append stale API-key budget settlement audit: {}",
+                err
+            );
+        }
+    }
+}
+
 fn flush_persistence(
     cfg: &Config,
     persisted_stats: &Arc<Mutex<stats_store::StatsStore>>,
+    api_key_registry: &ApiKeyRegistry,
     stats_dirty: &mut bool,
-    pending_api_keys: &mut Option<api_keys::ApiKeyStore>,
+    pending_api_key_touches: &mut HashMap<String, String>,
+    pending_api_key_policy_audits: &mut Vec<api_key_policy_store::ApiKeyRequestAuditEvent>,
     pending_history: &mut Vec<usage_store::UsageHistoryEntry>,
 ) {
     if *stats_dirty {
@@ -19209,16 +24554,184 @@ fn flush_persistence(
         }
         *stats_dirty = false;
     }
-    if let Some(snapshot) = pending_api_keys.take() {
-        if let Err(err) = api_keys::save(cfg, &snapshot) {
-            error!("failed to persist API key store: {}", err);
+    if !pending_api_key_touches.is_empty() {
+        let touches = std::mem::take(pending_api_key_touches);
+        if let Err(err) = api_key_registry.persist_touches(cfg, &touches) {
+            error!("failed to persist API-key last-used metadata: {}", err);
         }
     }
+    flush_api_key_policy_audits(cfg, pending_api_key_policy_audits);
     if !pending_history.is_empty() {
         let entries = std::mem::take(pending_history);
         if let Err(err) = usage_store::append_batch(cfg, &entries) {
             error!("failed to append usage history: {}", err);
         }
+    }
+}
+
+/// Persist queued authorization/dispatch decisions in the order in which the
+/// worker received them. Settlements call this before their own synchronous
+/// write so a request's audit trail remains chronological by event ID.
+fn flush_api_key_policy_audits(
+    cfg: &Config,
+    pending_api_key_policy_audits: &mut Vec<api_key_policy_store::ApiKeyRequestAuditEvent>,
+) {
+    if !pending_api_key_policy_audits.is_empty() {
+        let audits = std::mem::take(pending_api_key_policy_audits);
+        for event in audits {
+            if let Err(err) = api_key_policy_store::append_event(cfg, &event) {
+                error!("failed to append API-key policy audit event: {}", err);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod persistence_order_tests {
+    use super::{
+        flush_api_key_policy_audits, settle_api_key_budget_reservation_in_worker,
+        ApiKeyBudgetReservationContext, ApiKeyBudgetReservationLifecycle, Config,
+    };
+    use crate::{api_key_policy_store, api_keys};
+    use uuid::Uuid;
+
+    #[test]
+    fn dispatch_audit_is_persisted_before_its_budget_settlement() {
+        let directory =
+            std::env::temp_dir().join(format!("io-gateway-policy-audit-order-{}", Uuid::new_v4()));
+        let auth_dir = directory.join("auth");
+        std::fs::create_dir_all(&auth_dir).unwrap();
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1:0",
+            "upstream_base": "https://example.test",
+            "proxy_api_key": "",
+            "tokens": [],
+            "auth_dir": auth_dir.to_string_lossy(),
+        }))
+        .unwrap();
+
+        let budget = api_keys::ApiKeyInputTokenBudget {
+            limit: 100,
+            period: api_keys::ApiKeyBudgetPeriod::Lifetime,
+        };
+        let reservation = ApiKeyBudgetReservationContext {
+            reservation_id: "reservation-order".to_string(),
+            request_id: "request-order".to_string(),
+            api_key_id: "key-order".to_string(),
+            request_path: "/v1/responses".to_string(),
+            provider: Some("codex".to_string()),
+            model: Some("gpt-test".to_string()),
+            estimated_input_tokens: 11,
+            budget: budget.clone(),
+            lifecycle: std::sync::Arc::new(ApiKeyBudgetReservationLifecycle::default()),
+        };
+        let reserved = api_key_policy_store::reserve_input_tokens(
+            &cfg,
+            &api_key_policy_store::ApiKeyInputTokenReservationRequest {
+                reservation_id: reservation.reservation_id.clone(),
+                request_id: reservation.request_id.clone(),
+                api_key_id: reservation.api_key_id.clone(),
+                budget,
+                reserved_input_tokens: reservation.estimated_input_tokens,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            reserved,
+            api_key_policy_store::ApiKeyInputTokenReservationResult::Reserved { .. }
+        ));
+
+        let mut pending = vec![api_key_policy_store::ApiKeyRequestAuditEvent {
+            request_id: reservation.request_id.clone(),
+            api_key_id: reservation.api_key_id.clone(),
+            kind: api_key_policy_store::ApiKeyPolicyEventKind::Dispatch,
+            decision: api_key_policy_store::ApiKeyPolicyDecision::Allowed,
+            request_path: reservation.request_path.clone(),
+            provider: reservation.provider.clone(),
+            model: reservation.model.clone(),
+            account_key: None,
+            status_code: None,
+            estimated_input_tokens: Some(reservation.estimated_input_tokens),
+            actual_input_tokens: None,
+            measurement: Some(api_key_policy_store::ApiKeyInputMeasurement::Conservative),
+            reservation_id: Some(reservation.reservation_id.clone()),
+        }];
+        flush_api_key_policy_audits(&cfg, &mut pending);
+        assert!(pending.is_empty());
+        settle_api_key_budget_reservation_in_worker(
+            &cfg,
+            reservation,
+            api_key_policy_store::ApiKeyInputTokenSettlement::Commit {
+                actual_input_tokens: Some(11),
+            },
+            api_key_policy_store::ApiKeyPolicyDecision::Completed,
+            Some(11),
+        );
+
+        let events = api_key_policy_store::list_events(
+            &cfg,
+            &api_key_policy_store::ApiKeyRequestAuditQuery {
+                api_key_id: Some("key-order".to_string()),
+                request_id: Some("request-order".to_string()),
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+        assert_eq!(events.len(), 2);
+        // `list_events` is newest-first. The settlement must therefore have
+        // the later ID, with its Dispatch record immediately before it.
+        assert!(events[0].id > events[1].id);
+        assert_eq!(
+            events[0].event.kind,
+            api_key_policy_store::ApiKeyPolicyEventKind::Settlement
+        );
+        assert_eq!(
+            events[1].event.kind,
+            api_key_policy_store::ApiKeyPolicyEventKind::Dispatch
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+fn settle_api_key_budget_reservation_in_worker(
+    cfg: &Config,
+    reservation: ApiKeyBudgetReservationContext,
+    settlement: api_key_policy_store::ApiKeyInputTokenSettlement,
+    decision: api_key_policy_store::ApiKeyPolicyDecision,
+    actual_input_tokens: Option<u64>,
+) {
+    match api_key_policy_store::settle_input_token_reservation(
+        cfg,
+        &reservation.reservation_id,
+        settlement,
+    ) {
+        Ok(result) if result.settled_now => {
+            let event = api_key_policy_store::ApiKeyRequestAuditEvent {
+                request_id: reservation.request_id,
+                api_key_id: reservation.api_key_id,
+                kind: api_key_policy_store::ApiKeyPolicyEventKind::Settlement,
+                decision,
+                request_path: reservation.request_path,
+                provider: reservation.provider,
+                model: reservation.model,
+                account_key: None,
+                status_code: None,
+                estimated_input_tokens: Some(reservation.estimated_input_tokens),
+                actual_input_tokens,
+                measurement: Some(if actual_input_tokens.is_some() {
+                    api_key_policy_store::ApiKeyInputMeasurement::Exact
+                } else {
+                    api_key_policy_store::ApiKeyInputMeasurement::Conservative
+                }),
+                reservation_id: Some(reservation.reservation_id),
+            };
+            if let Err(err) = api_key_policy_store::append_event(cfg, &event) {
+                error!("failed to append API-key budget settlement audit: {}", err);
+            }
+        }
+        Ok(_) => {}
+        Err(err) => error!("failed to settle API-key input budget reservation: {}", err),
     }
 }
 
@@ -19371,25 +24884,7 @@ fn authenticate_api_key(state: &AppState, headers: &HeaderMap) -> Option<Authent
     };
     let now = now_rfc3339();
     let lookup_hash = api_keys::token_lookup_hash(token);
-    let cached = state
-        .api_key_cache
-        .read()
-        .unwrap()
-        .get(&lookup_hash)
-        .cloned();
-    let authenticated = if let Some(ApiKeyCacheEntry::Verified(authenticated)) = cached {
-        // Administrative mutations invalidate the whole cache before they
-        // become visible. A cache hit therefore needs no API-key store lock.
-        Some(authenticated)
-    } else if let Some(ApiKeyCacheEntry::Rejected(rejected_at)) = cached {
-        if rejected_at.elapsed() < Duration::from_secs(5) {
-            return None;
-        }
-        state.api_key_cache.write().unwrap().remove(&lookup_hash);
-        verify_api_key_cache_miss(state, token, &lookup_hash)
-    } else {
-        verify_api_key_cache_miss(state, token, &lookup_hash)
-    };
+    let authenticated = verify_api_key_cache_miss(state, token, &lookup_hash);
     let Some(authenticated) = authenticated else {
         return None;
     };
@@ -19407,23 +24902,10 @@ fn authenticate_api_key(state: &AppState, headers: &HeaderMap) -> Option<Authent
         }
     });
     if should_touch {
-        let snapshot = {
-            let mut store = state.api_keys.lock().unwrap();
-            if api_keys::touch_last_used(
-                &mut store,
-                authenticated.id.as_deref().unwrap_or_default(),
-                &now,
-            ) {
-                Some(store.clone())
-            } else {
-                None
-            }
-        };
-        if let Some(snapshot) = snapshot {
-            let _ = state
-                .persistence_tx
-                .send(PersistenceEvent::ApiKeys(snapshot));
-        }
+        let _ = state.persistence_tx.send(PersistenceEvent::ApiKeyTouch {
+            id: authenticated.id.clone().unwrap_or_default(),
+            timestamp: now,
+        });
     }
     Some(authenticated)
 }
@@ -19433,29 +24915,9 @@ fn verify_api_key_cache_miss(
     token: &str,
     lookup_hash: &str,
 ) -> Option<AuthenticatedApiKey> {
-    // Clone only the lookup candidates while holding the short-lived mutex.
-    // Argon2 verification runs after the mutex is released.
-    let candidates = {
-        let store = state.api_keys.lock().unwrap();
-        api_keys::verification_candidates(&store, token)
-    };
-    let verified = candidates
-        .iter()
-        .find(|record| api_keys::verify_record(record, token))
-        .map(|record| AuthenticatedApiKey {
-            id: Some(record.id.clone()),
-            access: record.access.clone(),
-        });
-    let cache_entry = verified
-        .as_ref()
-        .map(|authenticated| ApiKeyCacheEntry::Verified(authenticated.clone()))
-        .unwrap_or_else(|| ApiKeyCacheEntry::Rejected(std::time::Instant::now()));
     state
-        .api_key_cache
-        .write()
-        .unwrap()
-        .insert(lookup_hash.to_string(), cache_entry);
-    verified
+        .api_key_registry
+        .authenticate_cached(state.cfg.as_ref(), token, lookup_hash)
 }
 
 fn extract_api_key(headers: &HeaderMap) -> Option<&str> {
@@ -19700,6 +25162,13 @@ fn update_account_counters(
 }
 
 fn record_request_started(state: &AppState, context: &UsageContext) {
+    if let Some(event) = state
+        .request_api_key_audit
+        .as_ref()
+        .and_then(|audit| audit.begin(context.provider_name, &context.key))
+    {
+        queue_api_key_policy_audit(state, event);
+    }
     router_request_started(state, context.provider_name, &context.key);
     update_account_counters(
         state,
@@ -19709,7 +25178,7 @@ fn record_request_started(state: &AppState, context: &UsageContext) {
         context.account_id.clone(),
         CounterDelta {
             request_delta: 1,
-            prompt_total_delta: if context.prompt.is_prompt { 1 } else { 0 },
+            prompt_total_delta: 1,
             observed_at: Some(now_rfc3339()),
             ..Default::default()
         },
@@ -19726,6 +25195,82 @@ fn record_request_error_with_health(
     message: impl Into<String>,
     affects_account_health: bool,
 ) {
+    record_request_error_with_health_and_budget_settlement(
+        state,
+        context,
+        message,
+        affects_account_health,
+        api_key_policy_store::ApiKeyInputTokenSettlement::Commit {
+            actual_input_tokens: None,
+        },
+    );
+}
+
+/// Records a failure that occurred after selecting an account but before any
+/// model-generation request could be sent upstream. It finishes normal account
+/// bookkeeping while releasing the pre-dispatch API-key budget hold.
+pub(crate) fn record_request_pre_dispatch_error(
+    state: &AppState,
+    context: &UsageContext,
+    message: impl Into<String>,
+) {
+    record_request_error_with_health_and_optional_budget_settlement(
+        state, context, message, true, None,
+    );
+    // Keep this separate from account bookkeeping: custom-model aliases can
+    // fall back after a provider-specific local conversion failure, and the
+    // helper below is aware of that scoped deferral.
+    release_api_key_budget_before_dispatch(state);
+}
+
+/// Account bookkeeping for a failed credential/setup attempt when another
+/// account will be tried. The request-level hold must remain active because a
+/// later attempt can still dispatch upstream.
+pub(crate) fn record_request_pre_dispatch_retry_error(
+    state: &AppState,
+    context: &UsageContext,
+    message: impl Into<String>,
+) {
+    api_key_quota_runtime::release_before_dispatch(state);
+    record_request_error_with_health_and_optional_budget_settlement(
+        state, context, message, true, None,
+    );
+    // This account never reached an upstream model endpoint. Keep its
+    // prepared hold reusable for the next account instead of either charging
+    // it or issuing a new reservation while the old one is still active.
+    if let Some(reservation) = state.request_api_key_budget.as_ref() {
+        reservation.lifecycle.cancel_active_for_retry();
+    }
+}
+
+fn record_request_error_with_health_and_budget_settlement(
+    state: &AppState,
+    context: &UsageContext,
+    message: impl Into<String>,
+    affects_account_health: bool,
+    budget_settlement: api_key_policy_store::ApiKeyInputTokenSettlement,
+) {
+    record_request_error_with_health_and_optional_budget_settlement(
+        state,
+        context,
+        message,
+        affects_account_health,
+        Some(budget_settlement),
+    );
+}
+
+fn record_request_error_with_health_and_optional_budget_settlement(
+    state: &AppState,
+    context: &UsageContext,
+    message: impl Into<String>,
+    affects_account_health: bool,
+    budget_settlement: Option<api_key_policy_store::ApiKeyInputTokenSettlement>,
+) {
+    settle_unbudgeted_api_key_request_audit(
+        state,
+        api_key_policy_store::ApiKeyPolicyDecision::Failed,
+        None,
+    );
     let observed_at = now_rfc3339();
     let message = message.into();
     if affects_account_health {
@@ -19747,7 +25292,7 @@ fn record_request_error_with_health(
         context.account_id.clone(),
         CounterDelta {
             error_delta: 1,
-            prompt_error_total_delta: if context.prompt.is_prompt { 1 } else { 0 },
+            prompt_error_total_delta: 1,
             observed_at: Some(observed_at.clone()),
             error_at: Some(observed_at.clone()),
             error_message: Some(message.clone()),
@@ -19755,39 +25300,73 @@ fn record_request_error_with_health(
         },
     );
     notifications::notify_error(state, context, &message, &observed_at);
-    if context.prompt.is_prompt {
-        append_usage_history(
+    if let Some(budget_settlement) = budget_settlement {
+        match budget_settlement {
+            api_key_policy_store::ApiKeyInputTokenSettlement::Release => {
+                api_key_quota_runtime::release_before_dispatch(state)
+            }
+            api_key_policy_store::ApiKeyInputTokenSettlement::Commit { .. } => {
+                api_key_quota_runtime::settle_unknown(state)
+            }
+        }
+        if !queue_active_api_key_budget_settlement(
             state,
-            usage_store::UsageHistoryEntry {
-                recorded_at: observed_at,
-                provider: context.provider_name.to_string(),
-                account_key: context.key.clone(),
-                account_label: context.label.clone(),
-                account_id: context.account_id.clone(),
-                credential_file: context.credential_file.clone(),
-                model: context.model.clone(),
-                request_path: context.request_path.clone(),
-                api_key_id: state.request_api_key_id.clone(),
-                success: false,
-                error: true,
-                request_total: 1,
-                prompt_total: 1,
-                prompt_error_total: 1,
-                input_tokens: 0,
-                output_tokens: 0,
-                total_tokens: 0,
-                cache_tokens: 0,
-                reasoning_tokens: 0,
-                input_chars: context.prompt.input_chars,
-                prompt_items: context.prompt.prompt_items,
-                error_message: Some(message),
-                raw_usage: None,
-            },
-        );
+            budget_settlement,
+            api_key_policy_store::ApiKeyPolicyDecision::Failed,
+            None,
+        ) && state
+            .request_api_key_budget
+            .as_ref()
+            .is_some_and(|reservation| !reservation.lifecycle.original_was_assigned())
+        {
+            // Compatibility for a path that has not yet called the dispatch
+            // preparation helper. Converted paths always settle the exact
+            // active attempt above.
+            queue_api_key_budget_settlement(
+                state,
+                budget_settlement,
+                api_key_policy_store::ApiKeyPolicyDecision::Failed,
+                None,
+            );
+        }
     }
+    append_usage_history(
+        state,
+        usage_store::UsageHistoryEntry {
+            recorded_at: observed_at,
+            provider: context.provider_name.to_string(),
+            account_key: context.key.clone(),
+            account_label: context.label.clone(),
+            account_id: context.account_id.clone(),
+            credential_file: context.credential_file.clone(),
+            model: context.model.clone(),
+            request_path: context.request_path.clone(),
+            api_key_id: state.request_api_key_id.clone(),
+            success: false,
+            error: true,
+            request_total: 1,
+            prompt_total: 1,
+            prompt_error_total: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            cache_tokens: 0,
+            reasoning_tokens: 0,
+            input_chars: context.prompt.input_chars,
+            prompt_items: context.prompt.prompt_items,
+            error_message: Some(message),
+            raw_usage: None,
+        },
+    );
 }
 
 fn record_usage_success(state: &AppState, context: &UsageContext, metrics: &UsageMetrics) {
+    api_key_quota_runtime::settle_usage(state, context.provider_name, metrics.raw_usage.as_ref());
+    settle_unbudgeted_api_key_request_audit(
+        state,
+        api_key_policy_store::ApiKeyPolicyDecision::Completed,
+        Some(metrics.input_tokens),
+    );
     let observed_at = now_rfc3339();
     router_request_finished(state, context.provider_name, &context.key, true, None);
     update_account_counters(
@@ -19807,36 +25386,54 @@ fn record_usage_success(state: &AppState, context: &UsageContext, metrics: &Usag
             ..Default::default()
         },
     );
-    if context.prompt.is_prompt {
-        append_usage_history(
+    let settlement = api_key_policy_store::ApiKeyInputTokenSettlement::Commit {
+        actual_input_tokens: Some(metrics.input_tokens),
+    };
+    if !queue_active_api_key_budget_settlement(
+        state,
+        settlement,
+        api_key_policy_store::ApiKeyPolicyDecision::Completed,
+        Some(metrics.input_tokens),
+    ) && state
+        .request_api_key_budget
+        .as_ref()
+        .is_some_and(|reservation| !reservation.lifecycle.original_was_assigned())
+    {
+        queue_api_key_budget_settlement(
             state,
-            usage_store::UsageHistoryEntry {
-                recorded_at: observed_at,
-                provider: context.provider_name.to_string(),
-                account_key: context.key.clone(),
-                account_label: context.label.clone(),
-                account_id: context.account_id.clone(),
-                credential_file: context.credential_file.clone(),
-                model: context.model.clone(),
-                request_path: context.request_path.clone(),
-                api_key_id: state.request_api_key_id.clone(),
-                success: true,
-                error: false,
-                request_total: 1,
-                prompt_total: 1,
-                prompt_error_total: 0,
-                input_tokens: metrics.input_tokens,
-                output_tokens: metrics.output_tokens,
-                total_tokens: metrics.total_tokens,
-                cache_tokens: metrics.cache_tokens,
-                reasoning_tokens: metrics.reasoning_tokens,
-                input_chars: context.prompt.input_chars,
-                prompt_items: context.prompt.prompt_items,
-                error_message: None,
-                raw_usage: metrics.raw_usage.clone(),
-            },
+            settlement,
+            api_key_policy_store::ApiKeyPolicyDecision::Completed,
+            Some(metrics.input_tokens),
         );
     }
+    append_usage_history(
+        state,
+        usage_store::UsageHistoryEntry {
+            recorded_at: observed_at,
+            provider: context.provider_name.to_string(),
+            account_key: context.key.clone(),
+            account_label: context.label.clone(),
+            account_id: context.account_id.clone(),
+            credential_file: context.credential_file.clone(),
+            model: context.model.clone(),
+            request_path: context.request_path.clone(),
+            api_key_id: state.request_api_key_id.clone(),
+            success: true,
+            error: false,
+            request_total: 1,
+            prompt_total: 1,
+            prompt_error_total: 0,
+            input_tokens: metrics.input_tokens,
+            output_tokens: metrics.output_tokens,
+            total_tokens: metrics.total_tokens,
+            cache_tokens: metrics.cache_tokens,
+            reasoning_tokens: metrics.reasoning_tokens,
+            input_chars: context.prompt.input_chars,
+            prompt_items: context.prompt.prompt_items,
+            error_message: None,
+            raw_usage: metrics.raw_usage.clone(),
+        },
+    );
 }
 
 fn record_codex_request(state: &AppState, context: &UsageContext) {
@@ -20044,7 +25641,11 @@ fn is_hop_header(name: &str) -> bool {
     )
 }
 
-fn augment_codex_models_json(body: &Bytes, state: &AppState) -> Bytes {
+fn augment_codex_models_json(
+    body: &Bytes,
+    state: &AppState,
+    access: &api_keys::ApiKeyAccess,
+) -> Bytes {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return body.clone();
     };
@@ -20067,7 +25668,7 @@ fn augment_codex_models_json(body: &Bytes, state: &AppState) -> Bytes {
         .map(|slug| slug.to_string())
         .collect::<HashSet<_>>();
 
-    for model in codex_provider_model_metadata(state) {
+    for model in codex_provider_model_metadata(state, access) {
         let Some(slug) = model.get("slug").and_then(|value| value.as_str()) else {
             continue;
         };
@@ -20117,15 +25718,12 @@ fn append_prefixed_codex_model_aliases(models: &mut Vec<serde_json::Value>) {
     models.extend(aliases);
 }
 
-fn codex_provider_model_metadata(state: &AppState) -> Vec<serde_json::Value> {
+fn codex_provider_model_metadata(
+    state: &AppState,
+    access: &api_keys::ApiKeyAccess,
+) -> Vec<serde_json::Value> {
     let mut models = Vec::new();
-    if state
-        .deepseek_accounts
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|account| account.enabled)
-    {
+    if access.allows_provider("deepseek") && has_enabled_deepseek_account(state) {
         models.push(codex_provider_model(
             "dsk:deepseek-v4-pro",
             "DeepSeek V4 Pro",
@@ -20143,13 +25741,7 @@ fn codex_provider_model_metadata(state: &AppState) -> Vec<serde_json::Value> {
             true,
         ));
     }
-    if state
-        .gemini_accounts
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|account| account.enabled)
-    {
+    if access.allows_provider("gemini") && has_enabled_gemini_account(state) {
         models.push(codex_provider_model(
             "gem:gemini-2.5-pro",
             "Gemini 2.5 Pro",
@@ -20175,13 +25767,7 @@ fn codex_provider_model_metadata(state: &AppState) -> Vec<serde_json::Value> {
             true,
         ));
     }
-    if state
-        .grok_accounts
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|account| account.enabled)
-    {
+    if access.allows_provider("grok") && has_enabled_grok_account(state) {
         models.push(codex_provider_model(
             "grk:grok-4.3",
             "Grok 4.3",
@@ -20207,13 +25793,7 @@ fn codex_provider_model_metadata(state: &AppState) -> Vec<serde_json::Value> {
             false,
         ));
     }
-    if state
-        .minimax_accounts
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|account| account.enabled)
-    {
+    if access.allows_provider("minimax") && has_enabled_minimax_account(state) {
         models.push(codex_provider_model(
             "min:MiniMax-M3",
             "MiniMax M3",
@@ -20239,13 +25819,7 @@ fn codex_provider_model_metadata(state: &AppState) -> Vec<serde_json::Value> {
             false,
         ));
     }
-    if state
-        .copilot_accounts
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|account| account.enabled)
-    {
+    if access.allows_provider("copilot") && has_enabled_copilot_account(state) {
         models.push(codex_provider_model(
             "cop:gpt-5.1",
             "GitHub Copilot GPT-5.1",
@@ -20287,13 +25861,7 @@ fn codex_provider_model_metadata(state: &AppState) -> Vec<serde_json::Value> {
             true,
         ));
     }
-    if state
-        .glm_accounts
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|account| account.enabled)
-    {
+    if access.allows_provider("glm") && has_enabled_glm_account(state) {
         models.push(codex_provider_model(
             "glm:glm-5.2",
             "GLM 5.2",
@@ -20324,37 +25892,26 @@ fn codex_provider_model_metadata(state: &AppState) -> Vec<serde_json::Value> {
         .lock()
         .unwrap()
         .iter()
-        .filter(|model| model.enabled)
+        .filter(|model| model.enabled && custom_model_allowed_for_api_key(state, access, model))
     {
-        let display_name = model
-            .display_name
-            .clone()
-            .unwrap_or_else(|| format!("Custom {}", model.alias));
-        let route_summary = custom_model_route_summary(model);
-        let description = format!(
-            "Custom model alias routed through {} across {} route step(s). Comma-separated targets in a step are load-balanced; later steps are fallbacks.",
-            route_summary,
-            custom_models::route_group_count(model)
-        );
-        models.push(codex_provider_model(
-            &custom_models::public_model_id(&model.alias),
-            &display_name,
-            &description,
-            128_000,
-            true,
-            true,
-        ));
+        models.push(custom_model_codex_catalog_entry(model));
     }
     models
 }
 
-fn custom_model_route_summary(model: &custom_models::CustomModel) -> String {
-    let summary = custom_models::route_summary(model);
-    if summary.trim().is_empty() {
-        "no enabled targets".to_string()
-    } else {
-        summary
-    }
+fn custom_model_codex_catalog_entry(model: &custom_models::CustomModel) -> serde_json::Value {
+    let display_name = model
+        .display_name
+        .clone()
+        .unwrap_or_else(|| format!("Custom {}", model.alias));
+    codex_provider_model(
+        &custom_models::public_model_id(&model.alias),
+        &display_name,
+        "Custom model alias routed through an allowed configured target.",
+        128_000,
+        true,
+        true,
+    )
 }
 
 fn codex_provider_model(
@@ -20529,11 +26086,14 @@ mod account_selection_tests {
         account_runtime_status, api_key_account_prompt_limit_allows,
         api_key_account_prompt_limit_blocked, api_key_prompt_limit_violation,
         api_key_rule_allows_account, apply_router_failure, codex_error_affects_account_health,
-        codex_error_status_from_message, codex_token_matches_account, parse_retry_after_seconds,
+        codex_error_status_from_message, codex_token_matches_account,
+        codex_token_matches_api_key_account, parse_retry_after_seconds,
         select_ordered_account_indices_with_priority, AccountRuntimeState, AccountRuntimeStatus,
         AccountSelectionScore,
     };
-    use crate::api_keys::{ApiKeyAccess, ApiKeyAccountLimit, ApiKeyProviderAccess};
+    use crate::api_keys::{
+        ApiKeyAccess, ApiKeyAccountLimit, ApiKeyAccountScope, ApiKeyProviderAccess,
+    };
     use crate::target::codex::tokens::UpstreamToken;
     use axum::http::StatusCode;
     use std::collections::VecDeque;
@@ -20738,13 +26298,16 @@ mod account_selection_tests {
     }
 
     #[test]
-    fn api_key_account_rule_matches_any_selected_account_alias() {
+    fn api_key_account_rules_match_only_canonical_stable_selectors() {
         let access = ApiKeyAccess {
             all: false,
             prompt_token_limit: None,
+            input_token_budget: None,
+            quota: None,
             providers: vec![ApiKeyProviderAccess {
                 provider: "codex".to_string(),
-                accounts: vec!["first.json".to_string(), "second.json".to_string()],
+                account_scope: ApiKeyAccountScope::Selected,
+                accounts: vec!["codex:account_id:account-b".to_string()],
                 prompt_token_limit: None,
                 account_limits: Vec::new(),
             }],
@@ -20753,7 +26316,7 @@ mod account_selection_tests {
         let selected = UpstreamToken {
             token: "token-b".to_string(),
             account_id: Some("account-b".to_string()),
-            label: "Second".to_string(),
+            label: "Shared label".to_string(),
             file_name: Some("second.json".to_string()),
             enabled: true,
             expired_at: None,
@@ -20761,18 +26324,44 @@ mod account_selection_tests {
         let excluded = UpstreamToken {
             token: "token-c".to_string(),
             account_id: Some("account-c".to_string()),
-            label: "Third".to_string(),
+            label: "Shared label".to_string(),
             file_name: Some("third.json".to_string()),
             enabled: true,
             expired_at: None,
         };
 
         assert!(api_key_rule_allows_account(&access, "codex", |allowed| {
-            codex_token_matches_account(&selected, allowed)
+            codex_token_matches_api_key_account(&selected, allowed)
         }));
         assert!(!api_key_rule_allows_account(&access, "codex", |allowed| {
-            codex_token_matches_account(&excluded, allowed)
+            codex_token_matches_api_key_account(&excluded, allowed)
         }));
+        // Legacy display aliases now fail closed at runtime. The admin write
+        // path resolves a unique alias to its canonical key, but a duplicated
+        // label must never authorize both saved credentials.
+        let alias_access = ApiKeyAccess {
+            all: false,
+            prompt_token_limit: None,
+            input_token_budget: None,
+            quota: None,
+            providers: vec![ApiKeyProviderAccess {
+                provider: "codex".to_string(),
+                account_scope: ApiKeyAccountScope::Selected,
+                accounts: vec!["Shared label".to_string()],
+                prompt_token_limit: None,
+                account_limits: Vec::new(),
+            }],
+        };
+        assert!(!api_key_rule_allows_account(
+            &alias_access,
+            "codex",
+            |allowed| { codex_token_matches_api_key_account(&selected, allowed) }
+        ));
+        assert!(!api_key_rule_allows_account(
+            &alias_access,
+            "codex",
+            |allowed| { codex_token_matches_api_key_account(&excluded, allowed) }
+        ));
         assert!(!api_key_rule_allows_account(&access, "gemini", |_| true));
     }
 
@@ -20781,8 +26370,11 @@ mod account_selection_tests {
         let access = ApiKeyAccess {
             all: false,
             prompt_token_limit: Some(1000),
+            input_token_budget: None,
+            quota: None,
             providers: vec![ApiKeyProviderAccess {
                 provider: "codex".to_string(),
+                account_scope: ApiKeyAccountScope::Selected,
                 accounts: vec!["first.json".to_string(), "second.json".to_string()],
                 prompt_token_limit: Some(800),
                 account_limits: vec![
@@ -20833,8 +26425,11 @@ mod account_selection_tests {
         let access = ApiKeyAccess {
             all: false,
             prompt_token_limit: None,
+            input_token_budget: None,
+            quota: None,
             providers: vec![ApiKeyProviderAccess {
                 provider: "codex".to_string(),
+                account_scope: ApiKeyAccountScope::All,
                 accounts: Vec::new(),
                 prompt_token_limit: None,
                 account_limits: vec![
@@ -20877,6 +26472,7 @@ mod account_selection_tests {
                 "codex",
                 301,
                 codex_token_matches_account,
+                |_| true,
             ),
             Some(250)
         );
@@ -20887,6 +26483,7 @@ mod account_selection_tests {
                 "codex",
                 275,
                 codex_token_matches_account,
+                |_| true,
             ),
             None
         );
@@ -21071,6 +26668,11 @@ pub(crate) fn should_drop_incoming_header(name: &str) -> bool {
         || lower == "authorization"
         || lower == "x-api-key"
         || lower == "x-internal-proxy-key"
+        || is_gateway_managed_codex_routing_header(&lower)
+        // A browser cookie can carry ChatGPT session/account state. Provider
+        // credentials are configured by the gateway, so no client cookie is
+        // needed on an upstream request.
+        || lower == "cookie"
         || lower == "accept-encoding"
         || lower == "host"
         || lower == "content-length"
@@ -21086,6 +26688,39 @@ pub(crate) fn should_drop_incoming_header(name: &str) -> bool {
 
     // Never leak edge-provider headers upstream (for example Cloudflare).
     lower.starts_with("cf-")
+}
+
+/// Upstream Codex routing state is selected by this process, not by callers.
+/// Accept both underscore and hyphen spellings because HTTP clients/proxies
+/// vary in their treatment of nonstandard underscore header names.
+fn is_gateway_managed_codex_routing_header(lower_name: &str) -> bool {
+    matches!(
+        lower_name,
+        "chatgpt-account-id"
+            | "chatgpt_account_id"
+            | "conversation-id"
+            | "conversation_id"
+            | "session-id"
+            | "session_id"
+    )
+}
+
+fn strip_client_controlled_codex_routing_headers(headers: &mut HeaderMap) {
+    for name in [
+        "chatgpt-account-id",
+        "chatgpt_account_id",
+        "conversation-id",
+        "conversation_id",
+        "session-id",
+        "session_id",
+    ] {
+        headers.remove(name);
+    }
+    // The gateway has no reason to propagate caller cookies to an upstream
+    // provider; remove it here as well as in `should_drop_incoming_header` so
+    // adapters that inspect the input HeaderMap cannot accidentally consume
+    // it as a context signal.
+    headers.remove(axum::http::header::COOKIE);
 }
 
 fn select_config_path(cli_path: Option<PathBuf>, env_path: Option<PathBuf>) -> PathBuf {
@@ -21105,19 +26740,58 @@ fn absolute_path(path: &FsPath) -> PathBuf {
 }
 
 fn resolve_config_relative_paths(cfg: &mut Config, config_path: &FsPath) {
-    let Some(auth_dir) = cfg.auth_dir.as_mut() else {
-        return;
-    };
+    // Pin the data directory to the configuration's location even when the
+    // field is omitted. Restarting from a different working directory must
+    // never select a fresh key registry or quota ledger.
+    let config_dir = config_path.parent().unwrap_or_else(|| FsPath::new("."));
+    let auth_dir = cfg
+        .auth_dir
+        .get_or_insert_with(|| config_dir.to_string_lossy().into_owned());
     let configured_auth_dir = FsPath::new(auth_dir);
     if configured_auth_dir.is_absolute() {
         return;
     }
 
-    let config_dir = config_path.parent().unwrap_or_else(|| FsPath::new("."));
     *auth_dir = config_dir
         .join(configured_auth_dir)
         .to_string_lossy()
         .into_owned();
+}
+
+fn validate_implicit_auth_dir(
+    cfg: &Config,
+    config_path: &FsPath,
+    working_dir: &FsPath,
+) -> Result<(), String> {
+    if cfg.auth_dir.is_some() {
+        return Ok(());
+    }
+    let config_dir = config_path.parent().unwrap_or_else(|| FsPath::new("."));
+    let canonical_config = config_dir
+        .canonicalize()
+        .unwrap_or_else(|_| config_dir.to_path_buf());
+    let canonical_working = working_dir
+        .canonicalize()
+        .unwrap_or_else(|_| working_dir.to_path_buf());
+    if canonical_config == canonical_working {
+        return Ok(());
+    }
+    let evidence = |dir: &FsPath| {
+        [
+            "api-keys.json",
+            "api-key-policy.sqlite3",
+            "api-key-policy.sqlite3.identity",
+        ]
+        .iter()
+        .any(|name| dir.join(name).exists())
+    };
+    // Historically an omitted directory meant the process cwd. Refuse an
+    // ambiguous first migration, rather than silently bootstrapping an empty
+    // registry next to an external config and forgetting existing balances.
+    if evidence(working_dir) || !evidence(config_dir) {
+        return Err("auth_dir is omitted and the config is outside the working directory; set auth_dir explicitly to the existing persistent data directory before starting or migrating".into());
+    }
+    Ok(())
 }
 
 fn load_config(config_path: &FsPath) -> (Config, PathBuf) {
@@ -21126,6 +26800,12 @@ fn load_config(config_path: &FsPath) -> (Config, PathBuf) {
         .unwrap_or_else(|err| panic!("failed to read config {}: {err}", config_path.display()));
     let mut cfg: Config = serde_json::from_str(&data)
         .unwrap_or_else(|err| panic!("invalid config {}: {err}", config_path.display()));
+    validate_implicit_auth_dir(
+        &cfg,
+        &config_path,
+        &std::env::current_dir().expect("working directory"),
+    )
+    .unwrap_or_else(|err| panic!("unsafe API-key data directory: {err}"));
     resolve_config_relative_paths(&mut cfg, &config_path);
     admin_auth::apply_env_overrides(&mut cfg.admin_auth);
     (cfg, config_path)
@@ -21138,8 +26818,8 @@ pub(crate) fn generated_temp_download_dir() -> PathBuf {
 #[cfg(test)]
 mod runtime_path_tests {
     use super::{
-        generated_temp_download_dir, resolve_config_relative_paths, select_config_path, Config,
-        GatewayArgs,
+        generated_temp_download_dir, resolve_config_relative_paths, select_config_path,
+        validate_implicit_auth_dir, Config, GatewayArgs,
     };
     use clap::Parser;
     use std::path::PathBuf;
@@ -21161,6 +26841,35 @@ mod runtime_path_tests {
             PathBuf::from("env/config.json")
         );
         assert_eq!(select_config_path(None, None), PathBuf::from("config.json"));
+    }
+
+    #[test]
+    fn backup_flag_names_a_destination_without_starting_the_service() {
+        let args = GatewayArgs::try_parse_from([
+            "io-gateway",
+            "--config",
+            "config.json",
+            "--backup-policy",
+            "fresh-snapshot",
+        ])
+        .unwrap();
+        assert_eq!(args.backup_policy, Some(PathBuf::from("fresh-snapshot")));
+    }
+
+    #[test]
+    fn omitted_auth_dir_is_pinned_and_ambiguous_external_config_fails_closed() {
+        let mut cfg: Config = serde_json::from_value(serde_json::json!({
+            "listen":"127.0.0.1:8319", "upstream_base":"https://example.test",
+            "proxy_api_key":"test-key", "tokens":[]
+        }))
+        .unwrap();
+        let base = std::env::temp_dir().join(format!("io-gateway-path-{}", uuid::Uuid::new_v4()));
+        let path = base.join("config.json");
+        assert!(validate_implicit_auth_dir(&cfg, &path, &base).is_ok());
+        assert!(validate_implicit_auth_dir(&cfg, &path, &base.join("elsewhere")).is_err());
+        resolve_config_relative_paths(&mut cfg, &path);
+        assert_eq!(cfg.auth_dir.as_deref(), base.to_str());
+        assert!(validate_implicit_auth_dir(&cfg, &path, &base.join("elsewhere")).is_ok());
     }
 
     #[test]

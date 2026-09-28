@@ -94,21 +94,29 @@ pub async fn image_generations(
     body: Bytes,
 ) -> Response {
     if !crate::check_api_key(&state, &headers) {
+        crate::release_api_key_budget_before_dispatch(&state);
         return authentication_error();
     }
 
     let raw: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
-        Err(_) => return invalid_request("Invalid request body"),
+        Err(_) => {
+            crate::release_api_key_budget_before_dispatch(&state);
+            return invalid_request("Invalid request body");
+        }
     };
     let payload = match build_image_payload(&raw) {
         Ok(payload) => payload,
-        Err(err) => return invalid_request(&err),
+        Err(err) => {
+            crate::release_api_key_budget_before_dispatch(&state);
+            return invalid_request(&err);
+        }
     };
     let Some(account) = super::accounts::candidate_accounts(&state)
         .into_iter()
         .next()
     else {
+        crate::release_api_key_budget_before_dispatch(&state);
         return no_accounts();
     };
 
@@ -125,6 +133,16 @@ pub async fn image_generations(
         "/minimax/v1/image_generation",
         crate::prompt_metrics_from_request_value(&raw),
     );
+    if let Err(response) = crate::reserve_api_key_budgets_for_prepared_dispatch(
+        &state,
+        context.provider_name,
+        &context.key,
+        &serde_json::to_vec(&payload).unwrap_or_default(),
+    )
+    .await
+    {
+        return response;
+    }
     crate::record_minimax_request(&state, &context);
     let response = state
         .client
@@ -209,21 +227,29 @@ pub async fn video_generations(
     body: Bytes,
 ) -> Response {
     if !crate::check_api_key(&state, &headers) {
+        crate::release_api_key_budget_before_dispatch(&state);
         return authentication_error();
     }
 
     let raw: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
-        Err(_) => return invalid_request("Invalid request body"),
+        Err(_) => {
+            crate::release_api_key_budget_before_dispatch(&state);
+            return invalid_request("Invalid request body");
+        }
     };
     let payload = match build_video_payload(&raw) {
         Ok(payload) => payload,
-        Err(err) => return invalid_request(&err),
+        Err(err) => {
+            crate::release_api_key_budget_before_dispatch(&state);
+            return invalid_request(&err);
+        }
     };
     let Some(account) = super::accounts::candidate_accounts(&state)
         .into_iter()
         .next()
     else {
+        crate::release_api_key_budget_before_dispatch(&state);
         return no_accounts();
     };
     let model = payload
@@ -242,6 +268,16 @@ pub async fn video_generations(
         &format!("/minimax{}", upstream_path),
         crate::prompt_metrics_from_request_value(&raw),
     );
+    if let Err(response) = crate::reserve_api_key_budgets_for_prepared_dispatch(
+        &state,
+        context.provider_name,
+        &context.key,
+        &serde_json::to_vec(&payload).unwrap_or_default(),
+    )
+    .await
+    {
+        return response;
+    }
     crate::record_minimax_request(&state, &context);
     let response = state
         .client

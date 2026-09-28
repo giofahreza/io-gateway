@@ -338,9 +338,166 @@ Sessions are persisted to disk and survive server restarts. Session duration is 
 
 **Settings modal** — API-key management, notification channel (Telegram or Google Chat) configuration, and per-account alert subscriptions.
 
-Managed API keys can be unrestricted or limited to one or more providers. Each allowed provider can grant access to every account for that provider or only selected accounts. Keys can also enforce estimated prompt-token limits for the whole key, a provider, or a specific account. Access and prompt-limit rules are enforced before provider dispatch and account load balancing, including requests routed through custom models. Existing and legacy keys remain unrestricted until their access is edited.
+Managed API keys can be unrestricted or limited to one or more providers. Each allowed provider can grant access to every account for that provider or only selected accounts. These are provider/account rules, not model or custom-alias allow-lists. For a custom-model request, the gateway evaluates each concrete target against the key's provider and account rules before dispatch or fallback. Existing and legacy keys remain unrestricted until their access is edited.
 
-Prompt-token limits are request guardrails, not monthly counters. A request is blocked when its estimated input prompt tokens exceed the strictest matching whole-key, provider, or account limit.
+`max_estimated_input_tokens_per_request` is a per-request guardrail. A request is blocked when its estimated input tokens exceed the strictest matching whole-key, provider, or account cap. It is not a monthly counter and does not cap output tokens or cost. `prompt_token_limit` is accepted as a deprecated input alias during migration. A cap must be a positive integer; omit it for no cap.
+
+`input_token_budget` is the separate, opt-in cumulative control. It is whole-key only and input-token-only: set a positive `limit` with `period` of `lifetime` or `calendar_month`. It does not promise an output-token or monetary-cost budget.
+
+These legacy input controls do not impose a per-key request-count quota. A cap-only key can make repeated requests as long as each request fits its cap. Input estimates are conservative, not exact provider billing counts; every upstream retry or fallback needs its own legacy budget reservation, and settlement retains at least that reservation even when reported usage is lower. Use the separate `quota` policy below for renewable resource quotas. Neither feature is a requests-per-second burst limiter.
+
+When a key has an input cap or budget, media, encrypted/retained context, and provider-hosted retrieval or execution tools whose input cost cannot be measured locally are rejected with `400 prompt_measurement_required`. Ordinary function-tool definitions and JSON schemas remain measurable. Policy history records allowed dispatches and outcomes for cap-only keys as well as budgeted keys.
+
+```json
+{
+  "input_token_budget": {
+    "limit": 1000000,
+    "period": "calendar_month"
+  }
+}
+```
+
+### Renewable API-key quotas
+
+The optional `access.quota` policy supports simultaneous per-resource rules. For example:
+
+```json
+{
+  "all": true,
+  "quota": {
+    "timezone": "Asia/Jakarta",
+    "rules": [
+      { "metric": "requests", "period": "daily", "limit": 100 },
+      { "metric": "input_tokens", "period": "weekly", "limit": 100000 },
+      { "metric": "output_tokens", "period": "monthly", "limit": 50000 }
+    ]
+  }
+}
+```
+
+Supported metrics are `requests`, `input_tokens`, `uncached_input_tokens`,
+`output_tokens`, `cache_read_tokens`, `cache_write_tokens`, and `cache_tokens`.
+Total input includes cache reads/writes; combined cache is a subset of input.
+Total output includes reasoning, where reported. Do not add these subsets again
+when calculating input + output totals. Missing provider fields are unknown, not zero.
+
+All periods share the first accepted generation's anchor. Daily is 24 hours and
+weekly is 168 hours; monthly uses the configured calendar timezone (default UTC).
+A Tuesday 15:00 weekly first use renews the next Tuesday at 15:00 in Jakarta.
+Monthly January 31 renews February 28/29, then March 31. Inactivity and restart
+do not move the cadence, and unused allowance does not accumulate. DST regions
+can see local-time shifts for daily/weekly elapsed durations. Monthly nonexistent
+local times advance to the first valid instant; overlaps use the earlier instant.
+
+Every applicable rule is checked and reserved together before dispatch. One
+accepted client generation counts once; internal retries/fallbacks consume their
+own tokens but not another logical request. Retrieval, deletion, catalog, health,
+and administrative operations do not consume generation-request allowance.
+Upstream failures or client disconnects after dispatch are not free requests.
+
+The dashboard's API Keys editor provides **Add quota rule** and a timezone field.
+The list shows confirmed usage, reservations, uncertain consumption, remaining
+allowance, and the next renewal. Balances refresh after managed-key Test API calls
+and every 10 seconds while Settings is open. These read-only refreshes preserve
+unsaved policy edits; they do not reset the editor or its selected account scope.
+`GET /admin/api-keys/quotas?id=KEY_ID` exposes the same durable summary. A per-key
+accounting failure returns `503` with `ok: false`; `quota_summaries` retains the
+available summaries and an `{"error": true}` entry for each failed key. This is
+unavailable accounting, not zero usage or a renewed allowance.
+Quota denial uses native-protocol `429 quota_exceeded`, with
+`Retry-After`, `X-Quota-Reset-At`, and `X-Quota-Remaining` when applicable.
+If an administrator changes a legacy input-budget policy while a request is
+being prepared, `409 api_key_policy_changed` asks the client to retry; no upstream
+generation is sent under that stale policy.
+
+Strict token limits require measurable input and a supported native output bound.
+Send an explicit small `max_output_tokens`/native maximum for output-limited keys;
+the requested maximum must fit the available reservation. Unsupported bounds
+return `400 quota_measurement_required` before contacting the provider. Codex and
+Grok and native MiniMax Responses currently do not support strict output quotas. Other provider/model paths are
+capability-gated; dynamic/unbounded thinking, hosted tools, and unknown models can
+be rejected. Request-only quotas do not require token measurement.
+
+Complete, reliable usage settles actual values and releases unused reservations.
+Missing/partial usage keeps conservative uncertain charges. A crash does not
+refund outstanding holds: recovery converts stale holds to uncertain consumption.
+Do not mistake these protective charges for measured provider billing.
+
+Renewable quota limits must be positive signed-64-bit integers, up to
+`9223372036854775807`; null/omitted policy means no new quota. The dashboard only
+edits exactly representable integers up to `9007199254740991`. If an existing
+policy contains a larger limit, it refuses editing/saving instead of rounding or
+removing the limit. Use `iogw keys update KEY_ID --access-json @access.json` or the admin
+API to edit it, and `iogw keys quotas --id KEY_ID` or the API for exact large
+balances.
+
+Duplicate resource/period rules are rejected. Admin create/update requests reject
+unknown fields in the outer payload and in access, provider, account-limit,
+input-budget, and quota objects, so misspellings such as `acess` or `quotas` do
+not silently produce an unlimited key. Canonical cap names and the deprecated
+`prompt_token_limit` alias remain accepted. An empty create payload deliberately
+creates an unrestricted key; updates require an `access` object. Persisted legacy
+metadata remains compatible with migration.
+
+Normal allowance edits preserve usage; lowering below consumption blocks new requests.
+After first admission, changing timezone/resources/periods requires an explicit
+new policy/key rather than silently resetting the old schedule. Disabling and
+re-enabling the same schedule preserves its prior balances.
+
+CLI equivalents:
+
+```sh
+iogw keys create --label client --access-json @access.json
+iogw keys create --label client --quota-json @quota.json
+iogw keys update KEY_ID --access-json @access.json
+iogw keys quotas --id KEY_ID
+```
+
+`quota.json` contains the `timezone` and `rules` object; `access.json` is the full
+access policy, including provider/account restrictions you intend to retain.
+
+### Durable storage and migration
+
+Managed key hashes/access and renewable quota accounting share
+`<auth_dir>/api-key-policy.sqlite3`, with WAL and full synchronization. Startup
+imports legacy `api-keys.json` while preserving key IDs, hashes, revocations, old
+input-budget balances, and active holds. The original is retained privately as
+`api-keys.json.migration-backup`; the old live JSON becomes a migration sentinel
+that refuses old-binary use. Do not deploy an older binary against migrated state.
+If a legacy JSON key has an input budget but its accounting database is missing,
+migration refuses to invent a fresh allowance. Restore the original accounting
+state (including its committed WAL), or explicitly reconcile it before upgrading.
+
+Keep the entire data directory on a persistent local volume. The identity file
+`api-key-policy.sqlite3.identity` must stay with its database. Missing, substituted,
+or structurally damaged established accounting fails closed. If `auth_dir` is
+omitted, startup resolves data relative to the configuration's absolute directory,
+not a changing process working directory. An ambiguous first migration from an
+external config is rejected: set `auth_dir` explicitly to the existing directory.
+Prefer an explicit absolute `auth_dir`.
+
+Create a consistent online policy snapshot with:
+
+```sh
+io-gateway --config /absolute/config.json --backup-policy /backups/new-policy-snapshot
+```
+
+The destination must not exist and its parent must exist. The command uses SQLite
+`VACUUM INTO`, includes the matching identity, migration sentinel and manifest,
+then exits without starting a listener. It never overwrites a snapshot. Provider
+credentials, runtime configuration and reporting history are **not** included;
+back them up separately with private permissions. Failed snapshots are retained
+as explicitly incomplete private directories and must not be used for recovery.
+
+Copying only a live `.sqlite3` file can omit committed WAL transactions. Validate restoration
+offline before enabling traffic. Restoring an old snapshot rolls back usage too:
+reconcile the missing interval rather than assuming restart guarantees cover
+storage loss. Reporting-history pruning does not alter quota balances.
+
+SQLite is supported on one host/local filesystem. Multi-host replicas need a
+central transactional accounting service; do not share WAL databases over NFS.
+
+**Test API** has two explicit modes. Its default **operator-bypass** mode can prove an upstream route and account selection without applying managed-key policy. Selecting an active managed API-key profile instead applies that key's provider/account scope, per-request caps, input-token budget, and renewable quotas before dispatch. The dashboard sends only the managed key ID for that mode—never its plaintext secret.
 
 **Theme toggle** — dark / light, persisted to localStorage.
 
@@ -356,7 +513,7 @@ All client requests use `Authorization: Bearer <IO_GATEWAY_KEY>`.
 
 | Endpoint | Description |
 |---|---|
-| `GET /v1/models` | Unified model catalog across all enabled providers |
+| `GET /v1/models` | Unified model catalog filtered to the caller's permitted provider/account routes |
 | `POST /v1/responses` | OpenAI Responses API (primary endpoint) |
 | `POST /v1/chat/completions` | OpenAI Chat Completions API |
 | `POST /claude/v1/messages` | Anthropic Messages API |
@@ -376,6 +533,7 @@ All client requests use `Authorization: Bearer <IO_GATEWAY_KEY>`.
 | `POST /credentials/delete` | Delete a credential file |
 | `POST /credentials/toggle` | Enable or disable a credential |
 | `GET /admin/api-keys` | List managed API keys and selectable provider accounts |
+| `GET /admin/api-keys/quotas` | Durable per-key renewable quota balances, anchors, and renewal times; optional `id` filter |
 | `POST /admin/api-keys/create` | Create an API key with optional provider/account access rules |
 | `POST /admin/api-keys/access` | Replace an API key's provider/account access rules |
 | `POST /admin/api-keys/revoke` | Revoke an API key |
@@ -451,7 +609,7 @@ cop:gpt-5.1          → GitHub Copilot with upstream model gpt-5.1
 cld:claude-sonnet-4  → Claude OAuth with upstream model claude-sonnet-4
 ```
 
-Prefixed model ids are returned by `GET /v1/models` and should be used in client config and model pickers.
+Prefixed model ids returned to the caller by `GET /v1/models` should be used in client config and model pickers.
 
 ---
 
@@ -523,7 +681,7 @@ curl -sS http://127.0.0.1:8319/custom-models/delete \
 - If every target fails, the response is `502` with the failed target list in the error body.
 - Disabled custom models are hidden from `/v1/models` and return `503` when called directly.
 - To rename an alias, send `original_alias` (or `previous_alias`) alongside the new alias; the old alias is deleted after the new one is saved.
-- Custom model aliases appear in `GET /v1/models`, `GET /codex/models`.
+- An enabled custom-model alias appears in `GET /v1/models` and `GET /codex/models` only when at least one of its concrete targets is visible to the caller's provider/account scope.
 - Targets cannot point at another `ctm:` alias (no recursive routing).
 
 ---

@@ -48,7 +48,29 @@ pub(crate) fn atomic_write(
         let _ = private;
         file.write_all(data).map_err(|err| err.to_string())?;
         file.sync_all().map_err(|err| err.to_string())?;
-        std::fs::rename(&tmp, path).map_err(|err| err.to_string())
+        std::fs::rename(&tmp, path).map_err(|err| err.to_string())?;
+        // A synced temporary file alone is not enough: a crash after rename
+        // can still lose the directory entry on filesystems that journal data
+        // and metadata separately.  Sync the containing directory once the
+        // replacement is visible so authorization/config writes are durable.
+        //
+        // The rename has already made this exact value authoritative, though.
+        // Do not report it as an uncommitted write if a platform rejects a
+        // directory fsync: callers that then retain old in-memory policy would
+        // disagree with the file visible to a fresh process. Warn so an
+        // operator can correct the filesystem durability problem instead.
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            if let Err(err) = std::fs::File::open(parent).and_then(|directory| directory.sync_all())
+            {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "atomic write renamed data but could not fsync its parent directory"
+                );
+            }
+        }
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);

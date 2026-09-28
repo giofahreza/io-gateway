@@ -26,7 +26,7 @@ IO Gateway turns a pile of separate AI accounts into one operational gateway:
 - Load balancing, priority account usage, and failover across multiple accounts.
 - Custom model aliases that can route to one or many provider targets.
 - Dashboard-based account, quota, usage, notification, and API-key management.
-- Provider/account scoped API keys with whole-key, provider, and account prompt-token limits.
+- Provider/account scoped API keys with per-request estimated-input caps and optional whole-key input-token budgets.
 
 ## Feature Highlights
 
@@ -67,7 +67,7 @@ Custom models can:
 - Use every account except a selected account.
 - Weight targets for load balancing.
 - Fall back to another provider when a target fails.
-- Appear in `/v1/models` like a normal model.
+- Appear in `/v1/models` when enabled and visible through the caller's permitted provider/account targets.
 
 Example use cases:
 
@@ -99,10 +99,13 @@ Keys can be:
 - Limited to one provider.
 - Limited to multiple providers.
 - Limited to selected accounts inside a provider.
-- Limited by estimated prompt tokens for the whole key, a provider, or a specific account.
+- Capped by estimated input tokens in a single request for the whole key, a provider, or a specific account.
+- Given an optional cumulative, input-token-only whole-key budget for a lifetime or calendar month.
 - Updated or revoked from the dashboard.
 
-Access and prompt-limit rules are enforced before routing and load balancing, including custom-model requests.
+Provider and account access is enforced before routing and load balancing. A custom-model request is checked against the provider and account selected for each concrete target; API keys do not have separate model or alias allow-lists.
+
+The per-request cap is a guardrail, not a spending counter. The optional input-token budget is the separate feature for cumulative input-token usage; it does not cap output tokens or monetary cost.
 
 ### Dashboard
 

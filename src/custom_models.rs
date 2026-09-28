@@ -386,27 +386,6 @@ pub(crate) fn target_label(target: &CustomModelTarget) -> String {
     }
 }
 
-pub(crate) fn route_summary(model: &CustomModel) -> String {
-    model
-        .routes
-        .iter()
-        .filter_map(|group| {
-            let labels = group
-                .targets
-                .iter()
-                .filter(|target| target.enabled)
-                .map(target_label)
-                .collect::<Vec<_>>();
-            if labels.is_empty() {
-                None
-            } else {
-                Some(labels.join(", "))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" -> ")
-}
-
 pub(crate) fn target_count(model: &CustomModel) -> usize {
     model
         .routes

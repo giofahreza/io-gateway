@@ -86,6 +86,7 @@ pub async fn messages(
     body: Bytes,
 ) -> impl IntoResponse {
     if !crate::check_api_key(&state, &headers) {
+        crate::release_api_key_budget_before_dispatch(&state);
         return anthropic_error(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
@@ -95,6 +96,7 @@ pub async fn messages(
     let raw = match serde_json::from_slice::<Value>(&body) {
         Ok(value) => value,
         Err(_) => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return anthropic_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
@@ -105,6 +107,7 @@ pub async fn messages(
     let model = match raw.get("model").and_then(|value| value.as_str()) {
         Some(model) if !model.trim().is_empty() => model.trim().to_string(),
         _ => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return anthropic_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
@@ -114,11 +117,16 @@ pub async fn messages(
     };
     let accounts = super::accounts::candidate_accounts(&state);
     if accounts.is_empty() {
+        crate::release_api_key_budget_before_dispatch(&state);
         let reason = super::accounts::empty_accounts_reason(&state);
         return anthropic_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", reason);
     }
     let wants_stream = crate::source::wants_stream(&headers, &body);
-    let prompt_metrics = crate::prompt_metrics_from_request_value(&raw);
+    // Policy and usage accounting must include the Claude Code system blocks
+    // that are injected immediately before the upstream POST.
+    let prompt_metrics = policy_prompt_metrics("anthropic/v1/messages", &body)
+        .unwrap_or_else(|| crate::prompt_metrics_from_request_value(&raw));
+    let prepared_policy_body = prepare_anthropic_body(body.clone()).0;
     let mut last_error: Option<(StatusCode, String)> = None;
 
     for (attempt_idx, account) in accounts.iter().enumerate() {
@@ -128,11 +136,25 @@ pub async fn messages(
             "/claude/v1/messages",
             prompt_metrics.clone(),
         );
+        if let Err(response) = crate::reserve_api_key_budgets_for_prepared_dispatch(
+            &state,
+            context.provider_name,
+            &context.key,
+            &prepared_policy_body,
+        )
+        .await
+        {
+            return response;
+        }
         crate::record_claude_request(&state, &context);
         let access_token = match super::auth::ensure_access_token(&state, account).await {
             Ok(token) => token,
             Err(err) => {
-                crate::record_claude_error(&state, &context, &err);
+                if attempt_idx + 1 < accounts.len() {
+                    crate::record_request_pre_dispatch_retry_error(&state, &context, err.as_str());
+                } else {
+                    crate::record_request_pre_dispatch_error(&state, &context, err.as_str());
+                }
                 last_error = Some((StatusCode::UNAUTHORIZED, err));
                 if attempt_idx + 1 < accounts.len() {
                     continue;
@@ -228,6 +250,7 @@ pub async fn responses(
     body: Bytes,
 ) -> impl IntoResponse {
     if !crate::check_api_key(&state, &headers) {
+        crate::release_api_key_budget_before_dispatch(&state);
         return openai_error(
             StatusCode::UNAUTHORIZED,
             "invalid_request_error",
@@ -237,6 +260,7 @@ pub async fn responses(
     let raw = match serde_json::from_slice::<Value>(&body) {
         Ok(value) => value,
         Err(_) => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return openai_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
@@ -247,6 +271,7 @@ pub async fn responses(
     let model = match raw.get("model").and_then(|value| value.as_str()) {
         Some(model) if !model.trim().is_empty() => model.trim().to_string(),
         _ => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return openai_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
@@ -258,16 +283,22 @@ pub async fn responses(
     let anthropic_payload = match responses_to_anthropic_messages(&raw, &model, false) {
         Ok(payload) => payload,
         Err(err) => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &err);
         }
     };
     let anthropic_body = Bytes::from(serde_json::to_vec(&anthropic_payload).unwrap_or_default());
     let accounts = super::accounts::candidate_accounts(&state);
     if accounts.is_empty() {
+        crate::release_api_key_budget_before_dispatch(&state);
         let reason = super::accounts::empty_accounts_reason(&state);
         return openai_error(StatusCode::SERVICE_UNAVAILABLE, "server_error", reason);
     }
-    let prompt_metrics = crate::prompt_metrics_from_request_value(&raw);
+    // Keep per-account telemetry consistent with the proxy's final-payload
+    // policy preflight, including translated and injected system content.
+    let prompt_metrics = policy_prompt_metrics("responses", &body)
+        .unwrap_or_else(|| crate::prompt_metrics_from_request_value(&raw));
+    let prepared_policy_body = prepare_anthropic_body(anthropic_body.clone()).0;
     let mut last_error: Option<(StatusCode, String)> = None;
 
     for (attempt_idx, account) in accounts.iter().enumerate() {
@@ -277,11 +308,25 @@ pub async fn responses(
             "/claude/v1/responses",
             prompt_metrics.clone(),
         );
+        if let Err(response) = crate::reserve_api_key_budgets_for_prepared_dispatch(
+            &state,
+            context.provider_name,
+            &context.key,
+            &prepared_policy_body,
+        )
+        .await
+        {
+            return response;
+        }
         crate::record_claude_request(&state, &context);
         let access_token = match super::auth::ensure_access_token(&state, account).await {
             Ok(token) => token,
             Err(err) => {
-                crate::record_claude_error(&state, &context, &err);
+                if attempt_idx + 1 < accounts.len() {
+                    crate::record_request_pre_dispatch_retry_error(&state, &context, err.as_str());
+                } else {
+                    crate::record_request_pre_dispatch_error(&state, &context, err.as_str());
+                }
                 last_error = Some((StatusCode::UNAUTHORIZED, err));
                 if attempt_idx + 1 < accounts.len() {
                     continue;
@@ -352,6 +397,7 @@ pub async fn responses(
         if usage.total_tokens == 0 {
             usage = crate::usage_metrics_from_response_value(&anthropic);
         }
+        crate::quota_usage::preserve_native_usage(&mut usage, &anthropic, "anthropic");
         crate::record_claude_success(&state, &context, &usage);
         if wants_stream {
             return responses_sse(response).into_response();
@@ -463,6 +509,31 @@ fn prepare_anthropic_body(body: Bytes) -> (Bytes, Option<String>) {
     inject_claude_code_system(object);
     let rebuilt = serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec());
     (Bytes::from(rebuilt), beta)
+}
+
+/// Calculate the conservative input footprint of the exact Anthropic JSON
+/// payload this adapter will dispatch.  This is used by the outer API-key
+/// preflight as well as account telemetry, so injected Claude Code text and
+/// Responses-to-Anthropic conversion cannot evade a key cap or budget.
+pub(crate) fn policy_prompt_metrics(
+    upstream_path: &str,
+    body: &Bytes,
+) -> Option<crate::PromptMetrics> {
+    let raw = serde_json::from_slice::<Value>(body).ok()?;
+    let prepared = if upstream_path == "anthropic/v1/messages" {
+        prepare_anthropic_body(body.clone()).0
+    } else {
+        let model = raw.get("model")?.as_str()?.trim();
+        if model.is_empty() {
+            return None;
+        }
+        let anthropic = responses_to_anthropic_messages(&raw, model, false).ok()?;
+        let body = Bytes::from(serde_json::to_vec(&anthropic).ok()?);
+        prepare_anthropic_body(body).0
+    };
+    serde_json::from_slice::<Value>(&prepared)
+        .ok()
+        .map(|value| crate::prompt_metrics_from_request_value(&value))
 }
 
 fn inject_claude_code_system(object: &mut Map<String, Value>) {
@@ -1478,14 +1549,23 @@ async fn stream_anthropic_passthrough(
 ) -> axum::response::Response {
     let usage_state = state.clone();
     let usage_context = context.clone();
+    // Construct this before the lazy stream so dropping an unpolled response
+    // still abandons the selected account and settles its conservative hold.
+    let lifecycle = crate::StreamRequestGuard::new(&usage_state, &usage_context);
     let stream = async_stream::stream! {
-        let mut lifecycle = crate::StreamRequestGuard::new(&usage_state, &usage_context);
+        let mut lifecycle = lifecycle;
         let mut upstream = resp.bytes_stream();
         let mut parser = AnthropicSseUsageTracker::default();
         while let Some(chunk) = upstream.next().await {
             match chunk {
                 Ok(bytes) => {
                     parser.push(&bytes);
+                    if let Some(message) = parser.terminal_error() {
+                        crate::record_claude_error(&usage_state, &usage_context, message);
+                        lifecycle.finish();
+                        yield Ok::<Bytes, std::io::Error>(bytes);
+                        return;
+                    }
                     yield Ok::<Bytes, std::io::Error>(bytes);
                 }
                 Err(err) => {
@@ -1497,10 +1577,14 @@ async fn stream_anthropic_passthrough(
                 }
             }
         }
-        if let Some(usage) = parser.finish() {
-            crate::record_claude_success(&usage_state, &usage_context, &usage);
-        } else {
-            crate::record_claude_success(&usage_state, &usage_context, &crate::UsageMetrics::default());
+        match parser.finish() {
+            Err(message) => crate::record_claude_error(&usage_state, &usage_context, &message),
+            Ok(Some(usage)) => crate::record_claude_success(&usage_state, &usage_context, &usage),
+            Ok(None) => crate::record_claude_success(
+                &usage_state,
+                &usage_context,
+                &crate::UsageMetrics::default(),
+            ),
         }
         lifecycle.finish();
     };
@@ -1636,6 +1720,9 @@ struct AnthropicSseUsageTracker {
     buffer: Vec<u8>,
     usage: crate::UsageMetrics,
     saw_usage: bool,
+    saw_message_stop: bool,
+    saw_final_output_usage: bool,
+    terminal_error: Option<String>,
 }
 
 impl AnthropicSseUsageTracker {
@@ -1650,30 +1737,54 @@ impl AnthropicSseUsageTracker {
         }
     }
 
-    fn finish(mut self) -> Option<crate::UsageMetrics> {
+    fn finish(mut self) -> Result<Option<crate::UsageMetrics>, String> {
         if !self.buffer.is_empty() {
             let raw = std::mem::take(&mut self.buffer);
             self.absorb_event(&raw);
         }
+        if let Some(error) = self.terminal_error {
+            return Err(error);
+        }
         if self.saw_usage {
-            Some(self.usage)
+            crate::quota_usage::mark_stream_usage(
+                &mut self.usage,
+                "anthropic",
+                self.saw_message_stop && self.saw_final_output_usage,
+            );
+            Ok(Some(self.usage))
         } else {
-            None
+            Ok(None)
         }
     }
 
+    fn terminal_error(&self) -> Option<&str> {
+        self.terminal_error.as_deref()
+    }
+
     fn absorb_event(&mut self, raw_event: &[u8]) {
-        let Some(data) = parse_sse_data(raw_event) else {
-            return;
-        };
-        if data.trim() == "[DONE]" {
-            return;
+        if self.terminal_error.is_none() {
+            if let Some(error) = crate::sse_terminal_error_from_event(raw_event) {
+                self.terminal_error = Some(error);
+                return;
+            }
         }
-        let Ok(value) = serde_json::from_str::<Value>(&data) else {
+        let Some(value) = crate::sse_event_json_value(raw_event) else {
             return;
         };
+        if value.get("type").and_then(Value::as_str) == Some("message_stop") {
+            self.saw_message_stop = true;
+        }
+        if value.get("type").and_then(Value::as_str) == Some("message_delta") {
+            self.saw_final_output_usage |= value
+                .get("usage")
+                .is_some_and(crate::quota_usage::has_output_observation)
+                && value
+                    .pointer("/delta/stop_reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reason| !reason.is_empty());
+        }
         let usage = crate::usage_metrics_from_response_value(&value);
-        if usage.input_tokens > 0 || usage.output_tokens > 0 || usage.total_tokens > 0 {
+        if usage.raw_usage.is_some() {
             merge_usage_metrics(&mut self.usage, usage);
             self.saw_usage = true;
         }
@@ -1689,8 +1800,8 @@ fn merge_usage_metrics(current: &mut crate::UsageMetrics, incoming: crate::Usage
         .total_tokens
         .max(incoming.total_tokens)
         .max(current.input_tokens.saturating_add(current.output_tokens));
-    if incoming.raw_usage.is_some() {
-        current.raw_usage = incoming.raw_usage;
+    if let Some(incoming) = incoming.raw_usage {
+        crate::quota_usage::merge_cumulative_usage(&mut current.raw_usage, &incoming);
     }
 }
 
@@ -1726,6 +1837,66 @@ fn parse_sse_data(raw_event: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_native_tool_arguments_are_literal_but_result_media_is_not() {
+        let raw = json!({
+            "model":"claude-sonnet-4", "max_tokens":20,
+            "messages":[
+                {"role":"assistant","content":[{"type":"tool_use","id":"call_lookup","name":"lookup",
+                 "input":{"context":"query","file_id":"label","image_url":"an argument"}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_lookup","content":"found"}]}
+            ]
+        });
+        let prepared = prepare_anthropic_body(Bytes::from(raw.to_string())).0;
+        let mut payload: Value = serde_json::from_slice(&prepared).unwrap();
+        let bounds = crate::quota_usage::prepared_bounds("claude", &payload).unwrap();
+        assert!(bounds.input_measurable);
+        assert_eq!(bounds.input_upper_bound, prepared.len() as u64);
+        payload["messages"][1]["content"][0]["content"] = json!([{
+            "type":"image", "source":{"type":"url","url":"https://example.test/a.png"}
+        }]);
+        assert!(
+            !crate::quota_usage::prepared_bounds("claude", &payload)
+                .unwrap()
+                .input_measurable
+        );
+    }
+
+    #[test]
+    fn quota_native_mcp_connector_is_unmeasurable_after_preparation() {
+        let raw = json!({
+            "model":"claude-sonnet-4", "max_tokens":20,
+            "messages":[{"role":"user","content":"use the connector"}],
+            "mcp_servers":[{"type":"url","url":"https://example.test/mcp","name":"fixture"}]
+        });
+        let prepared = prepare_anthropic_body(Bytes::from(raw.to_string())).0;
+        let payload: Value = serde_json::from_slice(&prepared).unwrap();
+        assert_eq!(payload["mcp_servers"], raw["mcp_servers"]);
+        let bounds = crate::quota_usage::prepared_bounds("claude", &payload).unwrap();
+        assert!(!bounds.input_measurable);
+        assert!(bounds.output_upper_bound.is_none());
+        assert_eq!(bounds.input_upper_bound, prepared.len() as u64);
+    }
+
+    #[test]
+    fn quota_stream_requires_final_output_usage_not_just_message_stop() {
+        for (tail, complete) in [
+            ("", false),
+            ("data: {\"type\":\"message_stop\"}\n\n", false),
+            ("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\ndata: {\"type\":\"message_stop\"}\n\n", false),
+            ("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\ndata: {\"type\":\"message_stop\"}\n\n", true),
+        ] {
+            let mut tracker = AnthropicSseUsageTracker::default();
+            tracker.push(&Bytes::from_static(b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"cache_read_input_tokens\":7,\"cache_creation_input_tokens\":3,\"output_tokens\":0}}}\n\n"));
+            tracker.push(&Bytes::copy_from_slice(tail.as_bytes()));
+            let metrics = tracker.finish().unwrap().unwrap();
+            let normalized = crate::quota_usage::normalize("claude", metrics.raw_usage.as_ref().unwrap(), true);
+            assert_eq!(normalized.trustworthy_final, complete, "{tail:?}");
+            assert_eq!(normalized.input_tokens, Some(15));
+            if complete { assert_eq!(normalized.output_tokens, Some(9)); }
+        }
+    }
 
     #[test]
     fn responses_payload_maps_text_tools_and_tool_history() {
@@ -1850,5 +2021,48 @@ mod tests {
         assert_eq!(out["system"][1]["text"], CLAUDE_CODE_AGENT_PROMPT);
         assert_eq!(out["system"][2]["text"], "Keep answers concise.");
         assert!(out.get("betas").is_none());
+    }
+
+    #[test]
+    fn policy_metrics_include_translated_and_injected_system_content() {
+        let native = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "claude-fable-5",
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        );
+        let native_raw: Value = serde_json::from_slice(&native).unwrap();
+        let native_metrics = policy_prompt_metrics("anthropic/v1/messages", &native).unwrap();
+        assert!(
+            native_metrics.estimated_input_tokens()
+                > crate::prompt_metrics_from_request_value(&native_raw).estimated_input_tokens()
+        );
+
+        let responses = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "claude-fable-5",
+                "input": "hi"
+            }))
+            .unwrap(),
+        );
+        let responses_raw: Value = serde_json::from_slice(&responses).unwrap();
+        let responses_metrics = policy_prompt_metrics("responses", &responses).unwrap();
+        assert!(
+            responses_metrics.estimated_input_tokens()
+                > crate::prompt_metrics_from_request_value(&responses_raw).estimated_input_tokens()
+        );
+    }
+
+    #[test]
+    fn anthropic_sse_tracker_fails_on_error_event() {
+        let mut tracker = AnthropicSseUsageTracker::default();
+        tracker.push(&Bytes::from_static(
+            b"event: error\ndata: {\"error\":{\"message\":\"quota exhausted\"}}\n\n",
+        ));
+        assert!(matches!(
+            tracker.finish(),
+            Err(message) if message == "quota exhausted"
+        ));
     }
 }

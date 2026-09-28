@@ -100,6 +100,7 @@ pub async fn responses(
     body: Bytes,
 ) -> impl IntoResponse {
     if !crate::check_api_key(&state, &headers) {
+        crate::release_api_key_budget_before_dispatch(&state);
         return (
             StatusCode::UNAUTHORIZED,
             [("Content-Type", "application/json")],
@@ -115,6 +116,7 @@ pub async fn responses(
     let request_value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
@@ -124,13 +126,14 @@ pub async fn responses(
                     None,
                 ),
             )
-                .into_response()
+                .into_response();
         }
     };
 
     let model = match request_value.get("model").and_then(|v| v.as_str()) {
         Some(model) if !model.trim().is_empty() => model.to_string(),
         _ => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
@@ -140,11 +143,12 @@ pub async fn responses(
                     None,
                 ),
             )
-                .into_response()
+                .into_response();
         }
     };
 
     if let Err(err) = validate_request_history(&request_value) {
+        crate::release_api_key_budget_before_dispatch(&state);
         return (
             StatusCode::BAD_REQUEST,
             [("Content-Type", "application/json")],
@@ -159,6 +163,7 @@ pub async fn responses(
 
     let accounts = super::accounts::candidate_accounts(&state);
     if accounts.is_empty() {
+        crate::release_api_key_budget_before_dispatch(&state);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [("Content-Type", "application/json")],
@@ -192,6 +197,7 @@ pub async fn responses(
                         context.provider_name,
                         &context.key,
                     );
+                    crate::release_api_key_budget_before_dispatch(&state);
                     return (
                         StatusCode::BAD_REQUEST,
                         [("Content-Type", "application/json")],
@@ -205,12 +211,26 @@ pub async fn responses(
                 }
             };
 
+        if let Err(response) = crate::reserve_api_key_budgets_for_prepared_dispatch(
+            &state,
+            context.provider_name,
+            &context.key,
+            &serde_json::to_vec(&payload).unwrap_or_default(),
+        )
+        .await
+        {
+            return response;
+        }
         crate::record_antigravity_request(&state, &context);
 
         let access_token = match super::auth::ensure_access_token(&state, account).await {
             Ok(token) => token,
             Err(err) => {
-                crate::record_antigravity_error(&state, &context, &err);
+                if attempt_idx + 1 < accounts.len() {
+                    crate::record_request_pre_dispatch_retry_error(&state, &context, err.as_str());
+                } else {
+                    crate::record_request_pre_dispatch_error(&state, &context, err.as_str());
+                }
                 last_error = Some((StatusCode::BAD_GATEWAY, err));
                 if attempt_idx + 1 < accounts.len() {
                     continue;
@@ -219,9 +239,37 @@ pub async fn responses(
             }
         };
 
-        let upstream = match send_generate_request(&state.client, &access_token, &payload).await {
+        let upstream = match send_generate_request(
+            &state.client,
+            &access_token,
+            &payload,
+            super::auth::ANTIGRAVITY_ENDPOINTS,
+            |message| {
+                let state = &state;
+                let context = &context;
+                let payload = &payload;
+                async move {
+                    // The preceding endpoint already received this prompt.
+                    // Settle its hold and obtain a distinct one before the
+                    // same account can send it to the fallback endpoint.
+                    crate::record_antigravity_error(state, context, message);
+                    crate::reserve_api_key_budgets_for_prepared_dispatch(
+                        state,
+                        context.provider_name,
+                        &context.key,
+                        &serde_json::to_vec(payload).unwrap_or_default(),
+                    )
+                    .await?;
+                    crate::record_antigravity_request(state, context);
+                    Ok(())
+                }
+            },
+        )
+        .await
+        {
             Ok(value) => value,
-            Err((status, message)) => {
+            Err(GenerateRequestError::Policy(response)) => return response,
+            Err(GenerateRequestError::Upstream(status, message)) => {
                 crate::record_antigravity_error(&state, &context, &message);
                 if attempt_idx + 1 < accounts.len()
                     && crate::should_retry_account_error(status, &message)
@@ -247,7 +295,8 @@ pub async fn responses(
         };
 
         let mut openai_response = google_to_openai_response(&upstream, &model);
-        let usage = crate::usage_metrics_from_response_value(&openai_response);
+        let mut usage = crate::usage_metrics_from_response_value(&openai_response);
+        crate::quota_usage::preserve_native_usage(&mut usage, &upstream, "google");
         crate::record_antigravity_success(&state, &context, &usage);
         attach_temp_downloads(&mut openai_response);
 
@@ -298,6 +347,9 @@ pub async fn compact(
     let mut request = match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(value) => value,
         Err(_) => {
+            // `/responses/compact` reaches this wrapper before `responses`,
+            // so it must settle a managed-key hold itself on invalid JSON.
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
@@ -436,14 +488,30 @@ async fn fetch_models(client: &reqwest::Client, access_token: &str) -> Result<Ve
     Err(last_error)
 }
 
-async fn send_generate_request(
+enum GenerateRequestError {
+    Upstream(StatusCode, String),
+    Policy(axum::response::Response),
+}
+
+async fn send_generate_request<F, Fut>(
     client: &reqwest::Client,
     access_token: &str,
     payload: &serde_json::Value,
-) -> Result<serde_json::Value, (StatusCode, String)> {
+    endpoints: &[&str],
+    mut before_retry: F,
+) -> Result<serde_json::Value, GenerateRequestError>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<(), axum::response::Response>>,
+{
     let mut last_error = "all Antigravity endpoints failed".to_string();
 
-    for endpoint in super::auth::ANTIGRAVITY_ENDPOINTS {
+    for (endpoint_index, endpoint) in endpoints.iter().enumerate() {
+        if endpoint_index > 0 {
+            before_retry(last_error.clone())
+                .await
+                .map_err(GenerateRequestError::Policy)?;
+        }
         let resp = client
             .post(format!("{}/v1internal:generateContent", endpoint))
             .header("Authorization", format!("Bearer {}", access_token))
@@ -494,7 +562,10 @@ async fn send_generate_request(
             // A malformed transcript is deterministic. The second Google
             // endpoint and every other account will reject the same body.
             if status == StatusCode::BAD_REQUEST {
-                return Err((StatusCode::BAD_REQUEST, last_error));
+                return Err(GenerateRequestError::Upstream(
+                    StatusCode::BAD_REQUEST,
+                    last_error,
+                ));
             }
             continue;
         }
@@ -509,7 +580,10 @@ async fn send_generate_request(
         return Ok(value);
     }
 
-    Err((StatusCode::BAD_GATEWAY, last_error))
+    Err(GenerateRequestError::Upstream(
+        StatusCode::BAD_GATEWAY,
+        last_error,
+    ))
 }
 
 /// Strip the helper `_call_id` field we use to correlate a
@@ -567,6 +641,13 @@ fn build_google_payload(
         .and_then(|v| v.as_u64())
     {
         generation_config.insert("maxOutputTokens".to_string(), json!(max_output_tokens));
+    }
+    if let Some(thinking) = request_value
+        .get("thinking_config")
+        .or_else(|| request_value.get("thinkingConfig"))
+        .filter(|value| value.is_object())
+    {
+        generation_config.insert("thinkingConfig".to_string(), thinking.clone());
     }
     if let Some(temperature) = request_value.get("temperature").and_then(|v| v.as_f64()) {
         generation_config.insert("temperature".to_string(), json!(temperature));
@@ -1611,6 +1692,217 @@ fn image_extension(mime_type: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_prepared_function_arguments_remain_measurable() {
+        let raw = json!({"input":[
+            {"type":"message","role":"user","content":"lookup"},
+            {"type":"function_call","call_id":"call_lookup","name":"lookup",
+             "arguments":{"context":"query","file_id":"label"}},
+            {"type":"function_call_output","call_id":"call_lookup","output":"found"}
+        ]});
+        let payload =
+            build_google_payload(&raw, "gemini-2.5-flash", Some("fixture-project")).unwrap();
+        assert_eq!(
+            payload["request"]["contents"][1]["parts"][0]["functionCall"]["args"]["context"],
+            "query"
+        );
+        assert!(
+            crate::quota_usage::prepared_bounds("antigravity", &payload)
+                .unwrap()
+                .input_measurable
+        );
+        let mut with_media = payload;
+        with_media["request"]["contents"][1]["parts"][0]["fileData"] =
+            json!({"fileUri":"https://example.test/a.png"});
+        assert!(
+            !crate::quota_usage::prepared_bounds("antigravity", &with_media)
+                .unwrap()
+                .input_measurable
+        );
+    }
+
+    #[test]
+    fn quota_prepared_function_schema_remains_measurable() {
+        let payload = build_google_payload(
+            &json!({
+                "input":"describe the fields",
+                "tools":[{"type":"function","function":{"name":"describe","parameters":{
+                    "type":"object", "properties":{
+                        "file_id":{"type":"string"}, "previous_response_id":{"type":"string"}
+                    }
+                }}}]
+            }),
+            "gemini-2.5-flash",
+            Some("fixture-project"),
+        )
+        .unwrap();
+        assert!(payload
+            .pointer("/request/tools/0/functionDeclarations/0/parameters")
+            .is_some());
+        let bounds = crate::quota_usage::prepared_bounds("antigravity", &payload).unwrap();
+        assert!(bounds.input_measurable);
+        assert_eq!(bounds.input_upper_bound, payload.to_string().len() as u64);
+    }
+
+    #[test]
+    fn quota_prepared_google_request_preserves_explicit_thinking_bound() {
+        let payload = build_google_payload(
+            &json!({"input":"hi","max_output_tokens":20,"thinkingConfig":{"thinkingBudget":10}}),
+            "gemini-2.5-flash",
+            Some("fixture-project"),
+        )
+        .unwrap();
+        assert_eq!(
+            payload["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            10
+        );
+        let bounds = crate::quota_usage::prepared_bounds("antigravity", &payload).unwrap();
+        assert_eq!(bounds.output_upper_bound, Some(30));
+        assert_eq!(
+            bounds.input_upper_bound,
+            serde_json::to_vec(&payload).unwrap().len() as u64
+        );
+    }
+
+    async fn endpoint_retry_budget_fixture(budget_limit: u64) {
+        use crate::api_key_policy_store::{
+            input_token_budget_summary, reserve_input_tokens, settle_input_token_reservation,
+            ApiKeyInputTokenReservationRequest, ApiKeyInputTokenReservationResult,
+            ApiKeyInputTokenSettlement,
+        };
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = calls.clone();
+        let router = axum::Router::new().route(
+            "/v1internal:generateContent",
+            axum::routing::post(move || {
+                let calls = handler_calls.clone();
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            StatusCode::BAD_GATEWAY,
+                            axum::Json(json!({"error":"retry endpoint"})),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            axum::Json(
+                                json!({"candidates":[],"usageMetadata":{"promptTokenCount":3}}),
+                            ),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let directory =
+            std::env::temp_dir().join(format!("io-gateway-antigravity-retry-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let cfg: crate::Config = serde_json::from_value(json!({
+            "listen":"127.0.0.1:0", "upstream_base": endpoint,
+            "proxy_api_key":"", "tokens":[], "auth_dir":directory,
+        }))
+        .unwrap();
+        let budget = crate::api_keys::ApiKeyInputTokenBudget {
+            limit: budget_limit,
+            period: crate::api_keys::ApiKeyBudgetPeriod::Lifetime,
+        };
+        let reserve = |id: &str| {
+            reserve_input_tokens(
+                &cfg,
+                &ApiKeyInputTokenReservationRequest {
+                    reservation_id: id.to_owned(),
+                    request_id: "request".to_owned(),
+                    api_key_id: "key".to_owned(),
+                    budget: budget.clone(),
+                    reserved_input_tokens: 100,
+                },
+            )
+            .unwrap()
+        };
+        assert!(matches!(
+            reserve("first"),
+            ApiKeyInputTokenReservationResult::Reserved { .. }
+        ));
+
+        let result = send_generate_request(
+            &reqwest::Client::new(),
+            "mock-access-token",
+            &json!({"input":"hello"}),
+            &[&endpoint, &endpoint],
+            |_message| {
+                settle_input_token_reservation(
+                    &cfg,
+                    "first",
+                    ApiKeyInputTokenSettlement::Commit {
+                        actual_input_tokens: None,
+                    },
+                )
+                .unwrap();
+                let allowed = matches!(
+                    reserve("second"),
+                    ApiKeyInputTokenReservationResult::Reserved { .. }
+                );
+                async move {
+                    if allowed {
+                        Ok(())
+                    } else {
+                        Err(StatusCode::TOO_MANY_REQUESTS.into_response())
+                    }
+                }
+            },
+        )
+        .await;
+        if budget_limit < 200 {
+            assert!(
+                matches!(result, Err(GenerateRequestError::Policy(ref response)) if response.status() == StatusCode::TOO_MANY_REQUESTS)
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "fallback must not reach upstream without its own budget"
+            );
+        } else {
+            assert!(result.is_ok());
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            settle_input_token_reservation(
+                &cfg,
+                "second",
+                ApiKeyInputTokenSettlement::Commit {
+                    actual_input_tokens: Some(3),
+                },
+            )
+            .unwrap();
+        }
+        let summary = input_token_budget_summary(&cfg, "key", &budget).unwrap();
+        assert_eq!(
+            summary.committed_input_tokens,
+            if budget_limit < 200 { 100 } else { 200 }
+        );
+        assert_eq!(summary.reserved_input_tokens, 0);
+        server.abort();
+        let _ = server.await;
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn endpoint_fallback_is_denied_when_only_one_dispatch_fits_budget() {
+        endpoint_retry_budget_fixture(100).await;
+    }
+
+    #[tokio::test]
+    async fn endpoint_fallback_commits_each_dispatched_prompt_separately() {
+        endpoint_retry_budget_fixture(200).await;
+    }
 
     #[test]
     fn google_response_serializes_control_characters_as_valid_json() {

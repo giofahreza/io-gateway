@@ -153,6 +153,7 @@ pub async fn responses(
     body: Bytes,
 ) -> impl IntoResponse {
     if !crate::check_api_key(&state, &headers) {
+        crate::release_api_key_budget_before_dispatch(&state);
         return (
             StatusCode::UNAUTHORIZED,
             [("Content-Type", "application/json")],
@@ -168,6 +169,7 @@ pub async fn responses(
     let raw: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
@@ -184,6 +186,7 @@ pub async fn responses(
     let model = match raw.get("model").and_then(|v| v.as_str()) {
         Some(model) if !model.trim().is_empty() => model.to_string(),
         _ => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
@@ -199,9 +202,10 @@ pub async fn responses(
 
     let wants_stream = crate::source::wants_stream(&headers, &body);
 
-    let chat_payload = match build_chat_completions_payload(&raw, &model) {
+    let mut chat_payload = match build_chat_completions_payload(&raw, &model) {
         Ok(payload) => payload,
         Err(err) => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
@@ -211,8 +215,16 @@ pub async fn responses(
         }
     };
 
+    if wants_stream {
+        chat_payload["stream"] = json!(true);
+        if chat_payload.get("stream_options").is_none() {
+            chat_payload["stream_options"] = json!({"include_usage": true});
+        }
+    }
+
     let accounts = super::accounts::candidate_accounts(&state);
     if accounts.is_empty() {
+        crate::release_api_key_budget_before_dispatch(&state);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [("Content-Type", "application/json")],
@@ -235,6 +247,13 @@ pub async fn responses(
             "/minimax/v1/chat/completions",
             prompt_metrics.clone(),
         );
+        if let Err(response) = crate::api_key_quota_runtime::reserve_api_key_budgets_for_prepared_dispatch_with_protocol(
+            &state, context.provider_name, &context.key,
+            &serde_json::to_vec(&chat_payload).unwrap_or_default(),
+            crate::quota_usage::PreparedProtocol::ChatCompletions,
+        ).await {
+            return response;
+        }
         crate::record_minimax_request(&state, &context);
 
         let base_url = normalize_base_url(account.base_url.as_deref());
@@ -358,7 +377,8 @@ pub async fn responses(
         };
 
         let response = chat_completion_to_responses(&chat_response, &model);
-        let usage = crate::usage_metrics_from_response_value(&response);
+        let mut usage = crate::usage_metrics_from_response_value(&response);
+        crate::quota_usage::preserve_native_usage(&mut usage, &chat_response, "openai");
         crate::record_minimax_success(&state, &context, &usage);
 
         let body = serde_json::to_vec(&response).unwrap_or_default();
@@ -428,8 +448,9 @@ pub(super) async fn stream_chat_completions(
     let usage_state = state.clone();
     let usage_context = context.clone();
     let model = model.to_string();
+    let lifecycle = crate::StreamRequestGuard::new(&usage_state, &usage_context);
     let stream = async_stream::stream! {
-        let mut lifecycle = crate::StreamRequestGuard::new(&usage_state, &usage_context);
+        let mut lifecycle = lifecycle;
         let mut upstream = resp.bytes_stream();
         let mut parser = MiniMaxSseParser::default();
         let mut accumulator = MiniMaxStreamAccumulator::new(model.clone());
@@ -460,14 +481,41 @@ pub(super) async fn stream_chat_completions(
             for event in parser.push(&bytes) {
                 accumulator.absorb_sse_data(&event);
             }
+            if let Some(message) = parser.terminal_error().map(str::to_string) {
+                crate::record_minimax_error(&usage_state, &usage_context, &message);
+                lifecycle.finish();
+                yield Ok(response_sse_event(&json!({
+                    "type": "response.failed",
+                    "error": {
+                        "message": message,
+                        "type": "server_error"
+                    }
+                })));
+                yield Ok(done_sse_event());
+                return;
+            }
         }
 
         for event in parser.finish() {
             accumulator.absorb_sse_data(&event);
         }
+        if let Some(message) = parser.terminal_error().map(str::to_string) {
+            crate::record_minimax_error(&usage_state, &usage_context, &message);
+            lifecycle.finish();
+            yield Ok(response_sse_event(&json!({
+                "type": "response.failed",
+                "error": {
+                    "message": message,
+                    "type": "server_error"
+                }
+            })));
+            yield Ok(done_sse_event());
+            return;
+        }
 
         let response = accumulator.to_response();
-        let metrics = crate::usage_metrics_from_response_value(&response);
+        let mut metrics = crate::usage_metrics_from_response_value(&response);
+        crate::quota_usage::mark_stream_usage(&mut metrics, "openai", accumulator.usage_at_terminal);
         crate::record_minimax_success(&usage_state, &usage_context, &metrics);
         lifecycle.finish();
         for event in response_output_events(&response) {
@@ -969,6 +1017,7 @@ fn build_chat_tool_choice(raw: &Value) -> Option<Value> {
 #[derive(Default)]
 struct MiniMaxSseParser {
     buffer: Vec<u8>,
+    terminal_error: Option<String>,
 }
 
 impl MiniMaxSseParser {
@@ -980,6 +1029,12 @@ impl MiniMaxSseParser {
                 .buffer
                 .drain(..event_end + delimiter_len)
                 .collect::<Vec<_>>();
+            if self.terminal_error.is_none() {
+                if let Some(error) = crate::sse_terminal_error_from_event(&raw[..event_end]) {
+                    self.terminal_error = Some(error);
+                    continue;
+                }
+            }
             if let Some(data) = parse_minimax_sse_data(&raw[..event_end]) {
                 events.push(data);
             }
@@ -992,7 +1047,17 @@ impl MiniMaxSseParser {
             return Vec::new();
         }
         let raw = std::mem::take(&mut self.buffer);
+        if self.terminal_error.is_none() {
+            if let Some(error) = crate::sse_terminal_error_from_event(&raw) {
+                self.terminal_error = Some(error);
+                return Vec::new();
+            }
+        }
         parse_minimax_sse_data(&raw).into_iter().collect()
+    }
+
+    fn terminal_error(&self) -> Option<&str> {
+        self.terminal_error.as_deref()
     }
 }
 
@@ -1040,6 +1105,8 @@ struct MiniMaxStreamAccumulator {
     reasoning_content: String,
     tool_calls: Vec<StreamToolCall>,
     usage: Option<Value>,
+    saw_terminal: bool,
+    usage_at_terminal: bool,
 }
 
 impl MiniMaxStreamAccumulator {
@@ -1052,6 +1119,8 @@ impl MiniMaxStreamAccumulator {
             reasoning_content: String::new(),
             tool_calls: Vec::new(),
             usage: None,
+            saw_terminal: false,
+            usage_at_terminal: false,
         }
     }
 
@@ -1069,6 +1138,7 @@ impl MiniMaxStreamAccumulator {
 
     fn absorb_sse_data(&mut self, data: &str) {
         if data.trim() == "[DONE]" {
+            self.saw_terminal = true;
             return;
         }
         let Ok(value) = serde_json::from_str::<Value>(data) else {
@@ -1078,6 +1148,18 @@ impl MiniMaxStreamAccumulator {
     }
 
     fn absorb_chat_value(&mut self, value: &Value) {
+        self.saw_terminal |=
+            value
+                .get("choices")
+                .and_then(Value::as_array)
+                .is_some_and(|choices| {
+                    choices.iter().any(|choice| {
+                        choice
+                            .get("finish_reason")
+                            .and_then(Value::as_str)
+                            .is_some()
+                    })
+                });
         if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
             self.id = id.to_string();
         }
@@ -1085,7 +1167,9 @@ impl MiniMaxStreamAccumulator {
             self.created = created;
         }
         if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
-            self.usage = Some(usage.clone());
+            crate::quota_usage::merge_cumulative_usage(&mut self.usage, usage);
+            self.usage_at_terminal =
+                self.saw_terminal && crate::quota_usage::has_output_observation(usage);
         }
 
         let Some(choices) = value.get("choices").and_then(|v| v.as_array()) else {
@@ -1455,18 +1539,7 @@ pub(super) fn chat_completion_to_responses(chat: &Value, model: &str) -> Value {
     }
 
     let usage = chat.get("usage").cloned().unwrap_or(json!({}));
-    let input_tokens = usage
-        .get("prompt_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let output_tokens = usage
-        .get("completion_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let total_tokens = usage
-        .get("total_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(input_tokens + output_tokens);
+    let usage = crate::quota_usage::openai_compat_usage(&usage);
 
     json!({
         "id": id,
@@ -1476,15 +1549,7 @@ pub(super) fn chat_completion_to_responses(chat: &Value, model: &str) -> Value {
         "status": "completed",
         "output": output,
         "output_text": output_text,
-        "usage": {
-            "input_tokens": input_tokens,
-            "input_tokens_details": { "cached_tokens": 0 },
-            "output_tokens": output_tokens,
-            "output_tokens_details": { "reasoning_tokens": 0 },
-            "total_tokens": total_tokens,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0
-        }
+        "usage": usage
     })
 }
 
@@ -1524,6 +1589,37 @@ fn split_inline_thinking(text: &str) -> (Option<String>, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_stream_partial_usage_cannot_be_blessed_by_empty_final_event() {
+        let mut accumulator = MiniMaxStreamAccumulator::new("fixture-model".into());
+        accumulator.absorb_chat_value(&json!({"choices":[{"delta":{"content":"x"}}],"usage":{"prompt_tokens":10,"completion_tokens":0}}));
+        accumulator.absorb_chat_value(&json!({"choices":[{"finish_reason":"stop"}],"usage":{}}));
+        assert!(!accumulator.usage_at_terminal);
+        accumulator.absorb_chat_value(
+            &json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":8}}),
+        );
+        assert!(accumulator.usage_at_terminal);
+        let response = accumulator.to_response();
+        let usage = crate::quota_usage::normalize("openai", &response["usage"], true);
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(8));
+        assert_eq!(usage.cache_tokens, None);
+        assert_eq!(usage.reasoning_tokens, None);
+    }
+
+    #[test]
+    fn quota_conversion_does_not_invent_zero_usage() {
+        let response = chat_completion_to_responses(
+            &json!({"choices":[{"message":{"content":"x"}}]}),
+            "fixture-model",
+        );
+        let usage = crate::quota_usage::normalize("openai", &response["usage"], true);
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.output_tokens, None);
+        assert_eq!(usage.cache_tokens, None);
+        assert_eq!(usage.reasoning_tokens, None);
+    }
 
     #[test]
     fn normalize_base_url_defaults_to_official() {
@@ -1920,6 +2016,15 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(events[0].contains("\"H\""));
         assert!(events[1].contains("\"i\""));
+    }
+
+    #[test]
+    fn minimax_sse_parser_marks_terminal_error_events() {
+        let mut parser = MiniMaxSseParser::default();
+        parser.push(
+            b"data: {\"type\":\"error\",\"error\":{\"message\":\"minimax upstream error\"}}\n\n",
+        );
+        assert_eq!(parser.terminal_error(), Some("minimax upstream error"));
     }
 
     #[test]

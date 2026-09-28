@@ -18,21 +18,12 @@ pub fn resolve_mode(
 }
 
 pub fn sse_to_response_json(body: &Bytes) -> Bytes {
-    let text = String::from_utf8_lossy(body);
     let mut response_obj: Option<serde_json::Value> = None;
     let mut output_text = String::new();
 
-    for line in text.lines() {
-        let data = match line.strip_prefix("data: ") {
-            Some(d) => d.trim(),
-            None => continue,
-        };
-        if data == "[DONE]" {
-            break;
-        }
-        let v: serde_json::Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            Err(_) => continue,
+    for event in crate::sse_response_events(body) {
+        let Some(v) = crate::sse_event_json_value(event) else {
+            continue;
         };
         if let Some(t) = v.get("type").and_then(|v| v.as_str()) {
             if t == "response.output_text.delta" {
@@ -80,6 +71,24 @@ pub fn sse_to_response_json(body: &Bytes) -> Bytes {
         }
     }
     Bytes::from(serde_json::to_vec(&resp).unwrap_or_default())
+}
+
+#[cfg(test)]
+mod sse_accounting_tests {
+    use super::sse_to_response_json;
+    use bytes::Bytes;
+
+    #[test]
+    fn sse_accounting_conversion_preserves_no_space_response_and_usage() {
+        let body = Bytes::from_static(
+            b"data:{\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata:{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_test\",\"usage\":{\"input_tokens\":17}}}\n\n",
+        );
+        let response: serde_json::Value =
+            serde_json::from_slice(&sse_to_response_json(&body)).unwrap();
+        assert_eq!(response["id"], "resp_test");
+        assert_eq!(response["usage"]["input_tokens"], 17);
+        assert_eq!(response["output_text"], "ok");
+    }
 }
 
 pub fn models_list_to_openai_json(body: &Bytes) -> Result<Bytes, String> {

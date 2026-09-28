@@ -115,6 +115,7 @@ pub async fn responses(
     body: Bytes,
 ) -> impl IntoResponse {
     if !crate::check_api_key(&state, &headers) {
+        crate::release_api_key_budget_before_dispatch(&state);
         return (
             StatusCode::UNAUTHORIZED,
             [("Content-Type", "application/json")],
@@ -130,6 +131,7 @@ pub async fn responses(
     let request_value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
@@ -146,6 +148,7 @@ pub async fn responses(
     let model = match request_value.get("model").and_then(|v| v.as_str()) {
         Some(model) if !model.trim().is_empty() => model.to_string(),
         _ => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
@@ -162,6 +165,7 @@ pub async fn responses(
     let payload = match build_anthropic_payload(&request_value, &model) {
         Ok(payload) => payload,
         Err(err) => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
@@ -173,6 +177,7 @@ pub async fn responses(
 
     let accounts = super::accounts::candidate_accounts(&state);
     if accounts.is_empty() {
+        crate::release_api_key_budget_before_dispatch(&state);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [("Content-Type", "application/json")],
@@ -196,6 +201,16 @@ pub async fn responses(
             "/deepseek/v1/responses",
             prompt_metrics.clone(),
         );
+        if let Err(response) = crate::reserve_api_key_budgets_for_prepared_dispatch(
+            &state,
+            context.provider_name,
+            &context.key,
+            &serde_json::to_vec(&payload).unwrap_or_default(),
+        )
+        .await
+        {
+            return response;
+        }
         crate::record_deepseek_request(&state, &context);
 
         let upstream = match send_anthropic_request(
@@ -233,7 +248,8 @@ pub async fn responses(
         };
 
         let response = anthropic_to_openai_response(&upstream, &model);
-        let usage = crate::usage_metrics_from_response_value(&response);
+        let mut usage = crate::usage_metrics_from_response_value(&response);
+        crate::quota_usage::preserve_native_usage(&mut usage, &upstream, "anthropic");
         crate::record_deepseek_success(&state, &context, &usage);
 
         if wants_stream {

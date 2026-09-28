@@ -24,6 +24,9 @@ use utoipa_swagger_ui::Config;
         crate::login_submit_route,
         crate::delete_credential_route,
         crate::toggle_credential_route,
+        codex_reset_credit_automation_get_doc,
+        codex_reset_credit_automation_post_doc,
+        codex_reset_credit_consume_doc,
         swagger_ui_redirect,
         openapi_json,
         crate::source::v1::models_doc,
@@ -64,7 +67,14 @@ use utoipa_swagger_ui::Config;
         ClaudeContentPart,
         ResponseSummary,
         OpenAiErrorResponse,
-        OpenAiErrorBody
+        OpenAiErrorBody,
+        CodexResetCreditAutomationPolicyRequest,
+        CodexResetCreditAutomationResponse,
+        CodexResetCreditAutomationDefaults,
+        CodexResetCreditAutomationAccount,
+        CodexResetCreditAutomationPolicy,
+        CodexResetCreditAutomationAction,
+        CodexResetCreditConsumeRequest
     )),
     modifiers(&SecurityAddon)
 )]
@@ -206,6 +216,131 @@ pub(crate) struct DeleteCredentialRequest {
 pub(crate) struct ToggleCredentialRequest {
     file_name: String,
     enabled: String,
+}
+
+/// Reads the administrator-visible, privacy-safe status of automatic Codex
+/// reset-credit redemption. The runtime route requires an administrator
+/// session when dashboard authentication is configured.
+#[utoipa::path(
+    get,
+    path = "/admin/codex/reset-credit-automation",
+    responses(
+        (status = 200, description = "Automation policies and safe action status", body = CodexResetCreditAutomationResponse),
+        (status = 401, description = "Administrator login required", body = ActionResponse),
+        (status = 503, description = "Durable policy state is unavailable", body = ActionResponse)
+    )
+)]
+#[allow(dead_code)]
+pub(crate) fn codex_reset_credit_automation_get_doc() {}
+
+/// Creates, edits, or disables one stable Codex-account automation policy.
+#[utoipa::path(
+    post,
+    path = "/admin/codex/reset-credit-automation",
+    request_body(content = CodexResetCreditAutomationPolicyRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Saved automation policies and safe action status", body = CodexResetCreditAutomationResponse),
+        (status = 400, description = "Invalid policy or unavailable enabled account", body = ActionResponse),
+        (status = 401, description = "Administrator login required", body = ActionResponse),
+        (status = 503, description = "Durable policy state is unavailable", body = ActionResponse)
+    )
+)]
+#[allow(dead_code)]
+pub(crate) fn codex_reset_credit_automation_post_doc() {}
+
+/// Manually redeems one concrete Codex reset credit through the same durable
+/// action ledger as the automatic worker. The server owns the idempotency key.
+#[utoipa::path(
+    post,
+    path = "/codex/rate-limit-reset-credit/consume",
+    request_body(content = CodexResetCreditConsumeRequest, content_type = "application/x-www-form-urlencoded"),
+    responses(
+        (status = 200, description = "Coordinated redemption result", body = ActionResponse),
+        (status = 401, description = "Administrator login required", body = ActionResponse)
+    )
+)]
+#[allow(dead_code)]
+pub(crate) fn codex_reset_credit_consume_doc() {}
+
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct CodexResetCreditAutomationPolicyRequest {
+    /// Must be a stable `codex:account_id:<id>` identity.
+    account_key: String,
+    enabled: bool,
+    /// 1–1440; default 30.
+    scan_interval_minutes: Option<u64>,
+    /// 1–10080; default 60.
+    expiry_window_minutes: Option<u64>,
+    /// Must be smaller than `expiry_window_minutes`; default 5.
+    final_attempt_minutes: Option<u64>,
+    /// 0–10080; default 10.
+    min_natural_reset_remaining_minutes: Option<u64>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct CodexResetCreditAutomationResponse {
+    ok: bool,
+    defaults: CodexResetCreditAutomationDefaults,
+    accounts: Vec<CodexResetCreditAutomationAccount>,
+    policies: Vec<CodexResetCreditAutomationPolicy>,
+    actions: Vec<CodexResetCreditAutomationAction>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct CodexResetCreditAutomationDefaults {
+    scan_interval_minutes: u64,
+    expiry_window_minutes: u64,
+    final_attempt_minutes: u64,
+    min_natural_reset_remaining_minutes: u64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct CodexResetCreditAutomationAccount {
+    account_key: String,
+    label: String,
+    account_id: String,
+    file_name: Option<String>,
+    enabled: bool,
+    eligible: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct CodexResetCreditAutomationPolicy {
+    account_key: String,
+    enabled: bool,
+    scan_interval_minutes: u64,
+    expiry_window_minutes: u64,
+    final_attempt_minutes: u64,
+    min_natural_reset_remaining_minutes: u64,
+    next_scan_at: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct CodexResetCreditAutomationAction {
+    id: String,
+    account_key: String,
+    credit_id: String,
+    reset_type: String,
+    credit_expires_at: Option<String>,
+    state: String,
+    trigger: String,
+    next_attempt_at: String,
+    attempt_count: u64,
+    last_outcome: Option<String>,
+    created_at: String,
+    updated_at: String,
+    submitted_at: Option<String>,
+    verified_at: Option<String>,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct CodexResetCreditConsumeRequest {
+    file_name: Option<String>,
+    label: Option<String>,
+    account_id: Option<String>,
+    /// Required: an opaque credit ID returned by the quota read.
+    credit_id: String,
 }
 
 #[derive(Serialize, ToSchema)]

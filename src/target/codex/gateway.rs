@@ -53,12 +53,14 @@ pub fn apply_default_headers(
     // Force upstream Codex API version to a modern baseline even when client
     // sends an older `Version` header.
     req = req.header("Version", DEFAULT_CODEX_CLIENT_VERSION);
-    if !incoming.contains_key("session_id") {
-        req = req.header("Session_id", session_id);
-    }
-    if !incoming.contains_key("conversation_id") {
-        req = req.header("Conversation_id", session_id);
-    }
+    // Session/conversation and account selection belong to the gateway's
+    // chosen upstream credential.  They must not be inherited from the
+    // client: a caller could otherwise resume another account's retained
+    // context or override a selected-account API-key scope.  The proxy drops
+    // these headers as a first line of defense; force replacement here too so
+    // every direct gateway caller gets the same invariant.
+    req = req.header("Session_id", session_id);
+    req = req.header("Conversation_id", session_id);
     if !incoming.contains_key("user-agent") {
         req = req.header("User-Agent", DEFAULT_CODEX_USER_AGENT);
     }
@@ -77,11 +79,9 @@ pub fn apply_default_headers(
     if !incoming.contains_key("originator") {
         req = req.header("Originator", "codex_cli_rs");
     }
-    if !incoming.contains_key("chatgpt-account-id") {
-        if let Some(id) = account_id {
-            if !id.trim().is_empty() {
-                req = req.header("Chatgpt-Account-Id", id);
-            }
+    if let Some(id) = account_id {
+        if !id.trim().is_empty() {
+            req = req.header("Chatgpt-Account-Id", id);
         }
     }
     req
@@ -138,4 +138,46 @@ fn ensure_store_and_stream(headers: &HeaderMap, body: Bytes) -> Bytes {
         }
     }
     body
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_default_headers;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn gateway_owned_routing_headers_override_client_values() {
+        let mut incoming = HeaderMap::new();
+        incoming.insert(
+            "chatgpt-account-id",
+            HeaderValue::from_static("client-account"),
+        );
+        incoming.insert("session_id", HeaderValue::from_static("client-session"));
+        incoming.insert(
+            "conversation_id",
+            HeaderValue::from_static("client-conversation"),
+        );
+
+        let request = apply_default_headers(
+            reqwest::Client::new().get("https://example.test/responses"),
+            &incoming,
+            Some("gateway-account"),
+            "gateway-session",
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request.headers().get("chatgpt-account-id").unwrap(),
+            "gateway-account"
+        );
+        assert_eq!(
+            request.headers().get("session_id").unwrap(),
+            "gateway-session"
+        );
+        assert_eq!(
+            request.headers().get("conversation_id").unwrap(),
+            "gateway-session"
+        );
+    }
 }

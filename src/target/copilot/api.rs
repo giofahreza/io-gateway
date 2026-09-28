@@ -111,6 +111,7 @@ pub async fn responses(
     body: Bytes,
 ) -> impl IntoResponse {
     if !crate::check_api_key(&state, &headers) {
+        crate::release_api_key_budget_before_dispatch(&state);
         return (
             StatusCode::UNAUTHORIZED,
             [("Content-Type", "application/json")],
@@ -126,6 +127,7 @@ pub async fn responses(
     let mut raw: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
@@ -135,12 +137,13 @@ pub async fn responses(
                     None,
                 ),
             )
-                .into_response()
+                .into_response();
         }
     };
     let model = match raw.get("model").and_then(|value| value.as_str()) {
         Some(model) if !model.trim().is_empty() => model.trim().to_string(),
         _ => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
@@ -150,10 +153,11 @@ pub async fn responses(
                     None,
                 ),
             )
-                .into_response()
+                .into_response();
         }
     };
     if !super::accounts::is_app_accessible_model(&model) {
+        crate::release_api_key_budget_before_dispatch(&state);
         return (
             StatusCode::NOT_FOUND,
             [("Content-Type", "application/json")],
@@ -168,6 +172,7 @@ pub async fn responses(
     sanitize_responses_payload(&mut raw);
     let accounts = super::accounts::candidate_accounts(&state);
     if accounts.is_empty() {
+        crate::release_api_key_budget_before_dispatch(&state);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [("Content-Type", "application/json")],
@@ -180,10 +185,22 @@ pub async fn responses(
             .into_response();
     }
     let wants_stream = crate::source::wants_stream(&headers, &body);
+    if should_use_chat_completions_bridge(&raw) {
+        if let Err(err) = responses_to_chat_completions_payload(&raw, &model, wants_stream) {
+            crate::release_api_key_budget_before_dispatch(&state);
+            return (
+                StatusCode::BAD_REQUEST,
+                [("Content-Type", "application/json")],
+                crate::source::v1::response::openai_error_body(&err, "invalid_request_error", None),
+            )
+                .into_response();
+        }
+    }
     let request_body = match serde_json::to_vec(&raw) {
         Ok(value) => Bytes::from(value),
         Err(err) => {
             let message = format!("Copilot request serialize failed: {}", err);
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
@@ -197,6 +214,13 @@ pub async fn responses(
         }
     };
     let prompt_metrics = crate::prompt_metrics_from_request_value(&raw);
+    let prepared_policy_body = if should_use_chat_completions_bridge(&raw) {
+        responses_to_chat_completions_payload(&raw, &model, wants_stream)
+            .and_then(|payload| serde_json::to_vec(&payload).map_err(|error| error.to_string()))
+            .unwrap_or_default()
+    } else {
+        request_body.to_vec()
+    };
     let mut last_error: Option<(StatusCode, String)> = None;
 
     for (attempt_idx, account) in accounts.iter().enumerate() {
@@ -206,12 +230,22 @@ pub async fn responses(
             "/copilot/v1/responses",
             prompt_metrics.clone(),
         );
+        if let Err(response) = crate::api_key_quota_runtime::reserve_api_key_budgets_for_prepared_dispatch_with_protocol(
+            &state, context.provider_name, &context.key, &prepared_policy_body,
+            if should_use_chat_completions_bridge(&raw) { crate::quota_usage::PreparedProtocol::ChatCompletions } else { crate::quota_usage::PreparedProtocol::OpenAiResponses },
+        ).await {
+            return response;
+        }
         crate::record_copilot_request(&state, &context);
 
         let copilot_token = match super::auth::ensure_copilot_token(&state, account).await {
             Ok(token) => token,
             Err(err) => {
-                crate::record_copilot_error(&state, &context, &err);
+                if attempt_idx + 1 < accounts.len() {
+                    crate::record_request_pre_dispatch_retry_error(&state, &context, err.as_str());
+                } else {
+                    crate::record_request_pre_dispatch_error(&state, &context, err.as_str());
+                }
                 last_error = Some((StatusCode::BAD_GATEWAY, err));
                 if attempt_idx + 1 < accounts.len() {
                     continue;
@@ -270,6 +304,22 @@ pub async fn responses(
             let text = resp.text().await.unwrap_or_default();
             let message = format!("Copilot returned {}: {}", status, text);
             if should_try_chat_completions_fallback(status, &text, wants_stream, &raw) {
+                // The failed native request may have incurred usage. Settle
+                // that attempt before reserving a separate chat fallback.
+                crate::record_copilot_error(&state, &context, &message);
+                let fallback_body =
+                    responses_to_chat_completions_payload(&raw, &model, wants_stream)
+                        .and_then(|payload| {
+                            serde_json::to_vec(&payload).map_err(|error| error.to_string())
+                        })
+                        .unwrap_or_default();
+                if let Err(response) = crate::api_key_quota_runtime::reserve_api_key_budgets_for_prepared_dispatch_with_protocol(
+                    &state, context.provider_name, &context.key, &fallback_body,
+                    crate::quota_usage::PreparedProtocol::ChatCompletions,
+                ).await {
+                    return response;
+                }
+                crate::record_copilot_request(&state, &context);
                 match chat_completions_bridge_response(
                     &state,
                     &context,
@@ -397,6 +447,7 @@ pub async fn messages(
     body: Bytes,
 ) -> impl IntoResponse {
     if !crate::check_api_key(&state, &headers) {
+        crate::release_api_key_budget_before_dispatch(&state);
         return (
             StatusCode::UNAUTHORIZED,
             [("Content-Type", "application/json")],
@@ -408,26 +459,29 @@ pub async fn messages(
     let raw: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
                 anthropic_error_body("invalid_request_error", "Invalid request body"),
             )
-                .into_response()
+                .into_response();
         }
     };
     let model = match raw.get("model").and_then(|value| value.as_str()) {
         Some(model) if !model.trim().is_empty() => model.trim().to_string(),
         _ => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
                 anthropic_error_body("invalid_request_error", "model is required"),
             )
-                .into_response()
+                .into_response();
         }
     };
     if !super::accounts::is_app_accessible_model(&model) {
+        crate::release_api_key_budget_before_dispatch(&state);
         return (
             StatusCode::NOT_FOUND,
             [("Content-Type", "application/json")],
@@ -441,17 +495,31 @@ pub async fn messages(
     let responses_payload = match anthropic_messages_to_responses(&raw, &model) {
         Ok(payload) => payload,
         Err(err) => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
                 anthropic_error_body("invalid_request_error", &err),
             )
-                .into_response()
+                .into_response();
         }
     };
 
+    if should_use_chat_completions_bridge(&responses_payload) {
+        if let Err(err) = responses_to_chat_completions_payload(&responses_payload, &model, false) {
+            crate::release_api_key_budget_before_dispatch(&state);
+            return (
+                StatusCode::BAD_REQUEST,
+                [("Content-Type", "application/json")],
+                anthropic_error_body("invalid_request_error", &err),
+            )
+                .into_response();
+        }
+    }
+
     let accounts = super::accounts::candidate_accounts(&state);
     if accounts.is_empty() {
+        crate::release_api_key_budget_before_dispatch(&state);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [("Content-Type", "application/json")],
@@ -460,6 +528,13 @@ pub async fn messages(
             .into_response();
     }
     let prompt_metrics = crate::prompt_metrics_from_request_value(&raw);
+    let prepared_policy_body = if should_use_chat_completions_bridge(&responses_payload) {
+        responses_to_chat_completions_payload(&responses_payload, &model, false)
+            .and_then(|payload| serde_json::to_vec(&payload).map_err(|error| error.to_string()))
+            .unwrap_or_default()
+    } else {
+        serde_json::to_vec(&responses_payload).unwrap_or_default()
+    };
     let mut last_error: Option<(StatusCode, String)> = None;
 
     for (attempt_idx, account) in accounts.iter().enumerate() {
@@ -469,12 +544,22 @@ pub async fn messages(
             "/copilot/anthropic/v1/messages",
             prompt_metrics.clone(),
         );
+        if let Err(response) = crate::api_key_quota_runtime::reserve_api_key_budgets_for_prepared_dispatch_with_protocol(
+            &state, context.provider_name, &context.key, &prepared_policy_body,
+            if should_use_chat_completions_bridge(&responses_payload) { crate::quota_usage::PreparedProtocol::ChatCompletions } else { crate::quota_usage::PreparedProtocol::OpenAiResponses },
+        ).await {
+            return response;
+        }
         crate::record_copilot_request(&state, &context);
 
         let copilot_token = match super::auth::ensure_copilot_token(&state, account).await {
             Ok(token) => token,
             Err(err) => {
-                crate::record_copilot_error(&state, &context, &err);
+                if attempt_idx + 1 < accounts.len() {
+                    crate::record_request_pre_dispatch_retry_error(&state, &context, err.as_str());
+                } else {
+                    crate::record_request_pre_dispatch_error(&state, &context, err.as_str());
+                }
                 last_error = Some((StatusCode::BAD_GATEWAY, err));
                 if attempt_idx + 1 < accounts.len() {
                     continue;
@@ -939,11 +1024,20 @@ fn responses_to_chat_completions_payload(
         "messages".to_string(),
         Value::Array(sanitize_chat_messages(messages)),
     );
-    if let Some(value) = raw
+    if let Some(value) = raw.get("max_completion_tokens") {
+        out.insert("max_completion_tokens".to_string(), value.clone());
+    } else if let Some(value) = raw
         .get("max_output_tokens")
         .or_else(|| raw.get("max_tokens"))
     {
-        out.insert("max_tokens".to_string(), value.clone());
+        // Reasoning output is part of the total ceiling. The chat API's
+        // legacy max_tokens field is not that ceiling for these models.
+        let native_cap = if crate::quota_usage::known_reasoning_copilot_model(model) {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        out.insert(native_cap.to_string(), value.clone());
     }
     copy_if_present(raw, &mut out, "temperature");
     copy_if_present(raw, &mut out, "top_p");
@@ -1448,26 +1542,7 @@ fn chat_message_content_text(content: Option<&Value>) -> Option<String> {
 }
 
 fn chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
-    let usage = usage.unwrap_or(&Value::Null);
-    let input_tokens = usage
-        .get("prompt_tokens")
-        .or_else(|| usage.get("input_tokens"))
-        .and_then(|value| value.as_u64())
-        .unwrap_or(0);
-    let output_tokens = usage
-        .get("completion_tokens")
-        .or_else(|| usage.get("output_tokens"))
-        .and_then(|value| value.as_u64())
-        .unwrap_or(0);
-    let total_tokens = usage
-        .get("total_tokens")
-        .and_then(|value| value.as_u64())
-        .unwrap_or(input_tokens + output_tokens);
-    json!({
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "total_tokens": total_tokens
-    })
+    crate::quota_usage::openai_compat_usage(usage.unwrap_or(&Value::Null))
 }
 
 async fn stream_chat_completions_as_responses(
@@ -1478,13 +1553,22 @@ async fn stream_chat_completions_as_responses(
 ) -> axum::response::Response {
     let usage_state = state.clone();
     let usage_context = context.clone();
+    let lifecycle = crate::StreamRequestGuard::new(&usage_state, &usage_context);
     let stream = async_stream::stream! {
-        let mut lifecycle = crate::StreamRequestGuard::new(&usage_state, &usage_context);
+        let mut lifecycle = lifecycle;
         let mut upstream = resp.bytes_stream();
         let mut parser = ChatCompletionsSseAccumulator::default();
         while let Some(chunk) = upstream.next().await {
             match chunk {
-                Ok(bytes) => parser.push(&bytes),
+                Ok(bytes) => {
+                    parser.push(&bytes);
+                    if let Some(message) = parser.terminal_error() {
+                        crate::record_copilot_error(&usage_state, &usage_context, message);
+                        lifecycle.finish();
+                        yield Err::<Bytes, std::io::Error>(std::io::Error::new(std::io::ErrorKind::Other, "upstream stream error"));
+                        return;
+                    }
+                }
                 Err(err) => {
                     let message = format!("Copilot chat stream read failed: {}", err);
                     crate::record_copilot_error(&usage_state, &usage_context, &message);
@@ -1495,7 +1579,15 @@ async fn stream_chat_completions_as_responses(
             }
         }
 
-        let response = parser.finish(&model);
+        let response = match parser.finish(&model) {
+            Ok(response) => response,
+            Err(message) => {
+                crate::record_copilot_error(&usage_state, &usage_context, &message);
+                lifecycle.finish();
+                yield Err::<Bytes, std::io::Error>(std::io::Error::new(std::io::ErrorKind::Other, "upstream stream error"));
+                return;
+            }
+        };
         let usage = crate::usage_metrics_from_response_value(&response);
         crate::record_copilot_success(&usage_state, &usage_context, &usage);
         for event in response_stream_events(&response) {
@@ -1525,6 +1617,8 @@ struct ChatCompletionsSseAccumulator {
     tool_calls: Vec<ChatStreamToolCall>,
     usage: Option<Value>,
     finish_reason: Option<String>,
+    terminal_error: Option<String>,
+    usage_at_terminal: bool,
 }
 
 #[derive(Default, Clone)]
@@ -1543,10 +1637,19 @@ impl ChatCompletionsSseAccumulator {
         }
     }
 
-    fn finish(mut self, client_model: &str) -> Value {
+    fn finish(mut self, client_model: &str) -> Result<Value, String> {
         if !self.buffer.is_empty() {
             let raw = std::mem::take(&mut self.buffer);
             self.absorb_event(&raw);
+        }
+        if let Some(error) = self.terminal_error {
+            return Err(error);
+        }
+        if let Some(Value::Object(usage)) = self.usage.as_mut() {
+            usage.insert(
+                "_quota_final_usage".to_string(),
+                Value::Bool(self.usage_at_terminal),
+            );
         }
 
         let mut message = json!({
@@ -1589,10 +1692,20 @@ impl ChatCompletionsSseAccumulator {
             }],
             "usage": self.usage.unwrap_or_else(|| json!({}))
         });
-        chat_completion_to_response(&chat, client_model)
+        Ok(chat_completion_to_response(&chat, client_model))
+    }
+
+    fn terminal_error(&self) -> Option<&str> {
+        self.terminal_error.as_deref()
     }
 
     fn absorb_event(&mut self, raw_event: &[u8]) {
+        if self.terminal_error.is_none() {
+            if let Some(error) = crate::sse_terminal_error_from_event(raw_event) {
+                self.terminal_error = Some(error);
+                return;
+            }
+        }
         let Some(data) = parse_sse_data(raw_event) else {
             return;
         };
@@ -1602,6 +1715,19 @@ impl ChatCompletionsSseAccumulator {
         let Ok(value) = serde_json::from_str::<Value>(&data) else {
             return;
         };
+
+        let terminal = self.finish_reason.is_some()
+            || value
+                .get("choices")
+                .and_then(Value::as_array)
+                .is_some_and(|choices| {
+                    choices.iter().any(|choice| {
+                        choice
+                            .get("finish_reason")
+                            .and_then(Value::as_str)
+                            .is_some()
+                    })
+                });
 
         if let Some(id) = value
             .get("id")
@@ -1624,7 +1750,9 @@ impl ChatCompletionsSseAccumulator {
         }
         if let Some(usage) = value.get("usage") {
             if !usage.is_null() {
-                self.usage = Some(usage.clone());
+                crate::quota_usage::merge_cumulative_usage(&mut self.usage, usage);
+                self.usage_at_terminal =
+                    terminal && crate::quota_usage::has_output_observation(usage);
             }
         }
 
@@ -1836,14 +1964,21 @@ async fn stream_native_responses(
 ) -> axum::response::Response {
     let usage_state = state.clone();
     let usage_context = context.clone();
+    let lifecycle = crate::StreamRequestGuard::new(&usage_state, &usage_context);
     let stream = async_stream::stream! {
-        let mut lifecycle = crate::StreamRequestGuard::new(&usage_state, &usage_context);
+        let mut lifecycle = lifecycle;
         let mut upstream = resp.bytes_stream();
         let mut parser = NativeResponsesSseUsageTracker::default();
         while let Some(chunk) = upstream.next().await {
             match chunk {
                 Ok(bytes) => {
                     parser.push(&bytes);
+                    if let Some(message) = parser.terminal_error() {
+                        crate::record_copilot_error(&usage_state, &usage_context, message);
+                        lifecycle.finish();
+                        yield Ok::<Bytes, std::io::Error>(bytes);
+                        return;
+                    }
                     yield Ok::<Bytes, std::io::Error>(bytes);
                 }
                 Err(err) => {
@@ -1855,11 +1990,17 @@ async fn stream_native_responses(
                 }
             }
         }
-        if let Some(response) = parser.finish() {
-            let usage = crate::usage_metrics_from_response_value(&response);
-            crate::record_copilot_success(&usage_state, &usage_context, &usage);
-        } else {
-            crate::record_copilot_success(&usage_state, &usage_context, &crate::UsageMetrics::default());
+        match parser.finish() {
+            Err(message) => crate::record_copilot_error(&usage_state, &usage_context, &message),
+            Ok(Some(response)) => {
+                let usage = crate::usage_metrics_from_response_value(&response);
+                crate::record_copilot_success(&usage_state, &usage_context, &usage);
+            }
+            Ok(None) => crate::record_copilot_success(
+                &usage_state,
+                &usage_context,
+                &crate::UsageMetrics::default(),
+            ),
         }
         lifecycle.finish();
     };
@@ -1879,6 +2020,7 @@ async fn stream_native_responses(
 struct NativeResponsesSseUsageTracker {
     buffer: Vec<u8>,
     last_response: Option<Value>,
+    terminal_error: Option<String>,
 }
 
 impl NativeResponsesSseUsageTracker {
@@ -1890,15 +2032,25 @@ impl NativeResponsesSseUsageTracker {
         }
     }
 
-    fn finish(mut self) -> Option<Value> {
+    fn finish(mut self) -> Result<Option<Value>, String> {
         if !self.buffer.is_empty() {
             let raw = std::mem::take(&mut self.buffer);
             self.absorb_event(&raw);
         }
-        self.last_response
+        self.terminal_error.map_or(Ok(self.last_response), Err)
+    }
+
+    fn terminal_error(&self) -> Option<&str> {
+        self.terminal_error.as_deref()
     }
 
     fn absorb_event(&mut self, raw_event: &[u8]) {
+        if self.terminal_error.is_none() {
+            if let Some(error) = crate::sse_terminal_error_from_event(raw_event) {
+                self.terminal_error = Some(error);
+                return;
+            }
+        }
         let Some(data) = parse_sse_data(raw_event) else {
             return;
         };
@@ -2360,6 +2512,74 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quota_responses_output_ceiling_survives_reasoning_chat_bridge() {
+        for model in ["gpt-5", "gpt-5-mini", "o1", "o3-mini", "o4-mini", "gpt-4o"] {
+            let payload = responses_to_chat_completions_payload(
+                &json!({"input":"hello", "max_output_tokens":25}),
+                model,
+                false,
+            )
+            .unwrap();
+            let expected_field = if model == "gpt-4o" {
+                "max_tokens"
+            } else {
+                "max_completion_tokens"
+            };
+            assert_eq!(payload[expected_field], 25, "{model}: {payload}");
+            let bounds = crate::quota_usage::prepared_bounds_for_protocol(
+                "copilot",
+                &payload,
+                crate::quota_usage::PreparedProtocol::ChatCompletions,
+            )
+            .unwrap();
+            assert_eq!(bounds.output_upper_bound, Some(25), "{model}: {payload}");
+        }
+        let payload = responses_to_chat_completions_payload(
+            &json!({"input":"hello", "max_output_tokens":25, "max_completion_tokens":40}),
+            "gpt-5",
+            false,
+        )
+        .unwrap();
+        assert_eq!(payload["max_completion_tokens"], 40);
+        assert!(payload.get("max_tokens").is_none());
+        let unsupported = responses_to_chat_completions_payload(
+            &json!({"input":"hello", "max_output_tokens":25}),
+            "unknown-reasoning-model",
+            false,
+        )
+        .unwrap();
+        assert!(crate::quota_usage::prepared_bounds_for_protocol(
+            "copilot",
+            &unsupported,
+            crate::quota_usage::PreparedProtocol::ChatCompletions,
+        )
+        .unwrap()
+        .output_upper_bound
+        .is_none());
+    }
+
+    #[test]
+    fn quota_stream_partial_usage_cannot_be_blessed_by_empty_final_event() {
+        for (final_usage, complete) in [
+            (json!({}), false),
+            (json!({"prompt_tokens":10,"completion_tokens":8}), true),
+        ] {
+            let mut accumulator = ChatCompletionsSseAccumulator::default();
+            accumulator.push(&Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":0}}\n\n"));
+            accumulator.push(&Bytes::from(format!(
+                "data: {}\n\n",
+                json!({"choices":[{"finish_reason":"stop"}],"usage":final_usage})
+            )));
+            let response = accumulator.finish("gpt-4.1").unwrap();
+            let usage = crate::quota_usage::normalize("copilot", &response["usage"], true);
+            assert_eq!(usage.trustworthy_final, complete);
+            if complete {
+                assert_eq!(usage.output_tokens, Some(8));
+            }
+        }
+    }
+
+    #[test]
     fn models_are_exposed_with_copilot_prefix() {
         let models = vec![CopilotModelInfo {
             id: "gpt-4.1".to_string(),
@@ -2595,12 +2815,33 @@ data: [DONE]
 "#,
         ));
 
-        let response = accumulator.finish("gpt-4.1");
+        let response = accumulator.finish("gpt-4.1").unwrap();
         assert_eq!(response["id"], "chatcmpl_3");
         assert_eq!(response["output"][0]["type"], "function_call");
         assert_eq!(response["output"][0]["call_id"], "call_stream");
         assert_eq!(response["output"][0]["name"], "lookup");
         assert_eq!(response["output"][0]["arguments"], "{\"query\":\"beta\"}");
         assert_eq!(response["usage"]["total_tokens"], 8);
+    }
+
+    #[test]
+    fn copilot_sse_trackers_reject_terminal_error_events() {
+        let mut chat = ChatCompletionsSseAccumulator::default();
+        chat.push(&Bytes::from_static(
+            b"event: error\ndata: {\"message\":\"copilot quota exhausted\"}\n\n",
+        ));
+        assert!(matches!(
+            chat.finish("gpt-4.1"),
+            Err(message) if message == "copilot quota exhausted"
+        ));
+
+        let mut native = NativeResponsesSseUsageTracker::default();
+        native.push(&Bytes::from_static(
+            b"data: {\"type\":\"error\",\"error\":{\"message\":\"copilot failed\"}}\n\n",
+        ));
+        assert!(matches!(
+            native.finish(),
+            Err(message) if message == "copilot failed"
+        ));
     }
 }

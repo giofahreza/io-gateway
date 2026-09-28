@@ -96,6 +96,7 @@ pub async fn responses(
     body: Bytes,
 ) -> impl IntoResponse {
     if !crate::check_api_key(&state, &headers) {
+        crate::release_api_key_budget_before_dispatch(&state);
         return (
             StatusCode::UNAUTHORIZED,
             [("Content-Type", "application/json")],
@@ -111,6 +112,7 @@ pub async fn responses(
     let request_value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
@@ -127,6 +129,7 @@ pub async fn responses(
     let model = match request_value.get("model").and_then(|value| value.as_str()) {
         Some(model) if !model.trim().is_empty() => model.to_string(),
         _ => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
@@ -142,6 +145,7 @@ pub async fn responses(
 
     let accounts = super::accounts::candidate_accounts(&state);
     if accounts.is_empty() {
+        crate::release_api_key_budget_before_dispatch(&state);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [("Content-Type", "application/json")],
@@ -174,6 +178,7 @@ pub async fn responses(
             Ok(payload) => payload,
             Err(err) => {
                 crate::router_reservation_cancelled(&state, context.provider_name, &context.key);
+                crate::release_api_key_budget_before_dispatch(&state);
                 return (
                     StatusCode::BAD_REQUEST,
                     [("Content-Type", "application/json")],
@@ -187,12 +192,23 @@ pub async fn responses(
             }
         };
 
+        if let Err(response) = crate::api_key_quota_runtime::reserve_api_key_budgets_for_prepared_dispatch_with_protocol(
+            &state, context.provider_name, &context.key,
+            &serde_json::to_vec(&payload).unwrap_or_default(),
+            crate::quota_usage::PreparedProtocol::GoogleGenerateContent,
+        ).await {
+            return response;
+        }
         crate::record_gemini_request(&state, &context);
 
         let access_token = match super::auth::ensure_access_token(&state, account).await {
             Ok(token) => token,
             Err(err) => {
-                crate::record_gemini_error(&state, &context, &err);
+                if attempt_idx + 1 < accounts.len() {
+                    crate::record_request_pre_dispatch_retry_error(&state, &context, err.as_str());
+                } else {
+                    crate::record_request_pre_dispatch_error(&state, &context, err.as_str());
+                }
                 last_error = Some((StatusCode::BAD_GATEWAY, err));
                 if attempt_idx + 1 < accounts.len() {
                     continue;
@@ -229,7 +245,8 @@ pub async fn responses(
         };
 
         let mut openai_response = google_to_openai_response(&upstream, &model);
-        let usage = crate::usage_metrics_from_response_value(&openai_response);
+        let mut usage = crate::usage_metrics_from_response_value(&openai_response);
+        crate::quota_usage::preserve_native_usage(&mut usage, &upstream, "google");
         crate::record_gemini_success(&state, &context, &usage);
         attach_temp_downloads(&mut openai_response);
 
@@ -423,6 +440,15 @@ fn build_google_payload(
         .and_then(|value| value.as_u64())
     {
         generation_config.insert("maxOutputTokens".to_string(), json!(max_output_tokens));
+    }
+    // Keep explicit thinking bounds in the final native payload. An omitted
+    // or dynamic budget remains unsupported by strict output-token quotas.
+    if let Some(thinking) = request_value
+        .get("thinking_config")
+        .or_else(|| request_value.get("thinkingConfig"))
+        .filter(|value| value.is_object())
+    {
+        generation_config.insert("thinkingConfig".to_string(), thinking.clone());
     }
     if let Some(temperature) = request_value
         .get("temperature")
@@ -1271,6 +1297,77 @@ fn image_extension(mime_type: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_prepared_function_arguments_remain_measurable() {
+        let raw = json!({"input":[
+            {"type":"message","role":"user","content":"lookup"},
+            {"type":"function_call","call_id":"call_lookup","name":"lookup",
+             "arguments":{"context":"query","file_id":"label"}},
+            {"type":"function_call_output","call_id":"call_lookup","output":"found"}
+        ]});
+        let payload = build_google_payload(&raw, "gemini-2.5-flash", "fixture-project").unwrap();
+        assert_eq!(
+            payload["request"]["contents"][1]["parts"][0]["functionCall"]["args"]["context"],
+            "query"
+        );
+        assert!(
+            crate::quota_usage::prepared_bounds("gemini", &payload)
+                .unwrap()
+                .input_measurable
+        );
+        let mut with_media = payload;
+        with_media["request"]["contents"][1]["parts"][0]["inlineData"] =
+            json!({"mimeType":"image/png","data":"AAAA"});
+        assert!(
+            !crate::quota_usage::prepared_bounds("gemini", &with_media)
+                .unwrap()
+                .input_measurable
+        );
+    }
+
+    #[test]
+    fn quota_prepared_function_schema_remains_measurable() {
+        let payload = build_google_payload(
+            &json!({
+                "input":"describe the fields",
+                "tools":[{"type":"function","name":"describe","parameters":{
+                    "type":"object", "properties":{
+                        "image_url":{"type":"string"}, "context":{"type":"string"}
+                    }
+                }}]
+            }),
+            "gemini-2.5-flash",
+            "fixture-project",
+        )
+        .unwrap();
+        assert!(payload
+            .pointer("/request/tools/0/functionDeclarations/0/parameters")
+            .is_some());
+        let bounds = crate::quota_usage::prepared_bounds("gemini", &payload).unwrap();
+        assert!(bounds.input_measurable);
+        assert_eq!(bounds.input_upper_bound, payload.to_string().len() as u64);
+    }
+
+    #[test]
+    fn quota_prepared_google_request_preserves_explicit_thinking_bound() {
+        let payload = build_google_payload(
+            &json!({"input":"hi","max_output_tokens":20,"thinking_config":{"thinkingBudget":10}}),
+            "gemini-2.5-flash",
+            "fixture-project",
+        )
+        .unwrap();
+        assert_eq!(
+            payload["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            10
+        );
+        let bounds = crate::quota_usage::prepared_bounds("gemini", &payload).unwrap();
+        assert_eq!(bounds.output_upper_bound, Some(30));
+        assert_eq!(
+            bounds.input_upper_bound,
+            serde_json::to_vec(&payload).unwrap().len() as u64
+        );
+    }
 
     #[test]
     fn google_response_serializes_control_characters_as_valid_json() {

@@ -216,6 +216,13 @@ enum KeysAction {
     List,
     /// Create an API key. Prints the plain-text key once.
     Create(KeyCreateArgs),
+    /// Replace a key's access/quota policy without resetting its usage.
+    Update(KeyUpdateArgs),
+    /// Show durable renewable quota balances and renewal times.
+    Quotas {
+        #[arg(long)]
+        id: Option<String>,
+    },
     /// Revoke an API key by id.
     Revoke { id: String },
 }
@@ -224,12 +231,25 @@ enum KeysAction {
 struct KeyCreateArgs {
     #[arg(short, long, default_value = "API key")]
     label: String,
-    /// Optional JSON access object, or @path to a JSON file.
+    /// Optional JSON access object, or @path to a JSON file. Provider rules
+    /// must use account_scope="all" or account_scope="selected" explicitly.
     #[arg(long)]
     access_json: Option<String>,
-    /// Optional whole-key prompt token limit for unrestricted keys.
+    /// Optional renewable quota policy JSON, or @path. Includes timezone and rules.
     #[arg(long)]
-    prompt_token_limit: Option<u64>,
+    quota_json: Option<String>,
+    /// Optional whole-key maximum estimated input tokens per request.
+    /// `--prompt-token-limit` remains an alias for compatibility.
+    #[arg(long, visible_alias = "prompt-token-limit")]
+    max_estimated_input_tokens_per_request: Option<u64>,
+}
+
+#[derive(Args, Debug)]
+struct KeyUpdateArgs {
+    id: String,
+    /// Complete access object (including existing scopes/caps), or @path.
+    #[arg(long)]
+    access_json: String,
 }
 
 #[derive(Args, Debug)]
@@ -908,15 +928,7 @@ async fn command_keys(
             Ok(())
         }
         KeysAction::Create(args) => {
-            let access = if let Some(raw) = args.access_json {
-                parse_json_arg(&raw)?
-            } else {
-                let mut access = json!({ "all": true, "providers": [] });
-                if let Some(limit) = args.prompt_token_limit {
-                    access["prompt_token_limit"] = json!(limit);
-                }
-                access
-            };
+            let access = key_create_access(&args)?;
             let response = client
                 .post_json(
                     "/admin/api-keys/create",
@@ -934,6 +946,29 @@ async fn command_keys(
             println!("Store it now; the gateway will not show it again.");
             Ok(())
         }
+        KeysAction::Update(args) => {
+            let access = parse_json_arg(&args.access_json)?;
+            if !access.is_object() {
+                return Err("access JSON must be an object".to_string());
+            }
+            let response = client
+                .post_json(
+                    "/admin/api-keys/access",
+                    Some(json!({
+                        "id": args.id, "access": access
+                    })),
+                )
+                .await?;
+            ensure_success(&response)?;
+            print_response(json_output, response.body)
+        }
+        KeysAction::Quotas { id } => {
+            let mut path = "/admin/api-keys/quotas".to_string();
+            push_query(&mut path, "id", id.as_deref());
+            let response = client.get(&path).await?;
+            ensure_success(&response)?;
+            print_response(json_output, response.body)
+        }
         KeysAction::Revoke { id } => {
             let response = client
                 .post_json("/admin/api-keys/revoke", Some(json!({ "id": id })))
@@ -942,6 +977,38 @@ async fn command_keys(
             print_response(json_output, response.body)
         }
     }
+}
+
+fn key_create_access(args: &KeyCreateArgs) -> Result<Value, String> {
+    let mut access = match args.access_json.as_deref() {
+        Some(raw) => parse_json_arg(raw)?,
+        None => json!({ "all": true, "providers": [] }),
+    };
+    let object = access
+        .as_object_mut()
+        .ok_or("access JSON must be an object")?;
+    if let Some(limit) = args.max_estimated_input_tokens_per_request {
+        if limit == 0 {
+            return Err(
+                "max estimated input tokens per request must be greater than zero".to_string(),
+            );
+        }
+        // Explicit flags override JSON just like --quota-json. Remove the
+        // compatibility alias so the server does not see duplicate cap fields.
+        object.remove("prompt_token_limit");
+        object.insert(
+            "max_estimated_input_tokens_per_request".to_string(),
+            json!(limit),
+        );
+    }
+    if let Some(raw) = args.quota_json.as_deref() {
+        let quota = parse_json_arg(raw)?;
+        if !quota.is_object() {
+            return Err("quota JSON must be an object containing timezone and rules".to_string());
+        }
+        object.insert("quota".to_string(), quota);
+    }
+    Ok(access)
 }
 
 async fn command_models(
@@ -4774,23 +4841,88 @@ fn first_number_recursive(value: &Value, keys: &[&str]) -> Option<f64> {
 }
 
 fn access_summary(value: &Value) -> String {
+    let request_limit = value
+        .get("max_estimated_input_tokens_per_request")
+        .or_else(|| value.get("prompt_token_limit"))
+        .and_then(Value::as_u64);
+    let budget = value.get("input_token_budget").and_then(|budget| {
+        let limit = budget.get("limit").and_then(Value::as_u64)?;
+        let period = budget
+            .get("period")
+            .and_then(Value::as_str)
+            .unwrap_or("lifetime")
+            .replace('_', " ");
+        Some(format!("budget={limit}/{period}"))
+    });
+    let whole_key_limits = [
+        request_limit.map(|limit| format!("max={limit}/request")),
+        budget,
+        value
+            .get("quota")
+            .and_then(|quota| quota.get("rules"))
+            .and_then(Value::as_array)
+            .map(|rules| {
+                rules
+                    .iter()
+                    .filter_map(|rule| {
+                        Some(format!(
+                            "{}={}/{}",
+                            rule.get("metric")?.as_str()?,
+                            rule.get("limit")?.as_u64()?,
+                            rule.get("period")?.as_str()?
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let suffix = if whole_key_limits.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", whole_key_limits.join(", "))
+    };
     if bool_at(value, &["all"]) {
-        if let Some(limit) = value.get("prompt_token_limit").and_then(Value::as_u64) {
-            return format!("all <= {limit}");
-        }
-        return "all".to_string();
+        return format!("all{suffix}");
     }
     let providers = value
         .get("providers")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|provider| provider.get("provider").and_then(Value::as_str))
+        .filter_map(|provider| {
+            let name = provider.get("provider").and_then(Value::as_str)?;
+            let accounts = provider
+                .get("accounts")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let scope = provider
+                .get("account_scope")
+                .and_then(Value::as_str)
+                .filter(|scope| matches!(*scope, "all" | "selected"))
+                // Legacy empty account lists meant all accounts. New records
+                // carry the explicit scope shown above.
+                .unwrap_or(if accounts == 0 { "all" } else { "selected" });
+            let provider_limit = provider
+                .get("max_estimated_input_tokens_per_request")
+                .or_else(|| provider.get("prompt_token_limit"))
+                .and_then(Value::as_u64)
+                .map(|limit| format!(" <= {limit}/request"))
+                .unwrap_or_default();
+            let accounts = if scope == "all" {
+                "all accounts".to_string()
+            } else {
+                format!("{accounts} account{}", if accounts == 1 { "" } else { "s" })
+            };
+            Some(format!("{name} ({accounts}{provider_limit})"))
+        })
         .collect::<Vec<_>>();
     if providers.is_empty() {
-        "restricted".to_string()
+        format!("restricted{suffix}")
     } else {
-        providers.join(",")
+        format!("{}{}", providers.join(", "), suffix)
     }
 }
 
@@ -4833,6 +4965,97 @@ impl EmptyStringExt for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renewable_quota_cli_accepts_create_update_and_balance_commands() {
+        let quota =
+            r#"{"timezone":"UTC","rules":[{"metric":"requests","period":"weekly","limit":10}]}"#;
+        let parsed =
+            Cli::try_parse_from(["iogw", "keys", "create", "--quota-json", quota]).unwrap();
+        let Some(Command::Keys(KeysCommand {
+            action: Some(KeysAction::Create(args)),
+        })) = parsed.command
+        else {
+            panic!("expected key create");
+        };
+        assert_eq!(args.quota_json.as_deref(), Some(quota));
+        let parsed = Cli::try_parse_from([
+            "iogw",
+            "keys",
+            "update",
+            "key-one",
+            "--access-json",
+            "@policy.json",
+        ])
+        .unwrap();
+        let Some(Command::Keys(KeysCommand {
+            action: Some(KeysAction::Update(args)),
+        })) = parsed.command
+        else {
+            panic!("expected key update");
+        };
+        assert_eq!(args.id, "key-one");
+        assert_eq!(args.access_json, "@policy.json");
+        let parsed = Cli::try_parse_from(["iogw", "keys", "quotas", "--id", "key-one"]).unwrap();
+        assert!(matches!(parsed.command, Some(Command::Keys(KeysCommand {
+            action: Some(KeysAction::Quotas { id: Some(ref id) })
+        })) if id == "key-one"));
+        assert!(Cli::try_parse_from(["iogw", "keys", "update", "key-one"]).is_err());
+    }
+
+    #[test]
+    fn renewable_quota_cli_summary_keeps_scope_caps_and_each_rule() {
+        let summary = access_summary(&json!({
+            "all": false, "max_estimated_input_tokens_per_request": 400,
+            "providers": [{"provider":"claude", "account_scope":"selected", "accounts":["claude:one"]}],
+            "quota": {"timezone":"UTC", "rules":[
+                {"metric":"requests","period":"daily","limit":5},
+                {"metric":"output_tokens","period":"weekly","limit":1000}
+            ]}
+        }));
+        assert!(summary.contains("claude (1 account)"));
+        assert!(summary.contains("max=400/request"));
+        assert!(summary.contains("requests=5/daily"));
+        assert!(summary.contains("output_tokens=1000/weekly"));
+    }
+
+    #[test]
+    fn key_create_explicit_cap_overrides_json_without_losing_scope_or_quotas() {
+        let access = json!({
+            "all": false,
+            "prompt_token_limit": 999,
+            "max_estimated_input_tokens_per_request": 500,
+            "providers": [{"provider":"claude", "account_scope":"selected", "accounts":["claude:one"]}],
+            "quota": {"rules":[{"metric":"requests", "period":"weekly", "limit":10}]}
+        });
+        let args = KeyCreateArgs {
+            label: "test".to_string(),
+            access_json: Some(access.to_string()),
+            quota_json: None,
+            max_estimated_input_tokens_per_request: Some(1),
+        };
+        let payload = key_create_access(&args).unwrap();
+        assert_eq!(payload["max_estimated_input_tokens_per_request"], 1);
+        assert!(payload.get("prompt_token_limit").is_none());
+        assert_eq!(payload["providers"], access["providers"]);
+        assert_eq!(payload["quota"], access["quota"]);
+        assert_eq!(payload["all"], false);
+    }
+
+    #[test]
+    fn key_create_zero_cap_is_rejected_with_or_without_access_json() {
+        for access_json in [None, Some(r#"{"all":true}"#.to_string())] {
+            let args = KeyCreateArgs {
+                label: "test".to_string(),
+                access_json,
+                quota_json: None,
+                max_estimated_input_tokens_per_request: Some(0),
+            };
+            assert!(key_create_access(&args)
+                .unwrap_err()
+                .contains("greater than zero"));
+        }
+    }
 
     fn test_dir(name: &str) -> PathBuf {
         let path =

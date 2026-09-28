@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
 };
 use bytes::Bytes;
+use futures_util::StreamExt;
 use std::time::Duration;
 
 const DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
@@ -72,6 +73,7 @@ pub async fn responses(
     body: Bytes,
 ) -> impl IntoResponse {
     if !crate::check_api_key(&state, &headers) {
+        crate::release_api_key_budget_before_dispatch(&state);
         return (
             StatusCode::UNAUTHORIZED,
             [("Content-Type", "application/json")],
@@ -87,6 +89,7 @@ pub async fn responses(
     let request_value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
@@ -142,6 +145,7 @@ pub async fn responses(
     let payload_body = serde_json::to_string(&payload).unwrap_or_default();
     let accounts = super::accounts::candidate_accounts(&state);
     if accounts.is_empty() {
+        crate::release_api_key_budget_before_dispatch(&state);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [("Content-Type", "application/json")],
@@ -162,6 +166,16 @@ pub async fn responses(
             "/grok/v1/responses",
             prompt_metrics.clone(),
         );
+        if let Err(response) = crate::reserve_api_key_budgets_for_prepared_dispatch(
+            &state,
+            context.provider_name,
+            &context.key,
+            payload_body.as_bytes(),
+        )
+        .await
+        {
+            return response;
+        }
         crate::record_request_started(&state, &context);
 
         let upstream_base = account
@@ -233,22 +247,52 @@ pub async fn responses(
                     let state_clone = state.clone();
                     let context_clone = context.clone();
                     let rl_headers = forwarded_ratelimit_headers(resp.headers());
+                    let mut upstream: crate::ReqwestByteStream = Box::pin(resp.bytes_stream());
+                    let prefix = match crate::read_sse_prelude(
+                        &mut upstream,
+                        Duration::from_secs(state.cfg.upstream_first_event_timeout_seconds.max(1)),
+                    )
+                    .await
+                    {
+                        Ok(prefix) => prefix,
+                        Err(message) => {
+                            crate::record_grok_error(&state, &context, &message);
+                            if attempt_idx + 1 < accounts.len()
+                                && crate::should_retry_account_error(
+                                    StatusCode::BAD_GATEWAY,
+                                    &message,
+                                )
+                            {
+                                last_error = Some((StatusCode::BAD_GATEWAY, message));
+                                continue;
+                            }
+                            return grok_response_error(&message);
+                        }
+                    };
+                    // Construct before spawning so cancellation before the
+                    // first poll also finishes the account/budget lifecycle.
+                    let mut cleanup = crate::StreamRequestGuard::new(&state, &context);
                     tokio::spawn(async move {
-                        let mut chunk_stream = resp.bytes_stream();
+                        let mut chunk_stream: crate::ReqwestByteStream = Box::pin(
+                            futures_util::stream::once(async move {
+                                Ok::<Bytes, reqwest::Error>(prefix)
+                            })
+                            .chain(upstream),
+                        );
                         let mut buffer = Vec::new();
                         let mut failed = false;
-                        while let Some(chunk) =
-                            futures_util::StreamExt::next(&mut chunk_stream).await
-                        {
+                        loop {
+                            let chunk = match next_grok_stream_chunk(&mut chunk_stream, &tx).await {
+                                GrokStreamRead::ClientDisconnected => return,
+                                GrokStreamRead::Upstream(None) => break,
+                                GrokStreamRead::Upstream(Some(chunk)) => chunk,
+                            };
                             match chunk {
                                 Ok(bytes) => {
                                     buffer.extend_from_slice(&bytes);
                                     if tx.send(Ok(bytes)).await.is_err() {
-                                        crate::router_request_abandoned(
-                                            &state_clone,
-                                            context_clone.provider_name,
-                                            &context_clone.key,
-                                        );
+                                        // Cleanup conservatively charges the
+                                        // dispatched input on disconnect.
                                         return;
                                     }
                                 }
@@ -267,18 +311,20 @@ pub async fn responses(
                         }
                         if !failed {
                             let body_bytes = Bytes::from(buffer);
-                            if let Some(usage) =
-                                crate::usage_metrics_from_sse_response_body(&body_bytes)
-                            {
-                                crate::record_grok_success(&state_clone, &context_clone, &usage);
-                            } else {
-                                crate::record_grok_success(
+                            match grok_sse_outcome(&body_bytes) {
+                                Ok(Some(usage)) => {
+                                    crate::record_grok_success(&state_clone, &context_clone, &usage)
+                                }
+                                Ok(None) => crate::record_request_completed_with_unknown_usage(
                                     &state_clone,
                                     &context_clone,
-                                    &crate::UsageMetrics::default(),
-                                );
+                                ),
+                                Err(message) => {
+                                    crate::record_grok_error(&state_clone, &context_clone, &message)
+                                }
                             }
                         }
+                        cleanup.finish();
                     });
 
                     let stream_body = Body::from_stream(rx_stream(rx));
@@ -295,11 +341,56 @@ pub async fn responses(
                     return response;
                 } else {
                     let rl_headers = forwarded_ratelimit_headers(resp.headers());
-                    let body_bytes = resp.bytes().await.unwrap_or_default();
+                    let is_sse = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .is_some_and(|value| value.contains("text/event-stream"));
+                    let body_bytes = match resp.bytes().await {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            let message = format!("Grok response body failed: {}", error);
+                            crate::record_grok_error(&state, &context, &message);
+                            return grok_response_error(&message);
+                        }
+                    };
+                    // Some compatible upstreams return SSE even for a
+                    // buffered request. Inspect it before converting; an
+                    // error envelope must not turn into an empty success.
+                    let (body_bytes, unknown_sse_usage) = if is_sse {
+                        let usage = match grok_sse_outcome(&body_bytes) {
+                            Ok(usage) => usage,
+                            Err(message) => {
+                                crate::record_grok_error(&state, &context, &message);
+                                return grok_response_error(&message);
+                            }
+                        };
+                        (
+                            crate::source::v1::response::sse_to_response_json(&body_bytes),
+                            usage.is_none(),
+                        )
+                    } else {
+                        (body_bytes, false)
+                    };
                     let response_value: serde_json::Value =
-                        serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
+                        match serde_json::from_slice(&body_bytes) {
+                            Ok(value) => value,
+                            Err(_) => {
+                                let message = "Grok returned an invalid JSON response";
+                                crate::record_grok_error(&state, &context, message);
+                                return grok_response_error(message);
+                            }
+                        };
+                    if let Some(message) = crate::sse_error_from_value(&response_value) {
+                        crate::record_grok_error(&state, &context, &message);
+                        return grok_response_error(&message);
+                    }
                     let usage = crate::usage_metrics_from_response_value(&response_value);
-                    crate::record_grok_success(&state, &context, &usage);
+                    if unknown_sse_usage {
+                        crate::record_request_completed_with_unknown_usage(&state, &context);
+                    } else {
+                        crate::record_grok_success(&state, &context, &usage);
+                    }
                     let effective_model = response_value
                         .get("model")
                         .and_then(|v| v.as_str())
@@ -353,6 +444,37 @@ pub async fn responses(
         ),
     )
         .into_response()
+}
+
+fn grok_response_error(message: &str) -> axum::response::Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        [("Content-Type", "application/json")],
+        crate::source::v1::response::openai_error_body(message, "server_error", None),
+    )
+        .into_response()
+}
+
+fn grok_sse_outcome(body: &Bytes) -> Result<Option<crate::UsageMetrics>, String> {
+    crate::sse_response_body_outcome(body)
+}
+
+enum GrokStreamRead {
+    ClientDisconnected,
+    Upstream(Option<Result<Bytes, reqwest::Error>>),
+}
+
+async fn next_grok_stream_chunk(
+    upstream: &mut crate::ReqwestByteStream,
+    downstream: &tokio::sync::mpsc::Sender<Result<Bytes, axum::Error>>,
+) -> GrokStreamRead {
+    tokio::select! {
+        // A silent upstream must not keep an abandoned account and its
+        // budget hold active until the full upstream read timeout expires.
+        biased;
+        _ = downstream.closed() => GrokStreamRead::ClientDisconnected,
+        chunk = upstream.next() => GrokStreamRead::Upstream(chunk),
+    }
 }
 
 /// Returns the `x-ratelimit-*` headers from the upstream response, ready to be
@@ -428,6 +550,7 @@ async fn proxy_simple(
     upstream_suffix: &str,
 ) -> axum::response::Response {
     if !crate::check_api_key(&state, headers) {
+        crate::release_api_key_budget_before_dispatch(state);
         return (
             StatusCode::UNAUTHORIZED,
             [("Content-Type", "application/json")],
@@ -440,7 +563,23 @@ async fn proxy_simple(
             .into_response();
     }
 
-    let parsed_body: Option<serde_json::Value> = serde_json::from_slice(body).ok();
+    let parsed_body: Option<serde_json::Value> =
+        match serde_json::from_slice::<serde_json::Value>(body) {
+            Ok(value) if value.is_object() => Some(value),
+            _ => {
+                crate::release_api_key_budget_before_dispatch(state);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    [("Content-Type", "application/json")],
+                    crate::source::v1::response::openai_error_body(
+                        "Request body must be a JSON object",
+                        "invalid_request_error",
+                        None,
+                    ),
+                )
+                    .into_response();
+            }
+        };
     let model = parsed_body
         .as_ref()
         .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string));
@@ -451,6 +590,7 @@ async fn proxy_simple(
 
     let accounts = super::accounts::candidate_accounts(state);
     if accounts.is_empty() {
+        crate::release_api_key_budget_before_dispatch(state);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [("Content-Type", "application/json")],
@@ -477,6 +617,16 @@ async fn proxy_simple(
             &format!("/grok/v1/{}", upstream_suffix),
             prompt_metrics.clone(),
         );
+        if let Err(response) = crate::reserve_api_key_budgets_for_prepared_dispatch(
+            state,
+            context.provider_name,
+            &context.key,
+            body,
+        )
+        .await
+        {
+            return response;
+        }
         crate::record_request_started(state, &context);
 
         match state
@@ -521,10 +671,31 @@ async fn proxy_simple(
                 }
                 persist_runtime_metadata(state, account, model.as_deref(), &rate_limits, "");
                 let rl_headers = forwarded_ratelimit_headers(resp.headers());
-                let body_bytes = resp.bytes().await.unwrap_or_default();
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-                    let usage = crate::usage_metrics_from_response_value(&v);
+                let body_bytes = match resp.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        let message = format!("Grok media response body failed: {}", err);
+                        crate::record_grok_error(state, &context, &message);
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            [("Content-Type", "application/json")],
+                            crate::source::v1::response::openai_error_body(
+                                &message,
+                                "server_error",
+                                None,
+                            ),
+                        )
+                            .into_response();
+                    }
+                };
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                    let usage = crate::usage_metrics_from_response_value(&value);
                     crate::record_grok_success(state, &context, &usage);
+                } else {
+                    // A 2xx media response may omit the normal JSON usage
+                    // shape. It has already reached Grok, so settle its
+                    // managed-key input hold conservatively now.
+                    crate::record_request_completed_with_unknown_usage(state, &context);
                 }
                 let mut response = (
                     StatusCode::OK,
@@ -596,11 +767,64 @@ fn fallback_models() -> Vec<serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::DEFAULT_BASE_URL;
+    use super::{grok_sse_outcome, next_grok_stream_chunk, GrokStreamRead, DEFAULT_BASE_URL};
+    use bytes::Bytes;
 
     #[test]
     fn grok_responses_url_matches_xai_docs() {
         let upstream_url = format!("{}/responses", DEFAULT_BASE_URL.trim_end_matches('/'));
         assert_eq!(upstream_url, "https://api.x.ai/v1/responses");
+    }
+
+    #[test]
+    fn sse_accounting_grok_terminal_error_then_done_cannot_be_success() {
+        let body = Bytes::from_static(
+            b"data:{\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\nevent:error\ndata:{\"message\":\"upstream rejected request\"}\n\ndata:[DONE]\n\n",
+        );
+        assert_eq!(
+            grok_sse_outcome(&body).err().as_deref(),
+            Some("upstream rejected request")
+        );
+    }
+
+    #[test]
+    fn sse_accounting_grok_eof_without_terminal_event_is_a_failure() {
+        let body = Bytes::from_static(
+            b"data:{\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+        );
+        assert!(grok_sse_outcome(&body).is_err());
+        assert!(grok_sse_outcome(&Bytes::new()).is_err());
+    }
+
+    #[test]
+    fn sse_accounting_grok_completed_preserves_no_space_usage() {
+        let body = Bytes::from_static(
+            b"event:response.completed\r\ndata:{\"response\":{\"error\":null,\"usage\":{\"input_tokens\":17,\"output_tokens\":3}}}\r\n\r\n",
+        );
+        let usage = grok_sse_outcome(&body).unwrap().unwrap();
+        assert_eq!(usage.input_tokens, 17);
+        assert_eq!(usage.output_tokens, 3);
+    }
+
+    #[test]
+    fn sse_accounting_grok_done_without_usage_remains_unknown() {
+        assert!(grok_sse_outcome(&Bytes::from_static(b"data:[DONE]\n\n"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn sse_accounting_grok_disconnect_interrupts_silent_upstream() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut upstream: crate::ReqwestByteStream = Box::pin(futures_util::stream::pending());
+        let worker = tokio::spawn(async move { next_grok_stream_chunk(&mut upstream, &tx).await });
+        tokio::task::yield_now().await;
+        drop(rx);
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(250), worker)
+            .await
+            .expect("client disconnect must not wait for another upstream chunk")
+            .unwrap();
+        assert!(matches!(result, GrokStreamRead::ClientDisconnected));
     }
 }

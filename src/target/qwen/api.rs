@@ -108,6 +108,7 @@ pub async fn responses(
     body: Bytes,
 ) -> impl IntoResponse {
     if !crate::check_api_key(&state, &headers) {
+        crate::release_api_key_budget_before_dispatch(&state);
         return (
             StatusCode::UNAUTHORIZED,
             [("Content-Type", "application/json")],
@@ -123,6 +124,7 @@ pub async fn responses(
     let request_value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
@@ -139,6 +141,7 @@ pub async fn responses(
     let model = match request_value.get("model").and_then(|v| v.as_str()) {
         Some(model) if !model.trim().is_empty() => model.to_string(),
         _ => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
@@ -155,6 +158,7 @@ pub async fn responses(
     let payload = match build_chat_payload(&request_value, &model) {
         Ok(payload) => payload,
         Err(err) => {
+            crate::release_api_key_budget_before_dispatch(&state);
             return (
                 StatusCode::BAD_REQUEST,
                 [("Content-Type", "application/json")],
@@ -166,6 +170,7 @@ pub async fn responses(
 
     let accounts = super::accounts::candidate_accounts(&state);
     if accounts.is_empty() {
+        crate::release_api_key_budget_before_dispatch(&state);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [("Content-Type", "application/json")],
@@ -190,12 +195,26 @@ pub async fn responses(
             prompt_metrics.clone(),
         );
 
+        if let Err(response) = crate::reserve_api_key_budgets_for_prepared_dispatch(
+            &state,
+            context.provider_name,
+            &context.key,
+            &serde_json::to_vec(&payload).unwrap_or_default(),
+        )
+        .await
+        {
+            return response;
+        }
         crate::record_qwen_request(&state, &context);
 
         let access_token = match super::auth::ensure_access_token(&state, account).await {
             Ok(token) => token,
             Err(err) => {
-                crate::record_qwen_error(&state, &context, &err);
+                if attempt_idx + 1 < accounts.len() {
+                    crate::record_request_pre_dispatch_retry_error(&state, &context, err.as_str());
+                } else {
+                    crate::record_request_pre_dispatch_error(&state, &context, err.as_str());
+                }
                 last_error = Some((StatusCode::BAD_GATEWAY, err));
                 if attempt_idx + 1 < accounts.len() {
                     continue;
@@ -240,6 +259,7 @@ pub async fn responses(
 
         let response = chat_to_openai_response(&upstream, &model);
         let mut usage = crate::usage_metrics_from_response_value(&response);
+        crate::quota_usage::preserve_native_usage(&mut usage, &upstream, "openai");
         crate::apply_estimated_usage_fallback(
             &mut usage,
             &context.prompt,
@@ -418,6 +438,12 @@ fn build_chat_payload(
         .and_then(|v| v.as_u64())
     {
         payload["max_tokens"] = json!(max_output_tokens);
+    }
+    if let Some(enable_thinking) = request_value
+        .get("enable_thinking")
+        .and_then(serde_json::Value::as_bool)
+    {
+        payload["enable_thinking"] = json!(enable_thinking);
     }
     if let Some(temperature) = request_value.get("temperature").and_then(|v| v.as_f64()) {
         payload["temperature"] = json!(temperature);
@@ -838,6 +864,22 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn quota_prepared_qwen_request_preserves_disabled_thinking() {
+        let payload = build_chat_payload(
+            &json!({"input":"hi","max_output_tokens":20,"enable_thinking":false}),
+            "qwen3-coder-plus",
+        )
+        .unwrap();
+        assert_eq!(payload["enable_thinking"], false);
+        let bounds = crate::quota_usage::prepared_bounds("qwen", &payload).unwrap();
+        assert_eq!(bounds.output_upper_bound, Some(20));
+        assert_eq!(
+            bounds.input_upper_bound,
+            serde_json::to_vec(&payload).unwrap().len() as u64
+        );
+    }
+
+    #[test]
     fn strip_proxy_footer_removes_qwen_api_debug_block() {
         let content = "ok\n\n<details>\n<summary></summary>\n\n```\nResponse ID: abc\nRequest ID: def\n```\n</details>".to_string();
         assert_eq!(strip_proxy_footer(content), "ok");
@@ -866,9 +908,10 @@ mod tests {
 
         let response = chat_to_openai_response(&upstream, "qwen3-coder-plus");
         let mut usage = crate::usage_metrics_from_response_value(&response);
+        let prompt_metrics = crate::prompt_metrics_from_request_value(&request);
         crate::apply_estimated_usage_fallback(
             &mut usage,
-            &crate::prompt_metrics_from_request_value(&request),
+            &prompt_metrics,
             response
                 .get("output_text")
                 .and_then(|value| value.as_str())
@@ -885,7 +928,12 @@ mod tests {
             .cloned()
             .unwrap_or_default();
         assert_eq!(estimated_usage.get("provider"), Some(&json!("qwen")));
-        assert_eq!(estimated_usage.get("input_chars"), Some(&json!(43u64)));
+        // Input accounting is now the conservative full serialized request,
+        // rather than the old narrow prompt-text character count.
+        assert_eq!(
+            estimated_usage.get("input_chars"),
+            Some(&json!(prompt_metrics.input_chars))
+        );
         assert_eq!(
             estimated_usage.get("input_tokens"),
             Some(&json!(usage.input_tokens))
