@@ -65,7 +65,7 @@ jobs:
           app=false
           for path in "${changed_files[@]}"; do
             case "${path}" in
-              Cargo.toml|Cargo.lock|config.example.json|.env.example|ecosystem.config.cjs|src/*|examples/*|.github/workflows/deploy.yml)
+              Cargo.toml|Cargo.lock|config.example.json|.env.example|ecosystem.config.cjs|src/*|examples/*|scripts/test-iogw-performance.py|.github/workflows/deploy.yml)
                 app=true
                 ;;
             esac
@@ -113,6 +113,9 @@ jobs:
 
       - name: Build release
         run: cargo build --release --locked
+
+      - name: Check terminal responsiveness
+        run: python3 scripts/test-iogw-performance.py --binary target/release/iogw
 
       - name: Record checksum
         run: |

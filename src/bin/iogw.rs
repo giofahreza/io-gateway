@@ -26,8 +26,12 @@ use std::{
     io::{self, Stdout, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+#[path = "iogw/tui_network.rs"]
+mod tui_network;
+use tui_network::{NetworkEvent, Section, TuiCommand, TuiNetwork};
 
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8319";
 const SESSION_COOKIE_NAME: &str = "io_gateway_admin_session";
@@ -401,15 +405,12 @@ struct GatewayData {
     summary: Value,
     routing: Value,
     snapshot: Value,
-    context_history: Value,
     keys: Vec<KeyRow>,
     models: Vec<ModelRow>,
     accounts: Vec<AccountRow>,
     quotas: Vec<QuotaRow>,
     usage_buckets: Vec<UsageBucket>,
-    history: Vec<Value>,
     notifications: Value,
-    fetched_at: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -468,8 +469,8 @@ impl OverviewSection {
 }
 
 enum ConfirmationAction {
-    DeleteAccount,
-    DeleteCustomModel,
+    DeleteAccount { file_name: String },
+    DeleteCustomModel { alias: String },
 }
 
 struct ConfirmationModal {
@@ -567,7 +568,7 @@ struct TuiApp {
     show_command_modal: bool,
     confirmation_modal: Option<ConfirmationModal>,
     message: String,
-    last_auto_refresh: Instant,
+    network: TuiNetwork,
 }
 
 #[tokio::main]
@@ -618,6 +619,7 @@ impl GatewayClient {
             .filter(|value| !value.is_empty());
         let http = Client::builder()
             .timeout(Duration::from_secs(30))
+            .gzip(true)
             .build()
             .map_err(|err| err.to_string())?;
         Ok(Self {
@@ -788,7 +790,7 @@ async fn command_accounts(
     let action = command.action.unwrap_or(AccountsAction::List);
     match action {
         AccountsAction::List => {
-            let data = fetch_gateway_data(client, false).await?;
+            let data = fetch_gateway_data(client).await?;
             if json_output {
                 return print_response(true, accounts_json(&data.accounts));
             }
@@ -800,7 +802,7 @@ async fn command_accounts(
             set_account_enabled(client, args, false, json_output).await
         }
         AccountsAction::Delete(args) => {
-            let data = fetch_gateway_data(client, false).await?;
+            let data = fetch_gateway_data(client).await?;
             let account = find_account(&data.accounts, &args.target, args.provider.as_deref())?;
             if account.file_name.is_empty() {
                 return Err("selected account has no credential file name".to_string());
@@ -815,7 +817,7 @@ async fn command_accounts(
             print_response(json_output, response.body)
         }
         AccountsAction::Priority(args) => {
-            let data = fetch_gateway_data(client, false).await?;
+            let data = fetch_gateway_data(client).await?;
             let account = find_account(&data.accounts, &args.target, args.provider.as_deref())?;
             if account.key.is_empty() {
                 return Err("selected account has no routing key".to_string());
@@ -842,7 +844,7 @@ async fn set_account_enabled(
     enabled: bool,
     json_output: bool,
 ) -> Result<(), String> {
-    let data = fetch_gateway_data(client, false).await?;
+    let data = fetch_gateway_data(client).await?;
     let account = find_account(&data.accounts, &args.target, args.provider.as_deref())?;
     if account.file_name.is_empty() {
         return Err("selected account has no credential file name".to_string());
@@ -1142,35 +1144,12 @@ async fn run_tui_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     client: GatewayClient,
 ) -> Result<(), String> {
-    let preferences_path = preferences_path(&client.base_url)?;
-    let preferences = load_tui_preferences(&preferences_path);
-    let mut app = TuiApp {
-        client,
-        preferences_path,
-        data: GatewayData::default(),
-        tab: Tab::Overview,
-        selected: 0,
-        overview_section: OverviewSection::AccountUsage,
-        overview_account_selected: 0,
-        overview_model_selected: 0,
-        limit_display_mode: preferences.limit_display_mode,
-        hidden_usage_providers: preferences.hidden_usage_providers,
-        hidden_usage_accounts: preferences.hidden_usage_accounts,
-        show_command_modal: false,
-        confirmation_modal: None,
-        message: "loading".to_string(),
-        last_auto_refresh: Instant::now(),
-    };
-    app.refresh(false).await;
+    let mut app = TuiApp::new(client)?;
     loop {
+        app.poll_network();
         terminal
             .draw(|frame| draw_tui(frame, &app))
             .map_err(|err| err.to_string())?;
-
-        if app.last_auto_refresh.elapsed() >= Duration::from_secs(30) {
-            app.refresh(false).await;
-            continue;
-        }
 
         if !event::poll(Duration::from_millis(250)).map_err(|err| err.to_string())? {
             continue;
@@ -1186,7 +1165,7 @@ async fn run_tui_loop(
         }
         if app.confirmation_modal.is_some() {
             match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => app.confirm_selection().await,
+                KeyCode::Char('y') | KeyCode::Enter => app.confirm_selection(),
                 KeyCode::Char('n') | KeyCode::Char('?') => app.cancel_confirmation(),
                 _ => {}
             }
@@ -1212,7 +1191,7 @@ async fn run_tui_loop(
             KeyCode::Char('h') => app.previous_overview_section(),
             KeyCode::Char('l') => app.next_overview_section(),
             KeyCode::Char('v') => app.hide_selected_usage_account(),
-            KeyCode::Char('r') => app.refresh(true).await,
+            KeyCode::Char('r') => app.refresh(),
             KeyCode::Char('a') => {
                 let selected_account_index = selected_overview_account_index(&app);
                 app.limit_display_mode.toggle();
@@ -1227,6 +1206,10 @@ async fn run_tui_loop(
             }
             KeyCode::Char('u') => app.show_all_usage_filters(),
             KeyCode::Char('o') => {
+                if app.network.command_pending() {
+                    app.message = "an action is already in progress".to_string();
+                    continue;
+                }
                 let otp = prompt_in_terminal(terminal, "OTP: ")?;
                 let api_key_required = bool_at(&app.data.session, &["requires_api_key"])
                     || bool_at(&app.data.session, &["api_key_required"]);
@@ -1235,22 +1218,15 @@ async fn run_tui_loop(
                 } else {
                     None
                 };
-                match app.client.login(&otp, api_key.as_deref()).await {
-                    Ok(response) if response.status.is_success() => {
-                        app.message = "logged in".to_string();
-                        app.refresh(true).await;
-                    }
-                    Ok(response) => app.message = message_from(&response.body),
-                    Err(err) => app.message = err,
-                }
+                app.start_command(TuiCommand::Login { otp, api_key });
             }
-            KeyCode::Char('e') => app.enable_selected().await,
-            KeyCode::Char('d') => app.disable_selected().await,
+            KeyCode::Char('e') => app.enable_selected(),
+            KeyCode::Char('d') => app.disable_selected(),
             KeyCode::Char('p') => {
                 if app.tab == Tab::Overview {
                     app.hide_selected_usage_provider();
                 } else {
-                    app.toggle_selected_priority().await;
+                    app.toggle_selected_priority();
                 }
             }
             KeyCode::Char('x') => {
@@ -1258,13 +1234,7 @@ async fn run_tui_loop(
             }
             KeyCode::Char('t') => {
                 if app.tab == Tab::Notifications {
-                    match app.client.post_json("/notifications/test", None).await {
-                        Ok(response) if response.status.is_success() => {
-                            app.message = message_from(&response.body)
-                        }
-                        Ok(response) => app.message = message_from(&response.body),
-                        Err(err) => app.message = err,
-                    }
+                    app.start_command(TuiCommand::TestNotification);
                 }
             }
             _ => {}
@@ -1273,25 +1243,183 @@ async fn run_tui_loop(
 }
 
 impl TuiApp {
-    async fn refresh(&mut self, explicit: bool) {
-        match fetch_gateway_data(&self.client, true).await {
-            Ok(data) => {
-                self.data = data;
-                self.message = if explicit {
-                    "refreshed".to_string()
-                } else if self.needs_login() {
-                    "admin login required: press o".to_string()
-                } else {
-                    String::new()
-                };
-                self.last_auto_refresh = Instant::now();
-                self.clamp_selection();
-            }
-            Err(err) => {
-                self.message = err;
-                self.last_auto_refresh = Instant::now();
+    fn new(client: GatewayClient) -> Result<Self, String> {
+        let preferences_path = preferences_path(&client.base_url)?;
+        let preferences = load_tui_preferences(&preferences_path);
+        Ok(Self {
+            client,
+            preferences_path,
+            data: GatewayData::default(),
+            tab: Tab::Overview,
+            selected: 0,
+            overview_section: OverviewSection::AccountUsage,
+            overview_account_selected: 0,
+            overview_model_selected: 0,
+            limit_display_mode: preferences.limit_display_mode,
+            hidden_usage_providers: preferences.hidden_usage_providers,
+            hidden_usage_accounts: preferences.hidden_usage_accounts,
+            show_command_modal: false,
+            confirmation_modal: None,
+            message: String::new(),
+            network: TuiNetwork::new(),
+        })
+    }
+
+    fn refresh(&mut self) {
+        self.network.refresh_visible(self.tab);
+        self.message.clear();
+    }
+
+    fn start_command(&mut self, command: TuiCommand) {
+        if !matches!(command, TuiCommand::Login { .. })
+            && (self.needs_login() || !self.network.has_data(Section::Session))
+        {
+            self.message = "admin login required: press o".to_string();
+        } else if self.network.start_command(&self.client, command) {
+            self.message = "action in progress".to_string();
+        } else {
+            self.message = "an action is already in progress".to_string();
+        }
+    }
+
+    fn expire_session(&mut self) {
+        self.network.invalidate(true);
+        self.network.forget_data();
+        self.data = GatewayData {
+            session: json!({ "enabled": true, "authenticated": false }),
+            ..GatewayData::default()
+        };
+        self.confirmation_modal = None;
+        self.message = "admin login required: press o".to_string();
+    }
+
+    fn poll_network(&mut self) {
+        while let Some(event) = self.network.next_event() {
+            match event {
+                NetworkEvent::Section {
+                    section,
+                    result: Ok(body),
+                    ..
+                } => {
+                    self.apply_section(section, body);
+                }
+                NetworkEvent::Section {
+                    result: Err(error), ..
+                } => {
+                    if error.unauthorized {
+                        self.expire_session();
+                    }
+                }
+                NetworkEvent::Command(Ok(outcome)) => {
+                    if let Some(client) = outcome.client {
+                        self.client = client;
+                        self.network.forget_data();
+                        self.data = GatewayData::default();
+                    }
+                    if outcome.refresh {
+                        // Reject reads started before the mutation/login finished.
+                        self.network.invalidate(true);
+                    }
+                    self.message = outcome.message;
+                }
+                NetworkEvent::Command(Err(error)) => {
+                    if error.unauthorized {
+                        self.expire_session();
+                    }
+                    self.message = error.message;
+                }
             }
         }
+        let authenticated = self.network.has_data(Section::Session) && !self.needs_login();
+        self.network.schedule(&self.client, self.tab, authenticated);
+    }
+
+    fn apply_section(&mut self, section: Section, body: Value) {
+        // Selections belong to identities, not positions in refreshed/sorted rows.
+        let account = self
+            .data
+            .accounts
+            .get(self.selected)
+            .map(|row| (row.provider.clone(), row.key.clone()));
+        let key = self.data.keys.get(self.selected).map(|row| row.id.clone());
+        let model = self
+            .data
+            .models
+            .get(self.overview_model_selected)
+            .map(|row| row.alias.clone());
+        let overview = selected_overview_usage_row(self)
+            .map(|row| (row.provider, row.account_key, row.limit_label));
+        match section {
+            Section::Session => {
+                self.data.session = body;
+                if self.needs_login() {
+                    let session = self.data.session.take();
+                    self.network.forget_data();
+                    self.data = GatewayData {
+                        session,
+                        ..GatewayData::default()
+                    };
+                    self.confirmation_modal = None;
+                    self.message = "admin login required: press o".to_string();
+                }
+            }
+            Section::Summary => {
+                self.data.summary = body;
+                self.data.accounts = account_rows(&self.data.summary, &self.data.routing);
+            }
+            Section::Routing => {
+                self.data.routing = body;
+                self.data.accounts = account_rows(&self.data.summary, &self.data.routing);
+            }
+            Section::Snapshot => {
+                self.data.quotas = quota_rows_from_snapshot(&body);
+                self.data.snapshot = body;
+            }
+            Section::Models => self.data.models = model_rows_from_response(&body),
+            Section::Chart => self.data.usage_buckets = usage_buckets_from_context(&body),
+            Section::Keys => self.data.keys = key_rows_from_response(&body),
+            Section::Notifications => self.data.notifications = body,
+        }
+        if self.tab == Tab::Accounts {
+            if let Some(index) = self.data.accounts.iter().position(|row| {
+                account
+                    .as_ref()
+                    .is_some_and(|(provider, key)| &row.provider == provider && &row.key == key)
+            }) {
+                self.selected = index;
+            }
+        } else if self.tab == Tab::Keys {
+            if let Some(index) = self
+                .data
+                .keys
+                .iter()
+                .position(|row| Some(&row.id) == key.as_ref())
+            {
+                self.selected = index;
+            }
+        }
+        if let Some(index) = self
+            .data
+            .models
+            .iter()
+            .position(|row| Some(&row.alias) == model.as_ref())
+        {
+            self.overview_model_selected = index;
+        }
+        if let Some(index) = overview_account_usage_groups(self)
+            .into_iter()
+            .flat_map(|group| group.accounts)
+            .position(|row| {
+                overview.as_ref().is_some_and(|(provider, key, limit)| {
+                    &row.provider == provider
+                        && &row.account_key == key
+                        && &row.limit_label == limit
+                })
+            })
+        {
+            self.overview_account_selected = index;
+        }
+        self.clamp_selection();
     }
 
     fn needs_login(&self) -> bool {
@@ -1433,19 +1561,19 @@ impl TuiApp {
         None
     }
 
-    async fn enable_selected(&mut self) {
+    fn enable_selected(&mut self) {
         if self.selected_model().is_some() {
-            self.toggle_selected_model(true).await;
+            self.toggle_selected_model(true);
         } else {
-            self.toggle_selected_account(true).await;
+            self.toggle_selected_account(true);
         }
     }
 
-    async fn disable_selected(&mut self) {
+    fn disable_selected(&mut self) {
         if self.selected_model().is_some() {
-            self.toggle_selected_model(false).await;
+            self.toggle_selected_model(false);
         } else {
-            self.toggle_selected_account(false).await;
+            self.toggle_selected_account(false);
         }
     }
 
@@ -1504,7 +1632,7 @@ impl TuiApp {
         }
     }
 
-    async fn toggle_selected_account(&mut self, enabled: bool) {
+    fn toggle_selected_account(&mut self, enabled: bool) {
         if !matches!(self.tab, Tab::Overview | Tab::Accounts) {
             return;
         }
@@ -1515,27 +1643,13 @@ impl TuiApp {
             self.message = "selected account has no credential file".to_string();
             return;
         }
-        match self
-            .client
-            .post_form(
-                "/credentials/toggle",
-                &[
-                    ("file_name", account.file_name),
-                    ("enabled", enabled.to_string()),
-                ],
-            )
-            .await
-        {
-            Ok(response) if response.status.is_success() => {
-                self.message = message_from(&response.body);
-                self.refresh(true).await;
-            }
-            Ok(response) => self.message = message_from(&response.body),
-            Err(err) => self.message = err,
-        }
+        self.start_command(TuiCommand::ToggleAccount {
+            file_name: account.file_name,
+            enabled,
+        });
     }
 
-    async fn toggle_selected_priority(&mut self) {
+    fn toggle_selected_priority(&mut self) {
         if !matches!(self.tab, Tab::Overview | Tab::Accounts) {
             return;
         }
@@ -1546,53 +1660,20 @@ impl TuiApp {
             self.message = "selected account has no routing key".to_string();
             return;
         }
-        match self
-            .client
-            .post_json(
-                "/admin/account-routing/priority",
-                Some(json!({
-                    "provider": account.provider,
-                    "account": account.key,
-                    "priority": !account.priority
-                })),
-            )
-            .await
-        {
-            Ok(response) if response.status.is_success() => {
-                self.message = if account.priority {
-                    "priority removed".to_string()
-                } else {
-                    "account will be used first".to_string()
-                };
-                self.refresh(true).await;
-            }
-            Ok(response) => self.message = message_from(&response.body),
-            Err(err) => self.message = err,
-        }
+        self.start_command(TuiCommand::SetPriority {
+            provider: account.provider,
+            account: account.key,
+            priority: !account.priority,
+        });
     }
 
-    async fn toggle_selected_model(&mut self, enabled: bool) {
+    fn toggle_selected_model(&mut self, enabled: bool) {
         let Some(model) = self.selected_model() else {
             return;
         };
         let mut body = model.raw.clone();
         body["enabled"] = json!(enabled);
-        match self
-            .client
-            .post_json("/custom-models/save", Some(body))
-            .await
-        {
-            Ok(response) if response.status.is_success() => {
-                self.message = if enabled {
-                    "custom model enabled".to_string()
-                } else {
-                    "custom model disabled".to_string()
-                };
-                self.refresh(true).await;
-            }
-            Ok(response) => self.message = message_from(&response.body),
-            Err(err) => self.message = err,
-        }
+        self.start_command(TuiCommand::SaveModel { body });
     }
 
     fn request_delete_confirmation(&mut self) {
@@ -1600,10 +1681,16 @@ impl TuiApp {
             let Some(account) = self.selected_account() else {
                 return;
             };
+            if account.file_name.is_empty() {
+                self.message = "selected account has no credential file".to_string();
+                return;
+            }
             self.confirmation_modal = Some(ConfirmationModal {
                 title: "Delete Account".to_string(),
                 message: format!("Delete account credential {}?", account_display(&account)),
-                action: ConfirmationAction::DeleteAccount,
+                action: ConfirmationAction::DeleteAccount {
+                    file_name: account.file_name,
+                },
             });
         } else if self.tab == Tab::Overview
             && self.overview_section == OverviewSection::CustomModels
@@ -1614,7 +1701,7 @@ impl TuiApp {
             self.confirmation_modal = Some(ConfirmationModal {
                 title: "Delete Custom Model".to_string(),
                 message: format!("Delete custom model {}?", model.alias),
-                action: ConfirmationAction::DeleteCustomModel,
+                action: ConfirmationAction::DeleteCustomModel { alias: model.alias },
             });
         }
     }
@@ -1624,69 +1711,26 @@ impl TuiApp {
         self.message = "delete cancelled".to_string();
     }
 
-    async fn confirm_selection(&mut self) {
+    fn confirm_selection(&mut self) {
         let Some(modal) = self.confirmation_modal.take() else {
             return;
         };
         match modal.action {
-            ConfirmationAction::DeleteAccount => self.delete_selected_account().await,
-            ConfirmationAction::DeleteCustomModel => self.delete_selected_model().await,
-        }
-    }
-
-    async fn delete_selected_model(&mut self) {
-        let Some(model) = self.selected_model() else {
-            return;
-        };
-        match self
-            .client
-            .post_json(
-                "/custom-models/delete",
-                Some(json!({ "alias": model.alias })),
-            )
-            .await
-        {
-            Ok(response) if response.status.is_success() => {
-                self.message = message_from(&response.body);
-                self.refresh(true).await;
+            ConfirmationAction::DeleteAccount { file_name } => {
+                self.start_command(TuiCommand::DeleteAccount { file_name })
             }
-            Ok(response) => self.message = message_from(&response.body),
-            Err(err) => self.message = err,
-        }
-    }
-
-    async fn delete_selected_account(&mut self) {
-        let Some(account) = self.selected_account() else {
-            return;
-        };
-        if account.file_name.is_empty() {
-            self.message = "selected account has no credential file".to_string();
-            return;
-        }
-        match self
-            .client
-            .post_form("/credentials/delete", &[("file_name", account.file_name)])
-            .await
-        {
-            Ok(response) if response.status.is_success() => {
-                self.message = message_from(&response.body);
-                self.refresh(true).await;
+            ConfirmationAction::DeleteCustomModel { alias } => {
+                self.start_command(TuiCommand::DeleteModel { alias })
             }
-            Ok(response) => self.message = message_from(&response.body),
-            Err(err) => self.message = err,
         }
     }
 }
 
-async fn fetch_gateway_data(
-    client: &GatewayClient,
-    include_history: bool,
-) -> Result<GatewayData, String> {
+async fn fetch_gateway_data(client: &GatewayClient) -> Result<GatewayData, String> {
     let session_response = client.get("/admin/session").await?;
     let session = session_response.body;
     let mut data = GatewayData {
         session: session.clone(),
-        fetched_at: Some(Instant::now()),
         ..GatewayData::default()
     };
     if bool_at(&session, &["enabled"]) && !bool_at(&session, &["authenticated"]) {
@@ -1714,20 +1758,6 @@ async fn fetch_gateway_data(
     data.keys = key_rows_from_response(&keys.body);
     data.models = model_rows_from_response(&models.body);
     data.notifications = notifications.body;
-
-    if include_history {
-        let history = client.get("/usage/history.json?limit=30").await?;
-        if history.status.is_success() {
-            data.history = events_from_response(&history.body);
-        }
-        let context_history = client
-            .get("/usage/context-history.json?hours=24&bucket_minutes=30")
-            .await?;
-        if context_history.status.is_success() {
-            data.usage_buckets = usage_buckets_from_context(&context_history.body);
-            data.context_history = context_history.body;
-        }
-    }
 
     Ok(data)
 }
@@ -1808,7 +1838,7 @@ fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp) {
     let title = format!(
         " iogw  {}  {}",
         app.client.base_url,
-        if app.needs_login() { "AUTH" } else { "LIVE" }
+        app.network.connection_label(app.tab, &app.data.session)
     );
     frame.render_widget(
         Paragraph::new(title)
@@ -1849,7 +1879,11 @@ fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp) {
     } else {
         format!(" {}", app.message)
     };
-    frame.render_widget(Paragraph::new(footer).style(btop_muted_style()), root[3]);
+    let status = app.network.status(app.tab);
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(footer), Line::from(status)]).style(btop_muted_style()),
+        root[3],
+    );
 
     if app.show_command_modal {
         draw_command_modal(frame, frame.area(), app);
@@ -1963,11 +1997,10 @@ fn draw_overview_metrics(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         (
             "Error Rate",
             error_rate(requests, errors),
-            app.data
-                .fetched_at
-                .map(|_| "updated this session")
-                .unwrap_or("waiting for data")
-                .to_string(),
+            app.network
+                .age(Section::Summary)
+                .map(|age| format!("usage fetched {}s ago", age.as_secs()))
+                .unwrap_or_else(|| "waiting for data".to_string()),
             if errors > 0 {
                 BTOP_USED_END
             } else {

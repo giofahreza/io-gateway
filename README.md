@@ -266,6 +266,10 @@ Terminal management client:
 
 `iogw` opens the interactive terminal UI by default. `iogw tui` is the explicit equivalent, and direct commands such as `iogw accounts list`, `iogw quota --refresh`, `iogw keys list`, `iogw models list`, and `iogw usage history` are available for scripts or remote administration.
 
+The TUI loads sections independently in the background and keeps input available during refreshes and management requests. Visible usage counters refresh every 5 seconds, accounts and quota snapshots every 15 seconds, charts every 30 seconds, and custom models every 60 seconds. Keys and notification settings load when their tab is open and refresh every 30 seconds. Press `r` to refresh the current view; repeated presses share outstanding requests. Failed sections retain their previous values and show their age and error in the footer.
+
+Footer ages describe when the client received each section. Provider quota values still follow the gateway's upstream cache and refresh policy. Detailed event history is fetched only by `iogw usage history`, while the overview chart uses the separate aggregated history endpoint. The client requests gzip compression automatically.
+
 ## Example Client Config
 
 Codex CLI:
@@ -309,6 +313,14 @@ cargo fmt --check
 cargo test --locked
 cargo build --release --locked
 ```
+
+On Linux or macOS, exercise terminal responsiveness against a local mock gateway:
+
+```bash
+python3 scripts/test-iogw-performance.py --binary target/release/iogw
+```
+
+This checks startup, input and exit during slow requests, independent updates on failure, gzip decoding, and background login and management actions without using production credentials.
 
 Dashboard JavaScript syntax check:
 
