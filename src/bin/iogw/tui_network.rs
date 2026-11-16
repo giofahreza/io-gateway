@@ -1,7 +1,7 @@
 //! Bounded background requests. The terminal thread only schedules work and
 //! applies completed results; it never waits for the gateway.
 
-use super::{bool_at, ensure_success, message_from, GatewayClient, Tab};
+use super::{bool_at, ensure_success, message_from, ApiResponse, GatewayClient, Tab};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -36,7 +36,7 @@ impl Section {
     pub(super) fn visible(self, tab: Tab) -> bool {
         match self {
             Self::Session => true,
-            Self::Summary | Self::Routing => matches!(tab, Tab::Overview | Tab::Accounts),
+            Self::Summary | Self::Routing => tab == Tab::Overview,
             Self::Snapshot | Self::Models | Self::Chart => tab == Tab::Overview,
             Self::Keys => tab == Tab::Keys,
             Self::Notifications => tab == Tab::Notifications,
@@ -111,6 +111,26 @@ pub(super) struct CommandOutcome {
     pub message: String,
     pub client: Option<GatewayClient>,
     pub refresh: bool,
+    pub reveal: Option<String>,
+    pub account_login: Option<AccountLoginPrompt>,
+}
+
+pub(super) enum AccountLoginPrompt {
+    Browser {
+        provider: String,
+        url: String,
+        state: Option<String>,
+        label: Option<String>,
+        organization_uuid: Option<String>,
+        base_url: Option<String>,
+    },
+    CopilotDevice {
+        device_code: String,
+        verification_uri: String,
+        user_code: String,
+        label: Option<String>,
+        account_type: String,
+    },
 }
 
 pub(super) enum NetworkEvent {
@@ -127,14 +147,32 @@ pub(super) enum TuiCommand {
         otp: String,
         api_key: Option<String>,
     },
+    StartAccountLogin {
+        provider: String,
+        label: Option<String>,
+        organization_uuid: Option<String>,
+        base_url: Option<String>,
+        account_type: Option<String>,
+    },
+    CompleteAccountLogin {
+        provider: String,
+        input: String,
+        state: Option<String>,
+        project_id: Option<String>,
+        label: Option<String>,
+        organization_uuid: Option<String>,
+        base_url: Option<String>,
+        account_type: Option<String>,
+        verification_uri: Option<String>,
+        user_code: Option<String>,
+    },
+    SaveAccountCredentials {
+        provider: String,
+        body: Value,
+    },
     ToggleAccount {
         file_name: String,
         enabled: bool,
-    },
-    SetPriority {
-        provider: String,
-        account: String,
-        priority: bool,
     },
     SaveModel {
         body: Value,
@@ -145,15 +183,119 @@ pub(super) enum TuiCommand {
     DeleteModel {
         alias: String,
     },
+    CreateApiKey {
+        label: String,
+        access: Value,
+    },
+    UpdateApiKeyAccess {
+        id: String,
+        access: Value,
+    },
+    RevokeApiKey {
+        id: String,
+    },
+    UpdateNotificationSettings {
+        body: Value,
+    },
     TestNotification,
 }
 
 impl TuiCommand {
     async fn execute(self, mut client: GatewayClient) -> Result<CommandOutcome, RequestError> {
         let login = matches!(self, Self::Login { .. });
-        let refresh = !matches!(self, Self::TestNotification);
+        let refresh = !matches!(
+            self,
+            Self::TestNotification | Self::StartAccountLogin { .. }
+        );
+        let creates_api_key = matches!(self, Self::CreateApiKey { .. });
         let response = match self {
             Self::Login { otp, api_key } => client.login(&otp, api_key.as_deref()).await,
+            Self::StartAccountLogin {
+                provider,
+                label,
+                organization_uuid,
+                base_url,
+                account_type,
+            } => {
+                let pending = account_login_start(
+                    &client,
+                    &provider,
+                    label,
+                    organization_uuid,
+                    base_url,
+                    account_type,
+                )
+                .await?;
+                return Ok(CommandOutcome {
+                    message: "account login started".to_string(),
+                    client: None,
+                    refresh: false,
+                    reveal: None,
+                    account_login: pending,
+                });
+            }
+            Self::CompleteAccountLogin {
+                provider,
+                input,
+                state,
+                project_id,
+                label,
+                organization_uuid,
+                base_url,
+                account_type,
+                verification_uri,
+                user_code,
+            } => {
+                let fields = account_login_submit_fields(
+                    &provider,
+                    input,
+                    state,
+                    project_id,
+                    label,
+                    organization_uuid,
+                    base_url,
+                    account_type,
+                );
+                let response = client
+                    .post_form(account_login_submit_path(&provider)?, &fields)
+                    .await?;
+                if provider == "copilot"
+                    && response.status.is_success()
+                    && response.body.get("ok") == Some(&Value::Bool(false))
+                    && is_copilot_pending(&message_from(&response.body))
+                {
+                    return Ok(CommandOutcome {
+                        message: "GitHub authorization is still pending; approve the device code and press Enter to check again"
+                            .to_string(),
+                        client: None,
+                        refresh: false,
+                        reveal: None,
+                        account_login: Some(AccountLoginPrompt::CopilotDevice {
+                            device_code: fields
+                                .iter()
+                                .find(|(key, _)| *key == "device_code")
+                                .map(|(_, value)| value.clone())
+                                .unwrap_or_default(),
+                            verification_uri: verification_uri.unwrap_or_default(),
+                            user_code: user_code.unwrap_or_default(),
+                            label: fields
+                                .iter()
+                                .find(|(key, _)| *key == "label")
+                                .map(|(_, value)| value.clone()),
+                            account_type: fields
+                                .iter()
+                                .find(|(key, _)| *key == "account_type")
+                                .map(|(_, value)| value.clone())
+                                .unwrap_or_else(|| "individual".to_string()),
+                        }),
+                    });
+                }
+                Ok(response)
+            }
+            Self::SaveAccountCredentials { provider, body } => {
+                let path = account_credentials_path(&provider)?;
+                Ok(client.post_json(path, Some(body)).await?)
+            }
             Self::ToggleAccount { file_name, enabled } => {
                 client
                     .post_form(
@@ -162,16 +304,6 @@ impl TuiCommand {
                     )
                     .await
             }
-            Self::SetPriority {
-                provider,
-                account,
-                priority,
-            } => client
-                .post_json(
-                    "/admin/account-routing/priority",
-                    Some(json!({ "provider": provider, "account": account, "priority": priority })),
-                )
-                .await,
             Self::SaveModel { body } => client.post_json("/custom-models/save", Some(body)).await,
             Self::DeleteAccount { file_name } => {
                 client
@@ -183,22 +315,240 @@ impl TuiCommand {
                     .post_json("/custom-models/delete", Some(json!({ "alias": alias })))
                     .await
             }
+            Self::CreateApiKey { label, access } => {
+                client
+                    .post_json(
+                        "/admin/api-keys/create",
+                        Some(json!({ "label": label, "access": access })),
+                    )
+                    .await
+            }
+            Self::UpdateApiKeyAccess { id, access } => {
+                client
+                    .post_json(
+                        "/admin/api-keys/access",
+                        Some(json!({ "id": id, "access": access })),
+                    )
+                    .await
+            }
+            Self::RevokeApiKey { id } => {
+                client
+                    .post_json("/admin/api-keys/revoke", Some(json!({ "id": id })))
+                    .await
+            }
+            Self::UpdateNotificationSettings { body } => {
+                client
+                    .post_json("/notifications/settings", Some(body))
+                    .await
+            }
             Self::TestNotification => client.post_json("/notifications/test", None).await,
         }?;
         ensure_success(&response).map_err(|message| RequestError {
             message,
             unauthorized: matches!(response.status.as_u16(), 401 | 403),
         })?;
+        if response.body.get("ok") == Some(&Value::Bool(false)) {
+            return Err(RequestError {
+                message: message_from(&response.body),
+                unauthorized: matches!(response.status.as_u16(), 401 | 403),
+            });
+        }
         Ok(CommandOutcome {
             message: if login {
                 "logged in".to_string()
+            } else if creates_api_key {
+                "API key created; copy the revealed secret now".to_string()
             } else {
                 message_from(&response.body)
             },
             client: login.then_some(client),
             refresh,
+            reveal: creates_api_key
+                .then(|| response.body.get("plain_text_key").and_then(Value::as_str))
+                .flatten()
+                .map(str::to_string),
+            account_login: None,
         })
     }
+}
+
+async fn account_login_start(
+    client: &GatewayClient,
+    provider: &str,
+    label: Option<String>,
+    organization_uuid: Option<String>,
+    base_url: Option<String>,
+    account_type: Option<String>,
+) -> Result<Option<AccountLoginPrompt>, RequestError> {
+    let response = match provider {
+        "codex" => client.get("/login/codex/start").await,
+        "antigravity" => client.get("/login/antigravity/start").await,
+        "gemini" => client.get("/login/gemini/start").await,
+        "grok" => client.get("/login/grok/start").await,
+        "claude" => {
+            let path = query_path(
+                "/login/claude/start",
+                [
+                    ("label", label.as_deref()),
+                    ("organization_uuid", organization_uuid.as_deref()),
+                    ("base_url", base_url.as_deref()),
+                ],
+            );
+            client.get(&path).await
+        }
+        "copilot" => {
+            let mut body = serde_json::Map::new();
+            if let Some(label) = label.as_deref().filter(|value| !value.is_empty()) {
+                body.insert("label".to_string(), Value::String(label.to_string()));
+            }
+            if let Some(account_type) = account_type.as_deref().filter(|value| !value.is_empty()) {
+                body.insert(
+                    "account_type".to_string(),
+                    Value::String(account_type.to_string()),
+                );
+            }
+            client
+                .post_json("/login/copilot/start", Some(Value::Object(body)))
+                .await
+        }
+        _ => return Err(format!("unsupported account provider: {provider}").into()),
+    }
+    .map_err(RequestError::from)?;
+    ensure_action_success(&response)?;
+    let pending = match provider {
+        "copilot" => AccountLoginPrompt::CopilotDevice {
+            device_code: string_field(&response.body, "device_code")?,
+            verification_uri: string_field(&response.body, "verification_uri")?,
+            user_code: string_field(&response.body, "user_code")?,
+            label,
+            account_type: account_type.unwrap_or_else(|| "individual".to_string()),
+        },
+        _ => AccountLoginPrompt::Browser {
+            provider: provider.to_string(),
+            url: string_field(&response.body, "url")?,
+            state: response
+                .body
+                .get("state")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            label,
+            organization_uuid,
+            base_url,
+        },
+    };
+    Ok(Some(pending))
+}
+
+fn account_login_submit_path(provider: &str) -> Result<&'static str, RequestError> {
+    match provider {
+        "codex" => Ok("/login/codex/submit"),
+        "antigravity" => Ok("/login/antigravity/submit"),
+        "gemini" => Ok("/login/gemini/submit"),
+        "grok" => Ok("/login/grok/submit"),
+        "claude" => Ok("/login/claude/submit"),
+        "copilot" => Ok("/login/copilot/submit"),
+        _ => Err(format!("unsupported account provider: {provider}").into()),
+    }
+}
+
+fn account_credentials_path(provider: &str) -> Result<&'static str, RequestError> {
+    match provider {
+        "qwen" => Ok("/login/qwen/start"),
+        "deepseek" => Ok("/login/deepseek/start"),
+        "minimax" => Ok("/login/minimax/start"),
+        "glm" => Ok("/login/glm/start"),
+        "copilot" => Ok("/login/copilot/start"),
+        "claude" => Ok("/login/claude/start"),
+        _ => Err(format!("unsupported account provider: {provider}").into()),
+    }
+}
+
+fn account_login_submit_fields(
+    provider: &str,
+    input: String,
+    state: Option<String>,
+    project_id: Option<String>,
+    label: Option<String>,
+    organization_uuid: Option<String>,
+    base_url: Option<String>,
+    account_type: Option<String>,
+) -> Vec<(&'static str, String)> {
+    let mut fields = vec![(
+        if provider == "copilot" {
+            "device_code"
+        } else {
+            "redirect_url"
+        },
+        input,
+    )];
+    if let Some(value) = state.filter(|value| !value.is_empty()) {
+        fields.push(("state", value));
+    }
+    if let Some(value) = project_id.filter(|value| !value.is_empty()) {
+        fields.push(("project_id", value));
+    }
+    if let Some(value) = label.filter(|value| !value.is_empty()) {
+        fields.push(("label", value));
+    }
+    if let Some(value) = organization_uuid.filter(|value| !value.is_empty()) {
+        fields.push(("organization_uuid", value));
+    }
+    if let Some(value) = base_url.filter(|value| !value.is_empty()) {
+        fields.push(("base_url", value));
+    }
+    if let Some(value) = account_type.filter(|value| !value.is_empty()) {
+        fields.push(("account_type", value));
+    }
+    fields
+}
+
+fn query_path<const N: usize>(base: &str, fields: [(&str, Option<&str>); N]) -> String {
+    let query = fields
+        .into_iter()
+        .filter_map(|(key, value)| {
+            value
+                .filter(|value| !value.is_empty())
+                .map(|value| (key, value))
+        })
+        .map(|(key, value)| format!("{}={}", super::url_encode(key), super::url_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    if query.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{query}")
+    }
+}
+
+fn ensure_action_success(response: &ApiResponse) -> Result<(), RequestError> {
+    ensure_success(response).map_err(|message| RequestError {
+        message,
+        unauthorized: matches!(response.status.as_u16(), 401 | 403),
+    })?;
+    if response.body.get("ok") == Some(&Value::Bool(false)) {
+        return Err(RequestError {
+            message: message_from(&response.body),
+            unauthorized: matches!(response.status.as_u16(), 401 | 403),
+        });
+    }
+    Ok(())
+}
+
+fn string_field(value: &Value, key: &str) -> Result<String, RequestError> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("account login response did not include {key}").into())
+}
+
+fn is_copilot_pending(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("pending")
+        || message.contains("slow_down")
+        || message.contains("waiting")
+        || message.contains("authorization_pending")
 }
 
 #[derive(Default)]
@@ -500,7 +850,7 @@ impl Drop for TuiNetwork {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{ConfirmationAction, OverviewSection, TuiApp};
+    use super::super::{ConfirmationAction, KeyRow, OverviewSection, TuiApp};
     use super::*;
     use axum::{
         body::to_bytes,
@@ -818,7 +1168,8 @@ mod tests {
         );
         let mut app = mock.app();
         drive(&mut app, |app| app.network.has_data(Section::Session)).await;
-        app.tab = Tab::Accounts;
+        app.tab = Tab::Overview;
+        app.overview_section = OverviewSection::AccountUsage;
         app.apply_section(
             Section::Routing,
             json!({"accounts":[
@@ -848,6 +1199,196 @@ mod tests {
         drop(requests);
         gate.add_permits(1);
         drive(&mut app, |app| !app.network.command_pending()).await;
+    }
+
+    #[tokio::test]
+    async fn api_key_management_uses_dashboard_routes_and_reveals_new_secret() {
+        let mock = MockGateway::new().await;
+        mock.reply(
+            "/admin/api-keys/create",
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "plain_text_key": "iogw-secret-once",
+                "keys": [],
+                "quota_summaries": {},
+                "accounts": []
+            }),
+            None,
+        );
+        mock.reply(
+            "/admin/api-keys/access",
+            StatusCode::OK,
+            json!({"ok":true,"keys":[],"quota_summaries":{},"accounts":[]}),
+            None,
+        );
+        mock.reply(
+            "/admin/api-keys/revoke",
+            StatusCode::OK,
+            json!({"ok":true,"keys":[],"quota_summaries":{},"accounts":[]}),
+            None,
+        );
+        let mut app = mock.app();
+        drive(&mut app, |app| app.network.has_data(Section::Session)).await;
+        app.tab = Tab::Keys;
+        app.start_command(TuiCommand::CreateApiKey {
+            label: "Dashboard key".to_string(),
+            access: json!({"all":true,"providers":[]}),
+        });
+        drive(&mut app, |app| app.api_key_reveal == "iogw-secret-once").await;
+        let requests = mock.state.requests.lock().unwrap();
+        let (_, _, body, _) = requests
+            .iter()
+            .find(|(_, path, _, _)| path == "/admin/api-keys/create")
+            .unwrap();
+        let body: Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(body["label"], "Dashboard key");
+        assert_eq!(body["access"]["all"], true);
+        drop(requests);
+
+        app.data.keys = vec![KeyRow {
+            id: "key-1".to_string(),
+            label: "Dashboard key".to_string(),
+            access_json: json!({"all":true,"providers":[]}),
+            ..KeyRow::default()
+        }];
+        app.selected = 0;
+        app.start_command(TuiCommand::UpdateApiKeyAccess {
+            id: "key-1".to_string(),
+            access: json!({"all":false,"providers":[]}),
+        });
+        drive(&mut app, |app| !app.network.command_pending()).await;
+        app.data.keys = vec![KeyRow {
+            id: "key-1".to_string(),
+            label: "Dashboard key".to_string(),
+            access_json: json!({"all":false,"providers":[]}),
+            ..KeyRow::default()
+        }];
+        app.selected = 0;
+        app.request_delete_confirmation();
+        app.confirm_selection();
+        drive(&mut app, |app| !app.network.command_pending()).await;
+        assert_eq!(mock.count("/admin/api-keys/access"), 1);
+        assert_eq!(mock.count("/admin/api-keys/revoke"), 1);
+    }
+
+    #[tokio::test]
+    async fn account_add_uses_the_web_provider_route_and_json_payload() {
+        let mock = MockGateway::new().await;
+        mock.reply(
+            "/login/deepseek/start",
+            StatusCode::OK,
+            json!({"ok":true,"message":"saved DeepSeek account"}),
+            None,
+        );
+        let mut app = mock.app();
+        drive(&mut app, |app| app.network.has_data(Section::Session)).await;
+        app.start_command(TuiCommand::SaveAccountCredentials {
+            provider: "deepseek".to_string(),
+            body: json!({
+                "api_key": "sk-test",
+                "label": "work",
+                "base_url": "https://api.deepseek.com"
+            }),
+        });
+        drive(&mut app, |app| !app.network.command_pending()).await;
+
+        let requests = mock.state.requests.lock().unwrap();
+        let (_, path, body, _) = requests
+            .iter()
+            .find(|(_, path, _, _)| path == "/login/deepseek/start")
+            .unwrap();
+        assert_eq!(path, "/login/deepseek/start");
+        let body: Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(body["api_key"], "sk-test");
+        assert_eq!(body["label"], "work");
+        assert_eq!(body["base_url"], "https://api.deepseek.com");
+        assert_eq!(app.message, "saved DeepSeek account");
+    }
+
+    #[tokio::test]
+    async fn browser_account_add_keeps_provider_state_for_callback_submission() {
+        let mock = MockGateway::new().await;
+        mock.reply(
+            "/login/claude/start?label=work&organization_uuid=org-1&base_url=https%3A%2F%2Fapi.anthropic.com",
+            StatusCode::OK,
+            json!({"ok":true,"url":"https://example.test/login","state":"state-1"}),
+            None,
+        );
+        let mut app = mock.app();
+        drive(&mut app, |app| app.network.has_data(Section::Session)).await;
+        app.start_command(TuiCommand::StartAccountLogin {
+            provider: "claude".to_string(),
+            label: Some("work".to_string()),
+            organization_uuid: Some("org-1".to_string()),
+            base_url: Some("https://api.anthropic.com".to_string()),
+            account_type: None,
+        });
+        drive(&mut app, |app| app.pending_account_login.is_some()).await;
+
+        match app.pending_account_login.as_ref().unwrap() {
+            AccountLoginPrompt::Browser {
+                provider,
+                url,
+                state,
+                label,
+                organization_uuid,
+                base_url,
+            } => {
+                assert_eq!(provider, "claude");
+                assert_eq!(url, "https://example.test/login");
+                assert_eq!(state.as_deref(), Some("state-1"));
+                assert_eq!(label.as_deref(), Some("work"));
+                assert_eq!(organization_uuid.as_deref(), Some("org-1"));
+                assert_eq!(base_url.as_deref(), Some("https://api.anthropic.com"));
+            }
+            AccountLoginPrompt::CopilotDevice { .. } => panic!("expected browser login"),
+        }
+    }
+
+    #[tokio::test]
+    async fn notification_management_uses_dashboard_settings_route() {
+        let mock = MockGateway::new().await;
+        mock.reply(
+            "/notifications/settings",
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "settings": {
+                    "enabled": false,
+                    "channel": "telegram",
+                    "telegram": {"bot_token_configured": true, "chat_id": "123"},
+                    "google_chat": {"webhook_configured": false},
+                    "watched_accounts": ["codex:one"],
+                    "accounts": [{"provider":"codex", "provider_label":"Codex", "key":"codex:one", "label":"One", "enabled":true}]
+                }
+            }),
+            None,
+        );
+        let mut app = mock.app();
+        drive(&mut app, |app| app.network.has_data(Section::Session)).await;
+        app.tab = Tab::Notifications;
+        app.data.notifications = json!({
+            "ok": true,
+            "settings": {
+                "enabled": true,
+                "channel": "telegram",
+                "watched_accounts": [],
+                "accounts": [{"provider":"codex", "provider_label":"Codex", "key":"codex:one", "label":"One", "enabled":true}]
+            }
+        });
+        app.toggle_notifications_enabled();
+        drive(&mut app, |app| !app.network.command_pending()).await;
+
+        let requests = mock.state.requests.lock().unwrap();
+        let (_, _, body, _) = requests
+            .iter()
+            .find(|(_, path, _, _)| path == "/notifications/settings")
+            .unwrap();
+        let body: Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(body["enabled"], false);
+        assert_eq!(body["channel"], "telegram");
+        assert_eq!(body["watched_accounts"], json!([]));
     }
 
     #[tokio::test]

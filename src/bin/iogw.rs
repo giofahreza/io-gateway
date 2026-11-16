@@ -1,7 +1,8 @@
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -31,7 +32,7 @@ use std::{
 
 #[path = "iogw/tui_network.rs"]
 mod tui_network;
-use tui_network::{NetworkEvent, Section, TuiCommand, TuiNetwork};
+use tui_network::{AccountLoginPrompt, NetworkEvent, Section, TuiCommand, TuiNetwork};
 
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8319";
 const SESSION_COOKIE_NAME: &str = "io_gateway_admin_session";
@@ -52,6 +53,9 @@ const BTOP_PROC_BOX: Color = Color::Rgb(0x80, 0x52, 0x52);
 const BTOP_DIV_LINE: Color = Color::Rgb(0x30, 0x30, 0x30);
 const BTOP_TEMP_START: Color = Color::Rgb(0x48, 0x97, 0xd4);
 const BTOP_CPU_START: Color = Color::Rgb(0x77, 0xca, 0x9b);
+const BTOP_STATUS_DISABLED: Color = Color::Rgb(0xff, 0x47, 0x69);
+const BTOP_STATUS_COOLDOWN: Color = Color::Rgb(0x48, 0x97, 0xd4);
+const BTOP_ATTENTION: Color = Color::Rgb(0xff, 0xb8, 0x14);
 const BTOP_CPU_MID: Color = Color::Rgb(0xcb, 0xc0, 0x6c);
 const BTOP_CACHED_MID: Color = Color::Rgb(0x74, 0xe6, 0xfc);
 const BTOP_AVAILABLE_END: Color = Color::Rgb(0xff, 0xb8, 0x14);
@@ -343,6 +347,9 @@ struct AccountRow {
     account_id: String,
     file_name: String,
     enabled: bool,
+    cooldown: bool,
+    cooldown_remaining_seconds: Option<u64>,
+    attention_reasons: Vec<String>,
     priority: bool,
     requests: u64,
     errors: u64,
@@ -352,17 +359,37 @@ struct AccountRow {
     last_error_message: String,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct QuotaRow {
     provider: String,
     account_key: String,
     account_label: String,
     limit_label: String,
     label: String,
+    detail_text: String,
+    overview: bool,
     used_percent_value: Option<f64>,
     used_percent: String,
     remaining_percent: String,
     reset: String,
+}
+
+impl Default for QuotaRow {
+    fn default() -> Self {
+        Self {
+            provider: String::new(),
+            account_key: String::new(),
+            account_label: String::new(),
+            limit_label: String::new(),
+            label: String::new(),
+            detail_text: String::new(),
+            overview: true,
+            used_percent_value: None,
+            used_percent: String::new(),
+            remaining_percent: String::new(),
+            reset: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -372,9 +399,23 @@ struct KeyRow {
     prefix: String,
     source: String,
     revoked: bool,
+    revoked_at: String,
     created_at: String,
     last_used_at: String,
     access: String,
+    access_json: Value,
+}
+
+#[derive(Clone, Default)]
+struct NotificationAccountRow {
+    provider: String,
+    provider_label: String,
+    key: String,
+    label: String,
+    account_id: String,
+    credential_file: String,
+    enabled: bool,
+    watched: bool,
 }
 
 #[derive(Clone, Default)]
@@ -406,6 +447,7 @@ struct GatewayData {
     routing: Value,
     snapshot: Value,
     keys: Vec<KeyRow>,
+    key_quota_summaries: Value,
     models: Vec<ModelRow>,
     accounts: Vec<AccountRow>,
     quotas: Vec<QuotaRow>,
@@ -429,7 +471,6 @@ struct ApiResponse {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Tab {
     Overview,
-    Accounts,
     Keys,
     Notifications,
 }
@@ -471,6 +512,7 @@ impl OverviewSection {
 enum ConfirmationAction {
     DeleteAccount { file_name: String },
     DeleteCustomModel { alias: String },
+    RevokeApiKey { id: String },
 }
 
 struct ConfirmationModal {
@@ -514,6 +556,10 @@ struct TuiPreferences {
     limit_display_mode: Option<String>,
     hidden_usage_providers: Vec<String>,
     hidden_usage_accounts: Vec<HiddenUsageAccountPreference>,
+    #[serde(default)]
+    account_orders: Vec<AccountOrderPreference>,
+    #[serde(default)]
+    provider_order: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -522,10 +568,18 @@ struct HiddenUsageAccountPreference {
     account_key: String,
 }
 
+#[derive(Deserialize, Serialize)]
+struct AccountOrderPreference {
+    provider: String,
+    account_keys: Vec<String>,
+}
+
 struct TuiPreferenceState {
     limit_display_mode: LimitDisplayMode,
     hidden_usage_providers: HashSet<String>,
     hidden_usage_accounts: HashSet<(String, String)>,
+    account_orders: HashMap<String, Vec<String>>,
+    provider_order: Vec<String>,
 }
 
 impl Default for TuiPreferenceState {
@@ -534,20 +588,21 @@ impl Default for TuiPreferenceState {
             limit_display_mode: LimitDisplayMode::OnePerAccount,
             hidden_usage_providers: HashSet::new(),
             hidden_usage_accounts: HashSet::new(),
+            account_orders: HashMap::new(),
+            provider_order: Vec::new(),
         }
     }
 }
 
 impl Tab {
     fn all() -> &'static [Tab] {
-        &[Tab::Overview, Tab::Accounts, Tab::Keys, Tab::Notifications]
+        &[Tab::Overview, Tab::Keys, Tab::Notifications]
     }
 
     fn title(self) -> &'static str {
         match self {
             Tab::Overview => "Overview",
-            Tab::Accounts => "Accounts",
-            Tab::Keys => "Keys",
+            Tab::Keys => "API Keys",
             Tab::Notifications => "Notifications",
         }
     }
@@ -565,7 +620,17 @@ struct TuiApp {
     limit_display_mode: LimitDisplayMode,
     hidden_usage_providers: HashSet<String>,
     hidden_usage_accounts: HashSet<(String, String)>,
+    account_orders: HashMap<String, Vec<String>>,
+    provider_order: Vec<String>,
     show_command_modal: bool,
+    command_modal_scroll: usize,
+    show_account_details: bool,
+    account_details_scroll: usize,
+    show_api_key_details: bool,
+    api_key_details_scroll: usize,
+    show_api_key_reveal: bool,
+    api_key_reveal: String,
+    pending_account_login: Option<AccountLoginPrompt>,
     confirmation_modal: Option<ConfirmationModal>,
     message: String,
     network: TuiNetwork,
@@ -1147,6 +1212,7 @@ async fn run_tui_loop(
     let mut app = TuiApp::new(client)?;
     loop {
         app.poll_network();
+        app.continue_pending_account_login(terminal)?;
         terminal
             .draw(|frame| draw_tui(frame, &app))
             .map_err(|err| err.to_string())?;
@@ -1157,7 +1223,7 @@ async fn run_tui_loop(
         let Event::Key(key) = event::read().map_err(|err| err.to_string())? else {
             continue;
         };
-        if key.kind != KeyEventKind::Press {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             continue;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1166,20 +1232,113 @@ async fn run_tui_loop(
         if app.confirmation_modal.is_some() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => app.confirm_selection(),
-                KeyCode::Char('n') | KeyCode::Char('?') => app.cancel_confirmation(),
+                KeyCode::Char('n')
+                | KeyCode::Char('q')
+                | KeyCode::Char('Q')
+                | KeyCode::Char('?') => app.cancel_confirmation(),
+                _ => {}
+            }
+            continue;
+        }
+        if app.show_api_key_reveal {
+            match key.code {
+                KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Char('?')
+                | KeyCode::Char('q')
+                | KeyCode::Char('Q') => {
+                    app.show_api_key_reveal = false;
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if app.show_api_key_details {
+            match key.code {
+                KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Char('?')
+                | KeyCode::Char('q')
+                | KeyCode::Char('Q') => {
+                    app.show_api_key_details = false;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.api_key_details_scroll = app.api_key_details_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.api_key_details_scroll = app.api_key_details_scroll.saturating_add(1);
+                }
+                KeyCode::PageUp => {
+                    app.api_key_details_scroll = app.api_key_details_scroll.saturating_sub(10);
+                }
+                KeyCode::PageDown => {
+                    app.api_key_details_scroll = app.api_key_details_scroll.saturating_add(10);
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if app.show_account_details {
+            match key.code {
+                KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Char('?')
+                | KeyCode::Char('q')
+                | KeyCode::Char('Q') => {
+                    app.show_account_details = false;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.account_details_scroll = app.account_details_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.account_details_scroll = app.account_details_scroll.saturating_add(1);
+                }
+                KeyCode::PageUp => {
+                    app.account_details_scroll = app.account_details_scroll.saturating_sub(10);
+                }
+                KeyCode::PageDown => {
+                    app.account_details_scroll = app.account_details_scroll.saturating_add(10);
+                }
                 _ => {}
             }
             continue;
         }
         if app.show_command_modal {
             match key.code {
-                KeyCode::Char('?') => app.show_command_modal = false,
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                    app.show_command_modal = false
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.command_modal_scroll = app.command_modal_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.command_modal_scroll = app.command_modal_scroll.saturating_add(1);
+                }
+                KeyCode::PageUp => {
+                    app.command_modal_scroll = app.command_modal_scroll.saturating_sub(10);
+                }
+                KeyCode::PageDown => {
+                    app.command_modal_scroll = app.command_modal_scroll.saturating_add(10);
+                }
+                KeyCode::Home => app.command_modal_scroll = 0,
+                KeyCode::End => app.command_modal_scroll = usize::MAX,
                 _ => {}
             }
             continue;
         }
+        if let Some(delta) = account_reorder_delta(key) {
+            app.move_selected_usage_account(delta);
+            continue;
+        }
+        if let Some(delta) = provider_reorder_delta(key) {
+            app.move_selected_usage_provider(delta);
+            continue;
+        }
         match key.code {
-            KeyCode::Char('?') => app.show_command_modal = true,
+            KeyCode::Char('?') => {
+                app.command_modal_scroll = 0;
+                app.show_command_modal = true;
+            }
             KeyCode::Tab => {
                 app.next_tab();
             }
@@ -1190,21 +1349,48 @@ async fn run_tui_loop(
             KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
             KeyCode::Char('h') => app.previous_overview_section(),
             KeyCode::Char('l') => app.next_overview_section(),
-            KeyCode::Char('v') => app.hide_selected_usage_account(),
+            KeyCode::Enter => {
+                if app.tab == Tab::Keys {
+                    app.open_selected_api_key_details();
+                } else if app.tab == Tab::Notifications {
+                    app.toggle_selected_notification_account();
+                } else {
+                    app.open_selected_account_details();
+                }
+            }
+            KeyCode::Esc => {}
+            KeyCode::Char('v')
+                if app.tab == Tab::Overview
+                    && app.overview_section == OverviewSection::AccountUsage =>
+            {
+                app.hide_selected_usage_account();
+            }
             KeyCode::Char('r') => app.refresh(),
-            KeyCode::Char('a') => {
+            KeyCode::Char('a') if app.tab == Tab::Notifications => {
+                app.set_all_notification_accounts(true);
+            }
+            KeyCode::Char('a')
+                if app.tab == Tab::Overview
+                    && app.overview_section == OverviewSection::AccountUsage =>
+            {
                 let selected_account_index = selected_overview_account_index(&app);
                 app.limit_display_mode.toggle();
-                if app.tab == Tab::Overview {
-                    app.selected = selected_account_index
-                        .and_then(|index| overview_selection_for_account(&app, index))
-                        .unwrap_or(0);
-                }
+                app.selected = selected_account_index
+                    .and_then(|index| overview_selection_for_account(&app, index))
+                    .unwrap_or(0);
                 app.clamp_selection();
                 app.message = format!("quota view: {}", app.limit_display_mode.label());
                 app.persist_preferences();
             }
-            KeyCode::Char('u') => app.show_all_usage_filters(),
+            KeyCode::Char('u') => {
+                if app.tab == Tab::Notifications {
+                    app.set_all_notification_accounts(false);
+                } else if app.tab == Tab::Overview
+                    && app.overview_section == OverviewSection::AccountUsage
+                {
+                    app.show_all_usage_filters();
+                }
+            }
             KeyCode::Char('o') => {
                 if app.network.command_pending() {
                     app.message = "an action is already in progress".to_string();
@@ -1220,16 +1406,89 @@ async fn run_tui_loop(
                 };
                 app.start_command(TuiCommand::Login { otp, api_key });
             }
-            KeyCode::Char('e') => app.enable_selected(),
-            KeyCode::Char('d') => app.disable_selected(),
-            KeyCode::Char('p') => {
-                if app.tab == Tab::Overview {
-                    app.hide_selected_usage_provider();
-                } else {
-                    app.toggle_selected_priority();
+            KeyCode::Char('n') if app.tab == Tab::Keys => {
+                let label = match prompt_in_terminal(terminal, "API key label (blank = API key): ")
+                {
+                    Ok(label) => label,
+                    Err(error) => {
+                        app.message = error;
+                        continue;
+                    }
+                };
+                let access = match prompt_api_key_access(terminal, None) {
+                    Ok(access) => access,
+                    Err(error) => {
+                        app.message = error;
+                        continue;
+                    }
+                };
+                app.start_command(TuiCommand::CreateApiKey {
+                    label: label.trim().to_string(),
+                    access,
+                });
+            }
+            KeyCode::Char('n')
+                if app.tab == Tab::Overview
+                    && app.overview_section == OverviewSection::AccountUsage =>
+            {
+                if let Err(error) = app.begin_add_account(terminal) {
+                    app.message = error;
                 }
             }
-            KeyCode::Char('x') => {
+            KeyCode::Char('s') if app.tab == Tab::Notifications => {
+                if let Err(error) = app.edit_notification_settings(terminal) {
+                    app.message = error;
+                }
+            }
+            KeyCode::Char('c') if app.tab == Tab::Notifications => {
+                app.cycle_notification_channel();
+            }
+            KeyCode::Char('w') | KeyCode::Char(' ') if app.tab == Tab::Notifications => {
+                app.toggle_selected_notification_account();
+            }
+            KeyCode::Char('e') if app.tab == Tab::Keys => {
+                if let Err(error) = app.edit_selected_api_key(terminal) {
+                    app.message = error;
+                }
+            }
+            KeyCode::Char('e') if app.tab == Tab::Notifications => {
+                app.toggle_notifications_enabled();
+            }
+            KeyCode::Char('e')
+                if app.tab == Tab::Overview
+                    && matches!(
+                        app.overview_section,
+                        OverviewSection::CustomModels | OverviewSection::AccountUsage
+                    ) =>
+            {
+                app.enable_selected();
+            }
+            KeyCode::Char('d')
+                if app.tab == Tab::Overview
+                    && matches!(
+                        app.overview_section,
+                        OverviewSection::CustomModels | OverviewSection::AccountUsage
+                    ) =>
+            {
+                app.disable_selected();
+            }
+            KeyCode::Char('p') if app.tab == Tab::Notifications => {
+                app.toggle_selected_notification_provider();
+            }
+            KeyCode::Char('p')
+                if app.tab == Tab::Overview
+                    && app.overview_section == OverviewSection::AccountUsage =>
+            {
+                app.hide_selected_usage_provider();
+            }
+            KeyCode::Char('x')
+                if app.tab == Tab::Keys
+                    || (app.tab == Tab::Overview
+                        && matches!(
+                            app.overview_section,
+                            OverviewSection::CustomModels | OverviewSection::AccountUsage
+                        )) =>
+            {
                 app.request_delete_confirmation();
             }
             KeyCode::Char('t') => {
@@ -1258,7 +1517,17 @@ impl TuiApp {
             limit_display_mode: preferences.limit_display_mode,
             hidden_usage_providers: preferences.hidden_usage_providers,
             hidden_usage_accounts: preferences.hidden_usage_accounts,
+            account_orders: preferences.account_orders,
+            provider_order: preferences.provider_order,
             show_command_modal: false,
+            command_modal_scroll: 0,
+            show_account_details: false,
+            account_details_scroll: 0,
+            show_api_key_details: false,
+            api_key_details_scroll: 0,
+            show_api_key_reveal: false,
+            api_key_reveal: String::new(),
+            pending_account_login: None,
             confirmation_modal: None,
             message: String::new(),
             network: TuiNetwork::new(),
@@ -1280,6 +1549,267 @@ impl TuiApp {
         } else {
             self.message = "an action is already in progress".to_string();
         }
+    }
+
+    fn begin_add_account(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<(), String> {
+        if self.network.command_pending() {
+            return Err("an action is already in progress".to_string());
+        }
+        if self.needs_login() || !self.network.has_data(Section::Session) {
+            return Err("admin login required: press o".to_string());
+        }
+
+        let provider = prompt_account_provider(terminal)?;
+        match provider.as_str() {
+            "codex" | "antigravity" | "gemini" | "grok" => {
+                self.start_command(TuiCommand::StartAccountLogin {
+                    provider,
+                    label: None,
+                    organization_uuid: None,
+                    base_url: None,
+                    account_type: None,
+                });
+            }
+            "claude" => self.begin_claude_account(terminal)?,
+            "copilot" => self.begin_copilot_account(terminal)?,
+            "qwen" => {
+                let token = prompt_in_terminal(terminal, "Qwen browser token: ")?;
+                if token.trim().is_empty() {
+                    return Err("Qwen browser token is required".to_string());
+                }
+                self.start_command(TuiCommand::SaveAccountCredentials {
+                    provider,
+                    body: json!({ "token": token }),
+                });
+            }
+            "deepseek" | "minimax" => {
+                let api_key = prompt_in_terminal(terminal, "API key: ")?;
+                if api_key.trim().is_empty() {
+                    return Err("API key is required".to_string());
+                }
+                let label = prompt_optional(terminal, "Label (optional): ")?;
+                let base_url = prompt_optional(terminal, "Base URL (optional): ")?;
+                self.start_command(TuiCommand::SaveAccountCredentials {
+                    provider: provider.clone(),
+                    body: json!({
+                        "api_key": api_key,
+                        "label": label,
+                        "base_url": base_url,
+                    }),
+                });
+            }
+            "glm" => {
+                let api_key = prompt_in_terminal(terminal, "GLM API key: ")?;
+                if api_key.trim().is_empty() {
+                    return Err("GLM API key is required".to_string());
+                }
+                let label = prompt_optional(terminal, "Label (optional): ")?;
+                let account_type = prompt_choice(
+                    terminal,
+                    "Account type [1=API usage, 2=Subscription]: ",
+                    &[("1", "api_usage"), ("2", "subscription")],
+                )?;
+                let openai_base_url =
+                    prompt_optional(terminal, "OpenAI/Codex base URL (optional): ")?;
+                let anthropic_base_url =
+                    prompt_optional(terminal, "Claude Code base URL (optional): ")?;
+                self.start_command(TuiCommand::SaveAccountCredentials {
+                    provider,
+                    body: json!({
+                        "api_key": api_key,
+                        "label": label,
+                        "account_type": account_type,
+                        "openai_base_url": openai_base_url,
+                        "anthropic_base_url": anthropic_base_url,
+                    }),
+                });
+            }
+            _ => unreachable!("provider picker only returns known providers"),
+        }
+        Ok(())
+    }
+
+    fn begin_copilot_account(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<(), String> {
+        let method = prompt_choice(
+            terminal,
+            "Copilot login [1=device login, 2=GitHub token]: ",
+            &[("1", "device"), ("2", "token")],
+        )?;
+        let label = prompt_optional(terminal, "Label (optional): ")?;
+        let account_type = prompt_choice(
+            terminal,
+            "Account type [1=individual, 2=business, 3=enterprise]: ",
+            &[("1", "individual"), ("2", "business"), ("3", "enterprise")],
+        )?;
+        if method == "device" {
+            self.start_command(TuiCommand::StartAccountLogin {
+                provider: "copilot".to_string(),
+                label,
+                organization_uuid: None,
+                base_url: None,
+                account_type: Some(account_type),
+            });
+        } else {
+            let github_token = prompt_in_terminal(terminal, "GitHub token: ")?;
+            if github_token.trim().is_empty() {
+                return Err("GitHub token is required".to_string());
+            }
+            self.start_command(TuiCommand::SaveAccountCredentials {
+                provider: "copilot".to_string(),
+                body: json!({
+                    "github_token": github_token,
+                    "label": label,
+                    "account_type": account_type,
+                }),
+            });
+        }
+        Ok(())
+    }
+
+    fn begin_claude_account(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<(), String> {
+        let method = prompt_choice(
+            terminal,
+            "Claude login [1=OAuth, 2=access token, 3=cookie]: ",
+            &[("1", "oauth"), ("2", "token"), ("3", "cookie")],
+        )?;
+        let label = prompt_optional(terminal, "Label (optional): ")?;
+        let organization_uuid = prompt_optional(terminal, "Organization UUID (optional): ")?;
+        let base_url = prompt_optional(terminal, "API base URL (optional): ")?;
+        if method == "oauth" {
+            self.start_command(TuiCommand::StartAccountLogin {
+                provider: "claude".to_string(),
+                label,
+                organization_uuid,
+                base_url,
+                account_type: None,
+            });
+        } else if method == "token" {
+            let access_token = prompt_in_terminal(terminal, "Claude access token: ")?;
+            if access_token.trim().is_empty() {
+                return Err("Claude access token is required".to_string());
+            }
+            let refresh_token = prompt_optional(terminal, "Refresh token (optional): ")?;
+            self.start_command(TuiCommand::SaveAccountCredentials {
+                provider: "claude".to_string(),
+                body: json!({
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "label": label,
+                    "organization_uuid": organization_uuid,
+                    "base_url": base_url,
+                }),
+            });
+        } else {
+            let cookie = prompt_in_terminal(terminal, "Claude.ai cookie: ")?;
+            if cookie.trim().is_empty() {
+                return Err("Claude.ai cookie is required".to_string());
+            }
+            self.start_command(TuiCommand::SaveAccountCredentials {
+                provider: "claude".to_string(),
+                body: json!({
+                    "cookie": cookie,
+                    "label": label,
+                    "organization_uuid": organization_uuid,
+                    "base_url": base_url,
+                }),
+            });
+        }
+        Ok(())
+    }
+
+    fn continue_pending_account_login(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<(), String> {
+        let Some(pending) = self.pending_account_login.take() else {
+            return Ok(());
+        };
+        match pending {
+            AccountLoginPrompt::Browser {
+                provider,
+                url,
+                state,
+                label,
+                organization_uuid,
+                base_url,
+            } => {
+                open_account_login_url(&url);
+                let notice = format!(
+                    "Open this URL in a browser to finish the {} login:\n{}",
+                    provider, url
+                );
+                let input = prompt_in_terminal_with_notice(
+                    terminal,
+                    &notice,
+                    "Callback URL / authorization code (blank = cancel): ",
+                )?;
+                if input.trim().is_empty() {
+                    self.message = "account login cancelled".to_string();
+                    return Ok(());
+                }
+                let project_id = if provider == "gemini" {
+                    prompt_optional(terminal, "Gemini Project ID (optional): ")?
+                } else {
+                    None
+                };
+                self.start_command(TuiCommand::CompleteAccountLogin {
+                    provider,
+                    input,
+                    state,
+                    project_id,
+                    label,
+                    organization_uuid,
+                    base_url,
+                    account_type: None,
+                    verification_uri: None,
+                    user_code: None,
+                });
+            }
+            AccountLoginPrompt::CopilotDevice {
+                device_code,
+                verification_uri,
+                user_code,
+                label,
+                account_type,
+            } => {
+                open_account_login_url(&verification_uri);
+                let notice = format!(
+                    "Open {} and enter this code: {}\nApprove GitHub access, then return here.",
+                    verification_uri, user_code
+                );
+                let input = prompt_in_terminal_with_notice(
+                    terminal,
+                    &notice,
+                    "Press Enter to check (q = cancel): ",
+                )?;
+                if input.trim().eq_ignore_ascii_case("q") {
+                    self.message = "Copilot login cancelled".to_string();
+                    return Ok(());
+                }
+                self.start_command(TuiCommand::CompleteAccountLogin {
+                    provider: "copilot".to_string(),
+                    input: device_code,
+                    state: None,
+                    project_id: None,
+                    label,
+                    organization_uuid: None,
+                    base_url: None,
+                    account_type: Some(account_type),
+                    verification_uri: Some(verification_uri),
+                    user_code: Some(user_code),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn expire_session(&mut self) {
@@ -1311,11 +1841,16 @@ impl TuiApp {
                     }
                 }
                 NetworkEvent::Command(Ok(outcome)) => {
+                    if let Some(reveal) = outcome.reveal {
+                        self.api_key_reveal = reveal;
+                        self.show_api_key_reveal = true;
+                    }
                     if let Some(client) = outcome.client {
                         self.client = client;
                         self.network.forget_data();
                         self.data = GatewayData::default();
                     }
+                    self.pending_account_login = outcome.account_login;
                     if outcome.refresh {
                         // Reject reads started before the mutation/login finished.
                         self.network.invalidate(true);
@@ -1336,19 +1871,16 @@ impl TuiApp {
 
     fn apply_section(&mut self, section: Section, body: Value) {
         // Selections belong to identities, not positions in refreshed/sorted rows.
-        let account = self
-            .data
-            .accounts
-            .get(self.selected)
-            .map(|row| (row.provider.clone(), row.key.clone()));
         let key = self.data.keys.get(self.selected).map(|row| row.id.clone());
+        let notification_key = notification_account_rows(&self.data.notifications)
+            .get(self.selected)
+            .map(|row| row.key.clone());
         let model = self
             .data
             .models
             .get(self.overview_model_selected)
             .map(|row| row.alias.clone());
-        let overview = selected_overview_usage_row(self)
-            .map(|row| (row.provider, row.account_key, row.limit_label));
+        let overview = selected_overview_usage_row(self).map(|row| (row.provider, row.account_key));
         match section {
             Section::Session => {
                 self.data.session = body;
@@ -1366,34 +1898,56 @@ impl TuiApp {
             Section::Summary => {
                 self.data.summary = body;
                 self.data.accounts = account_rows(&self.data.summary, &self.data.routing);
+                apply_account_runtime_status(&mut self.data.accounts, &self.data.snapshot);
+                apply_account_attention(
+                    &mut self.data.accounts,
+                    &self.data.snapshot,
+                    &self.data.quotas,
+                );
             }
             Section::Routing => {
                 self.data.routing = body;
                 self.data.accounts = account_rows(&self.data.summary, &self.data.routing);
+                apply_account_runtime_status(&mut self.data.accounts, &self.data.snapshot);
+                apply_account_attention(
+                    &mut self.data.accounts,
+                    &self.data.snapshot,
+                    &self.data.quotas,
+                );
             }
             Section::Snapshot => {
                 self.data.quotas = quota_rows_from_snapshot(&body);
                 self.data.snapshot = body;
+                apply_account_runtime_status(&mut self.data.accounts, &self.data.snapshot);
+                apply_account_attention(
+                    &mut self.data.accounts,
+                    &self.data.snapshot,
+                    &self.data.quotas,
+                );
             }
             Section::Models => self.data.models = model_rows_from_response(&body),
             Section::Chart => self.data.usage_buckets = usage_buckets_from_context(&body),
-            Section::Keys => self.data.keys = key_rows_from_response(&body),
+            Section::Keys => {
+                self.data.key_quota_summaries =
+                    body.get("quota_summaries").cloned().unwrap_or(Value::Null);
+                self.data.keys = key_rows_from_response(&body);
+            }
             Section::Notifications => self.data.notifications = body,
         }
-        if self.tab == Tab::Accounts {
-            if let Some(index) = self.data.accounts.iter().position(|row| {
-                account
-                    .as_ref()
-                    .is_some_and(|(provider, key)| &row.provider == provider && &row.key == key)
-            }) {
-                self.selected = index;
-            }
-        } else if self.tab == Tab::Keys {
+        if self.tab == Tab::Keys {
             if let Some(index) = self
                 .data
                 .keys
                 .iter()
                 .position(|row| Some(&row.id) == key.as_ref())
+            {
+                self.selected = index;
+            }
+        }
+        if self.tab == Tab::Notifications {
+            if let Some(index) = notification_account_rows(&self.data.notifications)
+                .iter()
+                .position(|row| Some(&row.key) == notification_key.as_ref())
             {
                 self.selected = index;
             }
@@ -1406,14 +1960,11 @@ impl TuiApp {
         {
             self.overview_model_selected = index;
         }
-        if let Some(index) = overview_account_usage_groups(self)
+        if let Some(index) = overview_account_usage_account_rows(self)
             .into_iter()
-            .flat_map(|group| group.accounts)
             .position(|row| {
-                overview.as_ref().is_some_and(|(provider, key, limit)| {
-                    &row.provider == provider
-                        && &row.account_key == key
-                        && &row.limit_label == limit
+                overview.as_ref().is_some_and(|(provider, key)| {
+                    &row.provider == provider && &row.account_key == key
                 })
             })
         {
@@ -1455,6 +2006,120 @@ impl TuiApp {
         self.selected = next as usize;
     }
 
+    fn move_selected_usage_account(&mut self, delta: isize) {
+        if self.tab != Tab::Overview || self.overview_section != OverviewSection::AccountUsage {
+            return;
+        }
+        let Some(selected) = selected_overview_usage_row(self) else {
+            return;
+        };
+        let rows = overview_account_usage_account_rows(self);
+        let Some(current_index) = rows
+            .iter()
+            .position(|row| row.account_index == selected.account_index)
+        else {
+            return;
+        };
+        let next_index = moved_index(current_index, rows.len(), delta);
+        if next_index == current_index {
+            self.message = format!(
+                "{} is already at the provider boundary",
+                selected.account_label
+            );
+            return;
+        }
+        let Some(target) = rows.get(next_index) else {
+            return;
+        };
+        if target.provider != selected.provider {
+            self.message = "accounts can only be reordered within a provider".to_string();
+            return;
+        }
+
+        let provider = selected.provider.clone();
+        let selected_key = selected.account_key.clone();
+        let target_key = target.account_key.clone();
+        let mut order = account_order_for_provider(self, &provider);
+        let Some(selected_order_index) = order.iter().position(|key| key == &selected_key) else {
+            return;
+        };
+        let selected_key = order.remove(selected_order_index);
+        let Some(target_order_index) = order.iter().position(|key| key == &target_key) else {
+            return;
+        };
+        let insert_at = if delta < 0 {
+            target_order_index
+        } else {
+            target_order_index + 1
+        };
+        order.insert(insert_at.min(order.len()), selected_key);
+        self.account_orders.insert(provider, order);
+        self.overview_account_selected =
+            overview_selection_for_account(self, selected.account_index).unwrap_or(current_index);
+        self.sync_selected_from_overview_section();
+        self.message = format!(
+            "moved account {} {}",
+            selected.account_label,
+            if delta < 0 { "up" } else { "down" }
+        );
+        self.persist_preferences();
+    }
+
+    fn move_selected_usage_provider(&mut self, delta: isize) {
+        if self.tab != Tab::Overview || self.overview_section != OverviewSection::AccountUsage {
+            return;
+        }
+        let Some(selected) = selected_overview_usage_row(self) else {
+            return;
+        };
+        let current_account_selection = self.overview_account_selected;
+        let groups = overview_account_usage_groups(self);
+        let Some(current_index) = groups
+            .iter()
+            .position(|group| group.provider == selected.provider)
+        else {
+            return;
+        };
+        let next_index = moved_index(current_index, groups.len(), delta);
+        if next_index == current_index {
+            self.message = format!(
+                "provider {} is already at the display boundary",
+                selected.provider
+            );
+            return;
+        }
+        let Some(target) = groups.get(next_index) else {
+            return;
+        };
+        let provider = selected.provider.clone();
+        let target_provider = target.provider.clone();
+        let mut order = provider_order_for_app(self);
+        let Some(selected_order_index) = order.iter().position(|key| key == &provider) else {
+            return;
+        };
+        let selected_provider = order.remove(selected_order_index);
+        let Some(target_order_index) = order.iter().position(|key| key == &target_provider) else {
+            return;
+        };
+        let insert_at = if delta < 0 {
+            target_order_index
+        } else {
+            target_order_index + 1
+        };
+        order.insert(insert_at.min(order.len()), selected_provider);
+        self.provider_order = order;
+        self.overview_account_selected =
+            overview_selection_for_account(self, selected.account_index)
+                .unwrap_or(current_account_selection);
+        self.sync_selected_from_overview_section();
+        self.message = format!(
+            "moved provider {} {}",
+            provider,
+            if delta < 0 { "up" } else { "down" }
+        );
+        self.persist_preferences();
+    }
+
     fn clamp_selection(&mut self) {
         self.clamp_overview_selections();
         let len = self.selection_len();
@@ -1469,12 +2134,11 @@ impl TuiApp {
         match self.tab {
             Tab::Overview => match self.overview_section {
                 OverviewSection::CustomModels => self.data.models.len(),
-                OverviewSection::AccountUsage => overview_account_usage_row_count(self),
+                OverviewSection::AccountUsage => overview_account_usage_account_count(self),
                 _ => 0,
             },
-            Tab::Accounts => self.data.accounts.len(),
             Tab::Keys => self.data.keys.len(),
-            _ => 0,
+            Tab::Notifications => notification_account_rows(&self.data.notifications).len(),
         }
     }
 
@@ -1487,7 +2151,7 @@ impl TuiApp {
             OverviewSection::AccountUsage => {
                 self.overview_account_selected = moved_index(
                     self.overview_account_selected,
-                    overview_account_usage_row_count(self),
+                    overview_account_usage_account_count(self),
                     delta,
                 );
             }
@@ -1540,7 +2204,7 @@ impl TuiApp {
             clamp_index(self.overview_model_selected, self.data.models.len());
         self.overview_account_selected = clamp_index(
             self.overview_account_selected,
-            overview_account_usage_row_count(self),
+            overview_account_usage_account_count(self),
         );
         self.sync_selected_from_overview_section();
     }
@@ -1554,11 +2218,172 @@ impl TuiApp {
         self.data.accounts.get(account_index).cloned()
     }
 
+    fn selected_api_key(&self) -> Option<&KeyRow> {
+        (self.tab == Tab::Keys).then(|| self.data.keys.get(self.selected))?
+    }
+
+    fn selected_notification_account(&self) -> Option<NotificationAccountRow> {
+        (self.tab == Tab::Notifications).then(|| {
+            notification_account_rows(&self.data.notifications)
+                .into_iter()
+                .nth(self.selected)
+        })?
+    }
+
     fn selected_model(&self) -> Option<ModelRow> {
         if self.tab == Tab::Overview && self.overview_section == OverviewSection::CustomModels {
             return self.data.models.get(self.overview_model_selected).cloned();
         }
         None
+    }
+
+    fn open_selected_account_details(&mut self) {
+        if self.tab == Tab::Overview && self.overview_section == OverviewSection::AccountUsage {
+            if self.selected_account().is_some() {
+                self.account_details_scroll = 0;
+                self.show_account_details = true;
+            } else {
+                self.message = "no account selected".to_string();
+            }
+        }
+    }
+
+    fn open_selected_api_key_details(&mut self) {
+        if self.selected_api_key().is_some() {
+            self.api_key_details_scroll = 0;
+            self.show_api_key_details = true;
+        } else {
+            self.message = "no API key selected".to_string();
+        }
+    }
+
+    fn edit_selected_api_key(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<(), String> {
+        let Some(key) = self.selected_api_key().cloned() else {
+            self.message = "no API key selected".to_string();
+            return Ok(());
+        };
+        if key.revoked {
+            self.message = "revoked API keys cannot be edited".to_string();
+            return Ok(());
+        }
+        let access = prompt_api_key_access(terminal, Some(&key.access_json))?;
+        self.start_command(TuiCommand::UpdateApiKeyAccess { id: key.id, access });
+        Ok(())
+    }
+
+    fn update_notification_settings(&mut self, body: Value) {
+        if self.tab == Tab::Notifications {
+            self.start_command(TuiCommand::UpdateNotificationSettings { body });
+        }
+    }
+
+    fn toggle_notifications_enabled(&mut self) {
+        let settings = notification_settings_value(&self.data.notifications);
+        let body = notification_settings_update_body(
+            !bool_at(settings, &["enabled"]),
+            notification_channel(settings),
+            notification_watched_keys(settings),
+        );
+        self.update_notification_settings(body);
+    }
+
+    fn cycle_notification_channel(&mut self) {
+        let settings = notification_settings_value(&self.data.notifications);
+        let channel = if notification_channel(settings) == "telegram" {
+            "google_chat"
+        } else {
+            "telegram"
+        };
+        let body = notification_settings_update_body(
+            bool_at(settings, &["enabled"]),
+            channel.to_string(),
+            notification_watched_keys(settings),
+        );
+        self.update_notification_settings(body);
+    }
+
+    fn toggle_selected_notification_account(&mut self) {
+        let Some(account) = self.selected_notification_account() else {
+            self.message = "no notification account selected".to_string();
+            return;
+        };
+        let settings = notification_settings_value(&self.data.notifications);
+        let mut watched = notification_watched_keys(settings);
+        if let Some(index) = watched.iter().position(|key| key == &account.key) {
+            watched.remove(index);
+        } else {
+            watched.push(account.key);
+            watched.sort();
+        }
+        let body = notification_settings_update_body(
+            bool_at(settings, &["enabled"]),
+            notification_channel(settings),
+            watched,
+        );
+        self.update_notification_settings(body);
+    }
+
+    fn set_all_notification_accounts(&mut self, watched: bool) {
+        let settings = notification_settings_value(&self.data.notifications);
+        let keys = if watched {
+            notification_account_rows(&self.data.notifications)
+                .into_iter()
+                .map(|account| account.key)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let body = notification_settings_update_body(
+            bool_at(settings, &["enabled"]),
+            notification_channel(settings),
+            keys,
+        );
+        self.update_notification_settings(body);
+    }
+
+    fn toggle_selected_notification_provider(&mut self) {
+        let Some(account) = self.selected_notification_account() else {
+            self.message = "no notification account selected".to_string();
+            return;
+        };
+        let rows = notification_account_rows(&self.data.notifications);
+        let provider = normalize_usage_provider(&account.provider);
+        let provider_rows = rows
+            .iter()
+            .filter(|row| normalize_usage_provider(&row.provider) == provider)
+            .collect::<Vec<_>>();
+        let watch = !provider_rows.iter().all(|row| row.watched);
+        let provider_keys = provider_rows
+            .into_iter()
+            .map(|row| row.key.clone())
+            .collect::<HashSet<_>>();
+        let settings = notification_settings_value(&self.data.notifications);
+        let mut watched = notification_watched_keys(settings)
+            .into_iter()
+            .filter(|key| !provider_keys.contains(key))
+            .collect::<HashSet<_>>();
+        if watch {
+            watched.extend(provider_keys);
+        }
+        let body = notification_settings_update_body(
+            bool_at(settings, &["enabled"]),
+            notification_channel(settings),
+            watched.into_iter().collect(),
+        );
+        self.update_notification_settings(body);
+    }
+
+    fn edit_notification_settings(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<(), String> {
+        let settings = notification_settings_value(&self.data.notifications).clone();
+        let body = prompt_notification_settings(terminal, &settings)?;
+        self.update_notification_settings(body);
+        Ok(())
     }
 
     fn enable_selected(&mut self) {
@@ -1633,7 +2458,7 @@ impl TuiApp {
     }
 
     fn toggle_selected_account(&mut self, enabled: bool) {
-        if !matches!(self.tab, Tab::Overview | Tab::Accounts) {
+        if self.tab != Tab::Overview {
             return;
         }
         let Some(account) = self.selected_account() else {
@@ -1649,24 +2474,6 @@ impl TuiApp {
         });
     }
 
-    fn toggle_selected_priority(&mut self) {
-        if !matches!(self.tab, Tab::Overview | Tab::Accounts) {
-            return;
-        }
-        let Some(account) = self.selected_account() else {
-            return;
-        };
-        if account.key.is_empty() {
-            self.message = "selected account has no routing key".to_string();
-            return;
-        }
-        self.start_command(TuiCommand::SetPriority {
-            provider: account.provider,
-            account: account.key,
-            priority: !account.priority,
-        });
-    }
-
     fn toggle_selected_model(&mut self, enabled: bool) {
         let Some(model) = self.selected_model() else {
             return;
@@ -1677,7 +2484,22 @@ impl TuiApp {
     }
 
     fn request_delete_confirmation(&mut self) {
-        if self.tab == Tab::Accounts {
+        if self.tab == Tab::Keys {
+            let Some(key) = self.selected_api_key() else {
+                return;
+            };
+            if key.revoked {
+                self.message = "API key is already revoked".to_string();
+                return;
+            }
+            self.confirmation_modal = Some(ConfirmationModal {
+                title: "Revoke API Key".to_string(),
+                message: format!("Revoke API key {}?", display_or(&key.label, "API key")),
+                action: ConfirmationAction::RevokeApiKey { id: key.id.clone() },
+            });
+        } else if self.tab == Tab::Overview
+            && self.overview_section == OverviewSection::AccountUsage
+        {
             let Some(account) = self.selected_account() else {
                 return;
             };
@@ -1722,6 +2544,9 @@ impl TuiApp {
             ConfirmationAction::DeleteCustomModel { alias } => {
                 self.start_command(TuiCommand::DeleteModel { alias })
             }
+            ConfirmationAction::RevokeApiKey { id } => {
+                self.start_command(TuiCommand::RevokeApiKey { id })
+            }
         }
     }
 }
@@ -1755,6 +2580,13 @@ async fn fetch_gateway_data(client: &GatewayClient) -> Result<GatewayData, Strin
     data.snapshot = snapshot.body;
     data.accounts = account_rows(&data.summary, &data.routing);
     data.quotas = quota_rows_from_snapshot(&data.snapshot);
+    apply_account_runtime_status(&mut data.accounts, &data.snapshot);
+    apply_account_attention(&mut data.accounts, &data.snapshot, &data.quotas);
+    data.key_quota_summaries = keys
+        .body
+        .get("quota_summaries")
+        .cloned()
+        .unwrap_or(Value::Null);
     data.keys = key_rows_from_response(&keys.body);
     data.models = model_rows_from_response(&models.body);
     data.notifications = notifications.body;
@@ -1794,11 +2626,111 @@ fn selected_or(style: Style, selected: bool) -> Style {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AccountStatus {
+    Enabled,
+    Disabled,
+    Cooldown,
+}
+
+fn account_status(enabled: bool, cooldown: bool) -> AccountStatus {
+    if !enabled {
+        AccountStatus::Disabled
+    } else if cooldown {
+        AccountStatus::Cooldown
+    } else {
+        AccountStatus::Enabled
+    }
+}
+
+fn account_status_label(status: AccountStatus) -> &'static str {
+    match status {
+        AccountStatus::Enabled => "Enabled",
+        AccountStatus::Disabled => "Disabled",
+        AccountStatus::Cooldown => "Cooldown",
+    }
+}
+
+fn account_status_circle(status: AccountStatus, selected: bool) -> Span<'static> {
+    let color = match status {
+        AccountStatus::Enabled => BTOP_CPU_START,
+        AccountStatus::Disabled => BTOP_STATUS_DISABLED,
+        AccountStatus::Cooldown => BTOP_STATUS_COOLDOWN,
+    };
+    let style = if selected {
+        btop_selected_style().fg(color)
+    } else {
+        btop_fg(color)
+    };
+    Span::styled("●", style)
+}
+
+fn account_has_attention_marker(account: &AccountRow) -> bool {
+    account.enabled && !account.cooldown && !account.attention_reasons.is_empty()
+}
+
+fn account_status_circle_for_usage(
+    account: &OverviewAccountUsageRow,
+    selected: bool,
+) -> Span<'static> {
+    account_status_circle(account_status(account.enabled, account.cooldown), selected)
+}
+
+fn attention_marker(attention: bool, selected: bool) -> Option<Span<'static>> {
+    attention.then(|| {
+        let style = if selected {
+            btop_selected_style().fg(BTOP_ATTENTION)
+        } else {
+            btop_fg(BTOP_ATTENTION).add_modifier(Modifier::BOLD)
+        };
+        Span::styled("!", style)
+    })
+}
+
+fn attention_marker_for_usage(
+    account: &OverviewAccountUsageRow,
+    selected: bool,
+) -> Option<Span<'static>> {
+    attention_marker(account.attention, selected)
+}
+
 fn moved_index(current: usize, len: usize, delta: isize) -> usize {
     if len == 0 {
         return 0;
     }
     (current as isize + delta).clamp(0, len as isize - 1) as usize
+}
+
+fn account_reorder_delta(key: KeyEvent) -> Option<isize> {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    if !control {
+        return match key.code {
+            // These are the raw control bytes some terminal adapters expose
+            // before Crossterm decorates them with KeyModifiers::CONTROL.
+            KeyCode::Char('\u{0b}') => Some(-1),
+            KeyCode::Char('\u{0a}') => Some(1),
+            _ => None,
+        };
+    }
+
+    match key.code {
+        KeyCode::Char('k' | 'K' | '\u{0b}') => Some(-1),
+        KeyCode::Char('j' | 'J' | '\u{0a}') => Some(1),
+        // A few terminal/multiplexer combinations normalize Ctrl+J to Enter.
+        KeyCode::Enter => Some(1),
+        _ => None,
+    }
+}
+
+fn provider_reorder_delta(key: KeyEvent) -> Option<isize> {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Up => Some(-1),
+        KeyCode::Down => Some(1),
+        _ => None,
+    }
 }
 
 fn clamp_index(current: usize, len: usize) -> usize {
@@ -1866,16 +2798,31 @@ fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp) {
 
     match app.tab {
         Tab::Overview => draw_overview(frame, root[2], app),
-        Tab::Accounts => draw_accounts_table(frame, root[2], &app.data.accounts, app.selected),
-        Tab::Keys => draw_keys_table(frame, root[2], &app.data.keys, app.selected),
+        Tab::Keys => draw_api_keys(frame, root[2], app),
         Tab::Notifications => draw_notifications(frame, root[2], app),
     }
 
     let footer = if app.message.trim().is_empty() {
-        format!(
-            " ? commands | tab switch | h/l section | j/k move | r refresh | a quota: {} | o login | e/d enable | v hide acct | x delete ",
-            app.limit_display_mode.label()
-        )
+        if app.tab == Tab::Notifications {
+            " ? commands | tab switch | j/k move | Enter/Space watch | e enable | c channel | s settings | a/u all/none | p provider | t test "
+                .to_string()
+        } else if app.tab == Tab::Keys {
+            " ? commands | tab switch | j/k move | r refresh | n new key | Enter details | e edit | x revoke "
+                .to_string()
+        } else {
+            let section_hint = match app.overview_section {
+                OverviewSection::AccountUsage => format!(
+                    "a quota: {} | n add account | e/d enable/disable | x delete",
+                    app.limit_display_mode.label()
+                ),
+                OverviewSection::CustomModels => "e/d enable/disable | x delete".to_string(),
+                _ => "".to_string(),
+            };
+            format!(
+                " ? commands | tab switch | h/l section | j/k move | r refresh | o login | {} ",
+                section_hint
+            )
+        }
     } else {
         format!(" {}", app.message)
     };
@@ -1888,8 +2835,17 @@ fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp) {
     if app.show_command_modal {
         draw_command_modal(frame, frame.area(), app);
     }
+    if app.show_account_details {
+        draw_account_details_modal(frame, frame.area(), app);
+    }
+    if app.show_api_key_details {
+        draw_api_key_details_modal(frame, frame.area(), app);
+    }
     if let Some(modal) = &app.confirmation_modal {
         draw_confirmation_modal(frame, frame.area(), modal);
+    }
+    if app.show_api_key_reveal {
+        draw_api_key_reveal_modal(frame, frame.area(), app);
     }
 }
 
@@ -2326,27 +3282,36 @@ fn overview_block_title(title: &str, focused: bool) -> String {
 
 fn draw_account_usage_percentages(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let groups = overview_account_usage_groups(app);
+    let selected_account_index = (app.tab == Tab::Overview
+        && app.overview_section == OverviewSection::AccountUsage)
+        .then(|| selected_overview_account_index(app))
+        .flatten();
     let content_width = area.width.saturating_sub(2) as usize;
     let max_rows = area.height.saturating_sub(2).max(1) as usize;
 
     let mut all_lines = Vec::new();
-    let mut usage_row_index = 0usize;
     let mut selected_line_index = None;
     for group in &groups {
         all_lines.push(account_usage_provider_header(group, app.limit_display_mode));
-        let mut last_account_key: Option<&str> = None;
+        let mut last_account_index = None;
 
         for account in &group.accounts {
-            if app.limit_display_mode == LimitDisplayMode::AllPerAccount
-                && last_account_key != Some(account.account_key.as_str())
-            {
-                all_lines.push(account_usage_account_header_line(account, content_width));
-                last_account_key = Some(account.account_key.as_str());
+            let account_selected = selected_account_index == Some(account.account_index);
+            let first_account_row = last_account_index != Some(account.account_index);
+            if app.limit_display_mode == LimitDisplayMode::AllPerAccount && first_account_row {
+                if account_selected {
+                    selected_line_index = Some(all_lines.len());
+                }
+                all_lines.push(account_usage_account_header_line(
+                    account,
+                    content_width,
+                    account_selected,
+                ));
+                last_account_index = Some(account.account_index);
             }
-            let selected = app.tab == Tab::Overview
-                && app.overview_section == OverviewSection::AccountUsage
-                && usage_row_index == app.overview_account_selected;
-            if selected {
+            let selected =
+                app.limit_display_mode == LimitDisplayMode::OnePerAccount && account_selected;
+            if selected && first_account_row {
                 selected_line_index = Some(all_lines.len());
             }
             all_lines.push(account_quota_usage_line(
@@ -2355,7 +3320,6 @@ fn draw_account_usage_percentages(frame: &mut Frame<'_>, area: Rect, app: &TuiAp
                 selected,
                 app.limit_display_mode,
             ));
-            usage_row_index += 1;
         }
     }
 
@@ -2444,25 +3408,35 @@ fn account_quota_usage_line(
         .percent
         .map(|percent| format!("{percent:.1}%"))
         .unwrap_or_else(|| "No quota".to_string());
-    let state = if account.enabled { "on" } else { "off" };
     let priority = if account.priority { "first" } else { "" };
     let selection = if selected { ">" } else { " " };
 
     if content_width < 38 {
-        let compact = format!(
-            "{selection} {state} {priority} {} {}",
-            account.label, percent_text
-        );
         let style = if selected {
             btop_selected_style()
         } else {
             btop_style()
         };
-        return Line::from(Span::styled(truncate_text(&compact, content_width), style));
+        let prefix_width = 4 + if account.attention { 2 } else { 0 };
+        let compact = format!("{priority} {} {}", account.label, percent_text);
+        let mut spans = vec![
+            Span::styled(format!("{selection} "), style),
+            account_status_circle_for_usage(account, selected),
+            Span::styled(" ", style),
+        ];
+        if let Some(marker) = attention_marker_for_usage(account, selected) {
+            spans.push(marker);
+            spans.push(Span::styled(" ", style));
+        }
+        spans.push(Span::styled(
+            truncate_text(&compact, content_width.saturating_sub(prefix_width)),
+            style,
+        ));
+        return Line::from(spans);
     }
 
     let marker_width = 2;
-    let state_width = 4;
+    let state_width = 2 + if account.attention { 2 } else { 0 };
     let priority_width = 6;
     let pct_width = if account.percent.is_some() { 7 } else { 8 };
     let request_width = if content_width < 64 { 0 } else { 8 };
@@ -2490,17 +3464,15 @@ fn account_quota_usage_line(
             format!("{selection:<marker_width$}"),
             selected_or(btop_style(), selected),
         ),
-        Span::styled(
-            format!("{state:<state_width$}"),
-            selected_or(
-                if account.enabled {
-                    btop_fg(BTOP_CPU_START)
-                } else {
-                    btop_muted_style()
-                },
-                selected,
-            ),
-        ),
+        account_status_circle_for_usage(account, selected),
+        Span::styled(" ", selected_or(btop_style(), selected)),
+    ];
+
+    if let Some(marker) = attention_marker_for_usage(account, selected) {
+        spans.push(marker);
+        spans.push(Span::styled(" ", selected_or(btop_style(), selected)));
+    }
+    spans.extend([
         Span::styled(
             format!("{priority:<priority_width$}"),
             selected_or(btop_muted_style(), selected),
@@ -2517,7 +3489,7 @@ fn account_quota_usage_line(
             percent_bar(percent, bar_width),
             selected_or(btop_fg(bar_style), selected),
         ),
-    ];
+    ]);
 
     if request_width > 0 {
         spans.push(Span::styled(
@@ -2535,35 +3507,38 @@ fn account_quota_usage_line(
 fn account_usage_account_header_line(
     account: &OverviewAccountUsageRow,
     content_width: usize,
+    selected: bool,
 ) -> Line<'static> {
-    let state = if account.enabled { "on" } else { "off" };
     let priority = if account.priority { " first" } else { "" };
     let requests = if content_width >= 64 {
         format!("  {} req", format_short(account.requests))
     } else {
         String::new()
     };
+    let status_width = 2 + if account.attention { 2 } else { 0 };
     let label_width = content_width
-        .saturating_sub(3 + state.len() + priority.len() + requests.len())
+        .saturating_sub(2 + status_width + priority.len() + requests.len())
         .max(8);
-    Line::from(vec![
-        Span::styled("  ", btop_style()),
-        Span::styled(
-            format!("{state}"),
-            if account.enabled {
-                btop_fg(BTOP_CPU_START)
-            } else {
-                btop_muted_style()
-            },
-        ),
-        Span::styled(priority, btop_muted_style()),
-        Span::raw(" "),
+    let marker = if selected { "> " } else { "  " };
+    let mut spans = vec![
+        Span::styled(marker, selected_or(btop_style(), selected)),
+        account_status_circle_for_usage(account, selected),
+        Span::styled(" ", selected_or(btop_style(), selected)),
+    ];
+    if let Some(marker) = attention_marker_for_usage(account, selected) {
+        spans.push(marker);
+        spans.push(Span::styled(" ", selected_or(btop_style(), selected)));
+    }
+    spans.extend([
+        Span::styled(priority, selected_or(btop_muted_style(), selected)),
+        Span::styled(" ", selected_or(btop_style(), selected)),
         Span::styled(
             truncate_text(&account.account_label, label_width),
-            btop_title_style(),
+            selected_or(btop_title_style(), selected),
         ),
-        Span::styled(requests, btop_muted_style()),
-    ])
+        Span::styled(requests, selected_or(btop_muted_style(), selected)),
+    ]);
+    Line::from(spans)
 }
 
 fn account_quota_usage_detail_line(
@@ -2572,9 +3547,15 @@ fn account_quota_usage_detail_line(
     selected: bool,
 ) -> Line<'static> {
     let percent_text = account
-        .percent
-        .map(|percent| format!("{percent:.1}% used"))
-        .unwrap_or_else(|| "No quota".to_string());
+        .detail_text
+        .clone()
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| {
+            account
+                .percent
+                .map(|percent| format!("{percent:.1}% used"))
+                .unwrap_or_else(|| "No quota".to_string())
+        });
     let limit_name = if account.limit_label.trim().is_empty() {
         "usage".to_string()
     } else {
@@ -2678,128 +3659,527 @@ fn account_usage_reset_label(provider: &str, reset: &str) -> String {
     reset.to_string()
 }
 
-fn draw_accounts_table(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    accounts: &[AccountRow],
-    selected: usize,
-) {
-    let rows = accounts.iter().enumerate().map(|(index, account)| {
-        let is_selected = index == selected;
-        Row::new(vec![
-            Cell::from(if is_selected { ">" } else { "" }),
-            Cell::from(account.provider_label.clone()),
-            Cell::from(if account.enabled { "on" } else { "off" }),
-            Cell::from(if account.priority { "first" } else { "" }),
-            Cell::from(account.label.clone()),
-            Cell::from(account.file_name.clone()),
-            Cell::from(account.requests.to_string()),
-            Cell::from(account.errors.to_string()),
-            Cell::from(short_message(&account.last_error_message)),
-        ])
-        .style(if is_selected {
-            btop_selected_style()
-        } else {
-            btop_style()
-        })
-    });
-    let header = Row::new([
-        "",
-        "Provider",
-        "State",
-        "Priority",
-        "Label",
-        "File",
-        "Req",
-        "Err",
-        "Last error",
-    ])
-    .style(btop_header_style());
-    let widths = [
-        Constraint::Length(1),
-        Constraint::Length(12),
-        Constraint::Length(5),
-        Constraint::Length(8),
-        Constraint::Length(22),
-        Constraint::Length(28),
-        Constraint::Length(8),
-        Constraint::Length(6),
-        Constraint::Min(12),
-    ];
+fn draw_api_keys(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let content_width = area.width.saturating_sub(2) as usize;
+    let max_rows = area.height.saturating_sub(2).max(1) as usize;
+    let mut all_lines = Vec::new();
+    let mut selected_line_index = None;
+
+    for (index, key) in app.data.keys.iter().enumerate() {
+        let selected = index == app.selected;
+        if selected {
+            selected_line_index = Some(all_lines.len());
+        }
+        all_lines.push(api_key_header_line(key, content_width, selected));
+        all_lines.push(api_key_meta_line(key, content_width, selected));
+        all_lines.push(api_key_access_line(key, content_width, selected));
+        if let Some(summary) = app.data.key_quota_summaries.get(&key.id) {
+            if let Some(text) = api_key_quota_summary_text(summary) {
+                all_lines.push(api_key_meta_text_line(
+                    &format!("Quota: {text}"),
+                    content_width,
+                    selected,
+                ));
+            }
+        }
+        if index + 1 < app.data.keys.len() {
+            all_lines.push(Line::from(""));
+        }
+    }
+
+    if all_lines.is_empty() {
+        all_lines.push(Line::from("No API keys available."));
+    }
+
+    let start = selected_line_index
+        .map(|index| index.saturating_add(1).saturating_sub(max_rows))
+        .unwrap_or(0);
+    let lines = all_lines
+        .into_iter()
+        .skip(start)
+        .take(max_rows)
+        .collect::<Vec<_>>();
     frame.render_widget(
-        Table::new(rows, widths)
-            .header(header)
+        Paragraph::new(lines)
             .style(btop_style())
-            .block(btop_block_with_border("Accounts", BTOP_PROC_BOX))
-            .column_spacing(1),
+            .block(btop_block_with_border("API Keys", BTOP_NET_BOX)),
         area,
     );
 }
 
-fn draw_keys_table(frame: &mut Frame<'_>, area: Rect, keys: &[KeyRow], selected: usize) {
-    let rows = keys.iter().enumerate().map(|(index, key)| {
-        let is_selected = index == selected;
-        Row::new(vec![
-            Cell::from(if is_selected { ">" } else { "" }),
-            Cell::from(key.label.clone()),
-            Cell::from(key.prefix.clone()),
-            Cell::from(if key.revoked { "revoked" } else { "active" }),
-            Cell::from(key.source.clone()),
-            Cell::from(key.access.clone()),
-            Cell::from(key.created_at.clone()),
-            Cell::from(key.last_used_at.clone()),
-            Cell::from(key.id.clone()),
-        ])
-        .style(if is_selected {
-            btop_selected_style()
-        } else {
-            btop_style()
-        })
-    });
-    let header = Row::new([
-        "",
-        "Label",
-        "Prefix",
-        "State",
-        "Source",
-        "Access",
-        "Created",
-        "Last used",
-        "Id",
+fn api_key_header_line(key: &KeyRow, content_width: usize, selected: bool) -> Line<'static> {
+    let marker = if selected { "> " } else { "  " };
+    let status = if key.revoked { "revoked" } else { "active" };
+    let prefix = if key.prefix.trim().is_empty() {
+        key.id.as_str()
+    } else {
+        key.prefix.as_str()
+    };
+    let prefix = truncate_text(prefix, 24);
+    let label_width = content_width
+        .saturating_sub(2 + 2 + prefix.len() + status.len() + 4)
+        .max(8);
+    Line::from(vec![
+        Span::styled(marker, selected_or(btop_style(), selected)),
+        account_status_circle(
+            if key.revoked {
+                AccountStatus::Disabled
+            } else {
+                AccountStatus::Enabled
+            },
+            selected,
+        ),
+        Span::styled(" ", selected_or(btop_style(), selected)),
+        Span::styled(
+            format!(
+                "{:<label_width$} ",
+                truncate_text(&display_or(&key.label, "API key"), label_width)
+            ),
+            selected_or(btop_title_style(), selected),
+        ),
+        Span::styled(prefix, selected_or(btop_muted_style(), selected)),
+        Span::styled("  ", selected_or(btop_style(), selected)),
+        Span::styled(
+            status,
+            selected_or(
+                if key.revoked {
+                    btop_fg(BTOP_STATUS_DISABLED)
+                } else {
+                    btop_fg(BTOP_CPU_START)
+                },
+                selected,
+            ),
+        ),
     ])
-    .style(btop_header_style());
+}
+
+fn api_key_meta_line(key: &KeyRow, content_width: usize, selected: bool) -> Line<'static> {
+    api_key_meta_text_line(
+        &format!(
+            "  {} · created {} · last used {}{}",
+            api_key_source_label(&key.source),
+            display_or(&key.created_at, "unknown"),
+            display_or(&key.last_used_at, "never"),
+            if key.revoked_at.is_empty() {
+                String::new()
+            } else {
+                format!(" · revoked {}", key.revoked_at)
+            }
+        ),
+        content_width,
+        selected,
+    )
+}
+
+fn api_key_access_line(key: &KeyRow, content_width: usize, selected: bool) -> Line<'static> {
+    api_key_meta_text_line(
+        &format!("  Access: {}", key.access),
+        content_width,
+        selected,
+    )
+}
+
+fn api_key_meta_text_line(text: &str, content_width: usize, selected: bool) -> Line<'static> {
+    Line::from(Span::styled(
+        truncate_text(text, content_width),
+        selected_or(btop_muted_style(), selected),
+    ))
+}
+
+fn api_key_source_label(source: &str) -> &str {
+    match source {
+        "legacy_config" => "legacy config",
+        "managed" => "managed",
+        value if !value.trim().is_empty() => value,
+        _ => "unknown source",
+    }
+}
+
+fn api_key_quota_summary_text(summary: &Value) -> Option<String> {
+    if summary.get("error").and_then(Value::as_bool) == Some(true) {
+        return Some("accounting unavailable; requests fail closed".to_string());
+    }
+    let rules = summary.get("rules").and_then(Value::as_array)?;
+    if rules.is_empty() {
+        return summary
+            .get("anchor")
+            .and_then(Value::as_str)
+            .map(|anchor| format!("anchor {anchor}"));
+    }
+    Some(
+        rules
+            .iter()
+            .filter_map(api_key_quota_rule_text)
+            .collect::<Vec<_>>()
+            .join(" · "),
+    )
+}
+
+fn api_key_quota_detail_lines(summary: &Value) -> Vec<String> {
+    if summary.get("error").and_then(Value::as_bool) == Some(true) {
+        return vec!["Quota accounting unavailable; requests fail closed".to_string()];
+    }
+    let mut lines = Vec::new();
+    if let Some(anchor) = summary.get("anchor").and_then(Value::as_str) {
+        lines.push(format!("Quota anchor: {anchor}"));
+    } else {
+        lines.push("Quota timer starts on first accepted generation request".to_string());
+    }
+    if let Some(rules) = summary.get("rules").and_then(Value::as_array) {
+        for rule in rules {
+            if let Some(text) = api_key_quota_rule_text(rule) {
+                lines.push(text);
+            }
+        }
+    }
+    lines
+}
+
+fn api_key_quota_rule_text(rule: &Value) -> Option<String> {
+    let metric = rule.get("metric").and_then(Value::as_str)?;
+    let period = rule
+        .get("period")
+        .and_then(Value::as_str)
+        .unwrap_or("period");
+    let confirmed = json_amount(rule.get("confirmed"));
+    let reserved = json_amount(rule.get("reserved"));
+    let uncertain = json_amount(rule.get("uncertain"));
+    let remaining = json_amount(rule.get("remaining"));
+    let limit = json_amount(rule.get("limit"));
+    let reset = rule
+        .get("reset_at")
+        .and_then(Value::as_str)
+        .map(|value| format!(" · renews {value}"))
+        .unwrap_or_default();
+    Some(format!(
+        "{}/{}: {} confirmed · {} reserved · {} uncertain · {}/{} remaining{}",
+        api_key_quota_metric_label(metric),
+        period,
+        confirmed,
+        reserved,
+        uncertain,
+        remaining,
+        limit,
+        reset
+    ))
+}
+
+fn api_key_quota_metric_label(metric: &str) -> &str {
+    match metric {
+        "requests" => "requests",
+        "input_tokens" => "input tokens (incl. cache)",
+        "uncached_input_tokens" => "uncached input tokens",
+        "output_tokens" => "output tokens (incl. reasoning)",
+        "cache_read_tokens" => "cache-read tokens",
+        "cache_write_tokens" => "cache-write tokens",
+        "cache_tokens" => "cache tokens (read + write)",
+        value => value,
+    }
+}
+
+fn json_amount(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_u64)
+        .map(|value| value.to_string())
+        .or_else(|| value.and_then(Value::as_i64).map(|value| value.to_string()))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn draw_api_key_details_modal(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let Some(key) = app.selected_api_key() else {
+        return;
+    };
+    let status = if key.revoked {
+        AccountStatus::Disabled
+    } else {
+        AccountStatus::Enabled
+    };
+    let mut lines = vec![Line::from(vec![
+        account_status_circle(status, false),
+        Span::raw(format!(
+            "  {} ({})",
+            display_or(&key.label, "API key"),
+            if key.revoked { "revoked" } else { "active" }
+        )),
+    ])];
+    lines.extend([
+        detail_line("ID", display_or(&key.id, "not reported")),
+        detail_line("Prefix", display_or(&key.prefix, "not reported")),
+        detail_line("Source", api_key_source_label(&key.source).to_string()),
+        detail_line("Created", display_or(&key.created_at, "not reported")),
+        detail_line("Last used", display_or(&key.last_used_at, "never")),
+    ]);
+    if !key.revoked_at.is_empty() {
+        lines.push(detail_line("Revoked", key.revoked_at.clone()));
+    }
+
+    lines.push(detail_section("Access policy"));
+    lines.push(detail_line("Summary", key.access.clone()));
+    let access = &key.access_json;
+    lines.push(detail_line(
+        "Request limit",
+        access
+            .get("max_estimated_input_tokens_per_request")
+            .or_else(|| access.get("prompt_token_limit"))
+            .map(|value| format!("{} tokens", json_amount(Some(value))))
+            .unwrap_or_else(|| "Unlimited".to_string()),
+    ));
+    if let Some(budget) = access.get("input_token_budget") {
+        lines.push(detail_line(
+            "Input budget",
+            format!(
+                "{} tokens ({})",
+                json_amount(budget.get("limit")),
+                budget
+                    .get("period")
+                    .and_then(Value::as_str)
+                    .unwrap_or("lifetime")
+            ),
+        ));
+    }
+    if let Some(providers) = access.get("providers").and_then(Value::as_array) {
+        for provider in providers {
+            let name = provider
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or("provider");
+            let scope = provider
+                .get("account_scope")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    if provider
+                        .get("accounts")
+                        .and_then(Value::as_array)
+                        .is_some_and(|accounts| accounts.is_empty())
+                    {
+                        "all"
+                    } else {
+                        "selected"
+                    }
+                });
+            let accounts = provider
+                .get("accounts")
+                .and_then(Value::as_array)
+                .map(|accounts| {
+                    accounts
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let scope_text = if scope == "all" {
+                "all accounts".to_string()
+            } else if accounts.is_empty() {
+                "selected accounts".to_string()
+            } else {
+                format!("selected: {accounts}")
+            };
+            lines.push(detail_line("Provider", format!("{name} ({scope_text})")));
+            if let Some(limit) = provider
+                .get("max_estimated_input_tokens_per_request")
+                .or_else(|| provider.get("prompt_token_limit"))
+            {
+                lines.push(detail_line(
+                    "Provider limit",
+                    format!("{} tokens/request", json_amount(Some(limit))),
+                ));
+            }
+            if let Some(account_limits) = provider.get("account_limits").and_then(Value::as_array) {
+                for account_limit in account_limits {
+                    let account = account_limit
+                        .get("account")
+                        .and_then(Value::as_str)
+                        .unwrap_or("account");
+                    let limit = account_limit
+                        .get("max_estimated_input_tokens_per_request")
+                        .or_else(|| account_limit.get("prompt_token_limit"));
+                    lines.push(detail_line(
+                        "Account limit",
+                        format!("{}: {} tokens/request", account, json_amount(limit)),
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(rules) = access
+        .get("quota")
+        .and_then(|quota| quota.get("rules"))
+        .and_then(Value::as_array)
+    {
+        lines.push(detail_section("Renewable quotas"));
+        for rule in rules {
+            lines.push(detail_line(
+                "Rule",
+                format!(
+                    "{} {} / {}",
+                    json_amount(rule.get("limit")),
+                    api_key_quota_metric_label(
+                        rule.get("metric")
+                            .and_then(Value::as_str)
+                            .unwrap_or("quota")
+                    ),
+                    rule.get("period")
+                        .and_then(Value::as_str)
+                        .unwrap_or("period")
+                ),
+            ));
+        }
+    }
+
+    if let Some(summary) = app.data.key_quota_summaries.get(&key.id) {
+        lines.push(detail_section("Quota usage"));
+        for line in api_key_quota_detail_lines(summary) {
+            lines.push(detail_line("Balance", line));
+        }
+    }
+    lines.push(Line::from(vec![
+        Span::styled("j/k or Up/Down", btop_header_style()),
+        Span::raw(" scroll  "),
+        Span::styled("Enter/Esc/q", btop_header_style()),
+        Span::raw(" close details"),
+    ]));
+
+    let modal = centered_rect(area, 96, 32);
+    let max_scroll = lines
+        .len()
+        .saturating_sub(modal.height.saturating_sub(2) as usize);
+    let scroll = app.api_key_details_scroll.min(max_scroll) as u16;
+    frame.render_widget(Clear, modal);
     frame.render_widget(
-        Table::new(
-            rows,
-            [
-                Constraint::Length(1),
-                Constraint::Length(20),
-                Constraint::Length(16),
-                Constraint::Length(8),
-                Constraint::Length(10),
-                Constraint::Length(18),
-                Constraint::Length(20),
-                Constraint::Length(20),
-                Constraint::Min(20),
-            ],
-        )
-        .header(header)
-        .style(btop_style())
-        .block(btop_block_with_border("API Keys", BTOP_NET_BOX))
-        .column_spacing(1),
-        area,
+        Paragraph::new(lines)
+            .style(btop_style())
+            .block(btop_block_with_border("API Key Details", BTOP_NET_BOX))
+            .scroll((scroll, 0))
+            .wrap(Wrap { trim: false }),
+        modal,
+    );
+}
+
+fn draw_api_key_reveal_modal(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let modal = centered_rect(area, 96, 9);
+    let inner_width = modal.width.saturating_sub(4) as usize;
+    let lines = vec![
+        Line::from("The API key will not be shown again."),
+        Line::from("Copy it now and store it securely:"),
+        Line::from(Span::styled(
+            truncate_text(&app.api_key_reveal, inner_width),
+            btop_header_style(),
+        )),
+        Line::from("Enter/Esc/q close"),
+    ];
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(btop_style())
+            .block(btop_block_with_border("New API Key", BTOP_USED_END))
+            .wrap(Wrap { trim: false }),
+        modal,
     );
 }
 
 fn draw_notifications(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let settings = app
-        .data
-        .notifications
-        .get("settings")
-        .unwrap_or(&app.data.notifications);
-    let text = serde_json::to_string_pretty(settings).unwrap_or_else(|_| "{}".to_string());
+    let settings = notification_settings_value(&app.data.notifications);
+    let accounts = notification_account_rows(&app.data.notifications);
+    let watched_count = accounts.iter().filter(|account| account.watched).count();
+    let status = if bool_at(settings, &["enabled"]) {
+        AccountStatus::Enabled
+    } else {
+        AccountStatus::Disabled
+    };
+    let channel = notification_channel(settings);
+    let channel_details = match channel.as_str() {
+        "google_chat" => format!(
+            "Google Chat · webhook {}",
+            if bool_at(settings, &["google_chat", "webhook_configured"]) {
+                "configured"
+            } else {
+                "not configured"
+            }
+        ),
+        _ => format!(
+            "Telegram · bot {} · chat ID {}",
+            if bool_at(settings, &["telegram", "bot_token_configured"]) {
+                "configured"
+            } else {
+                "not configured"
+            },
+            display_or(
+                &string_at(settings, &["telegram", "chat_id"]),
+                "not configured",
+            )
+        ),
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            account_status_circle(status, false),
+            Span::styled(
+                format!(
+                    "  Notifications {}",
+                    if status == AccountStatus::Enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                ),
+                btop_title_style(),
+            ),
+        ]),
+        notification_info_line("Channel", channel_label(&channel)),
+        notification_info_line("Connection", channel_details),
+        notification_info_line(
+            "Watching",
+            format!("{} of {} accounts", watched_count, accounts.len()),
+        ),
+        Line::from(""),
+        Line::from(Span::styled("Watched accounts", btop_header_style())),
+    ];
+
+    let mut last_provider = String::new();
+    let mut selected_line_index = None;
+    for (index, account) in accounts.iter().enumerate() {
+        if account.provider != last_provider {
+            if !last_provider.is_empty() {
+                lines.push(Line::from(""));
+            }
+            lines.push(notification_provider_line(
+                &account.provider_label,
+                accounts
+                    .iter()
+                    .filter(|row| row.provider == account.provider)
+                    .count(),
+            ));
+            last_provider = account.provider.clone();
+        }
+        if index == app.selected {
+            selected_line_index = Some(lines.len());
+        }
+        lines.push(notification_account_header_line(
+            account,
+            area.width.saturating_sub(4) as usize,
+            index == app.selected,
+        ));
+        lines.push(notification_account_meta_line(
+            account,
+            area.width.saturating_sub(4) as usize,
+            index == app.selected,
+        ));
+    }
+    if accounts.is_empty() {
+        lines.push(Line::from("No provider accounts available."));
+    }
+
+    let max_rows = area.height.saturating_sub(2).max(1) as usize;
+    let start = selected_line_index
+        .map(|index| index.saturating_add(1).saturating_sub(max_rows))
+        .unwrap_or(0);
+    let visible = lines
+        .into_iter()
+        .skip(start)
+        .take(max_rows)
+        .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(text)
+        Paragraph::new(visible)
             .style(btop_style())
             .block(btop_block_with_border("Notifications", BTOP_NET_BOX))
             .wrap(Wrap { trim: false }),
@@ -2807,85 +4187,489 @@ fn draw_notifications(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     );
 }
 
+fn notification_info_line(label: &str, value: impl Into<String>) -> Line<'static> {
+    detail_line(label, value)
+}
+
+fn notification_provider_line(label: &str, count: usize) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {label}"), btop_header_style()),
+        Span::styled(
+            format!("  {count} account{}", if count == 1 { "" } else { "s" }),
+            btop_muted_style(),
+        ),
+    ])
+}
+
+fn notification_account_header_line(
+    account: &NotificationAccountRow,
+    content_width: usize,
+    selected: bool,
+) -> Line<'static> {
+    let marker = if selected { "> " } else { "  " };
+    let status = account_status(account.enabled, false);
+    let watched = if account.watched { "[watch]" } else { "[ ]" };
+    let label_width = content_width
+        .saturating_sub(marker.len() + 1 + watched.len() + 2)
+        .max(8);
+    let label = if account.label.trim().is_empty() {
+        display_or(&account.account_id, "Account")
+    } else {
+        account.label.clone()
+    };
+    Line::from(vec![
+        Span::styled(marker, selected_or(btop_style(), selected)),
+        account_status_circle(status, selected),
+        Span::styled(" ", selected_or(btop_style(), selected)),
+        Span::styled(watched, selected_or(btop_header_style(), selected)),
+        Span::styled(" ", selected_or(btop_style(), selected)),
+        Span::styled(
+            truncate_text(&label, label_width),
+            selected_or(btop_title_style(), selected),
+        ),
+    ])
+}
+
+fn notification_account_meta_line(
+    account: &NotificationAccountRow,
+    content_width: usize,
+    selected: bool,
+) -> Line<'static> {
+    let mut details = Vec::new();
+    if !account.account_id.trim().is_empty() {
+        details.push(account.account_id.clone());
+    }
+    if !account.credential_file.trim().is_empty() {
+        details.push(account.credential_file.clone());
+    }
+    if details.is_empty() {
+        details.push(account.key.clone());
+    }
+    Line::from(Span::styled(
+        truncate_text(&format!("     {}", details.join(" · ")), content_width),
+        selected_or(btop_muted_style(), selected),
+    ))
+}
+
 fn draw_command_modal(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let modal = centered_rect(area, 72, 18);
-    let text = vec![
-        Line::from(vec![
-            Span::styled("?", btop_header_style()),
-            Span::raw(" close commands"),
-        ]),
-        Line::from(vec![
-            Span::styled("Tab", btop_header_style()),
-            Span::raw(" next tab"),
-            Span::styled("    Shift-Tab", btop_header_style()),
-            Span::raw(" previous tab"),
-        ]),
-        Line::from(vec![
-            Span::styled("j/k or Up/Down", btop_header_style()),
-            Span::raw(" move selection"),
-        ]),
-        Line::from(vec![
-            Span::styled("h/l", btop_header_style()),
-            Span::raw(" previous/next Overview section"),
-        ]),
-        Line::from(vec![
-            Span::styled("r", btop_header_style()),
-            Span::raw(" refresh data"),
-            Span::styled("    o", btop_header_style()),
-            Span::raw(" login"),
-        ]),
-        Line::from(vec![
-            Span::styled("a", btop_header_style()),
-            Span::raw(format!(
-                " toggle quota limit view ({})",
-                app.limit_display_mode.label()
-            )),
-        ]),
-        Line::from(vec![
-            Span::styled("p", btop_header_style()),
-            Span::raw(" hide selected provider from Account Usage"),
-            Span::styled("    u", btop_header_style()),
-            Span::raw(" show all hidden usage rows"),
-        ]),
-        Line::from(vec![
-            Span::styled("v", btop_header_style()),
-            Span::raw(" hide selected account from Account Usage"),
-        ]),
-        Line::from(""),
-        Line::from("Overview Custom Models / Accounts"),
-        Line::from(vec![
-            Span::styled("e", btop_header_style()),
-            Span::raw(" enable selected"),
-            Span::styled("    d", btop_header_style()),
-            Span::raw(" disable selected"),
-            Span::styled("    x", btop_header_style()),
-            Span::raw(" delete selected"),
-        ]),
-        Line::from("Accounts"),
-        Line::from(vec![
-            Span::styled("    p", btop_header_style()),
-            Span::raw(" toggle use-first priority"),
-        ]),
-        Line::from(""),
-        Line::from("Notifications"),
-        Line::from(vec![
-            Span::styled("t", btop_header_style()),
-            Span::raw(" send test notification"),
-        ]),
-        Line::from(""),
-        Line::from(
-            "Direct commands: status, accounts, quota, keys, models, usage, notifications, raw",
+    let modal_width = 86u16.min(area.width.saturating_sub(2)).max(1);
+    let content_width = modal_width.saturating_sub(2) as usize;
+    let lines = command_modal_rows(app)
+        .into_iter()
+        .map(|(key, description)| {
+            if key.is_empty() {
+                if description.is_empty() {
+                    Line::from("")
+                } else {
+                    Line::from(Span::styled(description, btop_title_style()))
+                }
+            } else {
+                command_modal_key_line(&key, description, content_width)
+            }
+        })
+        .collect::<Vec<_>>();
+    let modal_height = lines.len().saturating_add(2).min(u16::MAX as usize) as u16;
+    let modal = centered_rect(area, modal_width, modal_height);
+    let block = btop_block_with_border("Commands", BTOP_DIV_LINE);
+    let inner = block.inner(modal);
+    let visible_height = inner.height as usize;
+    let max_scroll = lines.len().saturating_sub(visible_height);
+    let scroll = app.command_modal_scroll.min(max_scroll) as u16;
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(btop_style())
+            .block(block)
+            .scroll((scroll, 0)),
+        modal,
+    );
+}
+
+fn command_modal_rows(app: &TuiApp) -> Vec<(String, String)> {
+    let mut rows = vec![
+        (String::new(), "GENERAL".to_string()),
+        ("?".to_string(), "open/close this shortcut list".to_string()),
+        ("q/Q".to_string(), "close the active modal".to_string()),
+        (
+            "Esc".to_string(),
+            "close command/details modal or cancel".to_string(),
+        ),
+        ("Ctrl+C".to_string(), "quit the TUI".to_string()),
+        ("Tab".to_string(), "next tab".to_string()),
+        ("Shift-Tab".to_string(), "previous tab".to_string()),
+        ("r".to_string(), "refresh the current data".to_string()),
+        ("o".to_string(), "log in to the gateway".to_string()),
+        (String::new(), "MODAL NAVIGATION".to_string()),
+        (
+            "j/k · Up/Down".to_string(),
+            "scroll the shortcut list or details".to_string(),
+        ),
+        (
+            "PageUp/PageDown".to_string(),
+            "scroll ten lines in a modal".to_string(),
+        ),
+        (
+            "Home/End".to_string(),
+            "jump to the start/end of a modal".to_string(),
         ),
     ];
 
+    match app.tab {
+        Tab::Overview => {
+            rows.push((String::new(), "OVERVIEW".to_string()));
+            rows.push((
+                "h/l".to_string(),
+                format!(
+                    "previous/next section (currently {})",
+                    app.overview_section.title()
+                ),
+            ));
+            match app.overview_section {
+                OverviewSection::Metrics => {
+                    rows.push((String::new(), "METRICS".to_string()));
+                }
+                OverviewSection::ContextUsage => {
+                    rows.push((String::new(), "CONTEXT USAGE".to_string()));
+                }
+                OverviewSection::CustomModels => {
+                    rows.push((String::new(), "CUSTOM MODELS".to_string()));
+                    rows.push(("j/k · Up/Down".to_string(), "select a model".to_string()));
+                    rows.push(("e".to_string(), "enable selected model".to_string()));
+                    rows.push(("d".to_string(), "disable selected model".to_string()));
+                    rows.push(("x".to_string(), "delete selected model".to_string()));
+                }
+                OverviewSection::AccountUsage => {
+                    rows.push((String::new(), "ACCOUNT USAGE".to_string()));
+                    rows.push(("j/k · Up/Down".to_string(), "select an account".to_string()));
+                    rows.push((
+                        "Ctrl+j/k/Enter".to_string(),
+                        "reorder selected account within its provider".to_string(),
+                    ));
+                    rows.push((
+                        "Ctrl+Up/Down".to_string(),
+                        "reorder selected provider".to_string(),
+                    ));
+                    rows.push(("Enter".to_string(), "show account details".to_string()));
+                    rows.push((
+                        "n".to_string(),
+                        "add an account (choose provider)".to_string(),
+                    ));
+                    rows.push((
+                        "a".to_string(),
+                        format!("toggle quota view ({})", app.limit_display_mode.label()),
+                    ));
+                    rows.push(("e".to_string(), "enable selected account".to_string()));
+                    rows.push(("d".to_string(), "disable selected account".to_string()));
+                    rows.push(("p".to_string(), "hide selected provider".to_string()));
+                    rows.push(("v".to_string(), "hide selected account".to_string()));
+                    rows.push(("u".to_string(), "show all hidden account rows".to_string()));
+                    rows.push(("x".to_string(), "delete selected account".to_string()));
+                }
+            }
+        }
+        Tab::Keys => {
+            rows.push((String::new(), "API KEYS".to_string()));
+            rows.push(("j/k · Up/Down".to_string(), "select an API key".to_string()));
+            rows.push(("Enter".to_string(), "show API key details".to_string()));
+            rows.push(("n".to_string(), "create an API key".to_string()));
+            rows.push(("e".to_string(), "edit selected key access".to_string()));
+            rows.push(("x".to_string(), "revoke selected API key".to_string()));
+        }
+        Tab::Notifications => {
+            rows.push((String::new(), "NOTIFICATIONS".to_string()));
+            rows.push((
+                "j/k · Up/Down".to_string(),
+                "select a provider account".to_string(),
+            ));
+            rows.push((
+                "Enter · Space · w".to_string(),
+                "watch/unwatch selected account".to_string(),
+            ));
+            rows.push((
+                "p".to_string(),
+                "watch/unwatch selected provider".to_string(),
+            ));
+            rows.push((
+                "a/u".to_string(),
+                "watch all / unwatch all accounts".to_string(),
+            ));
+            rows.push(("e".to_string(), "enable/disable notifications".to_string()));
+            rows.push(("c".to_string(), "switch Telegram/Google Chat".to_string()));
+            rows.push(("s".to_string(), "edit notification settings".to_string()));
+            rows.push(("t".to_string(), "send a test notification".to_string()));
+        }
+    }
+    let context = if app.tab == Tab::Overview {
+        format!("{} / {}", app.tab.title(), app.overview_section.title())
+    } else {
+        app.tab.title().to_string()
+    };
+    rows.push((String::new(), format!("CURRENT CONTEXT: {context}")));
+    rows
+}
+
+const COMMAND_MODAL_KEY_WIDTH: usize = 18;
+
+fn command_modal_key_line(
+    key: &str,
+    description: impl Into<String>,
+    column_width: usize,
+) -> Line<'static> {
+    let style = if key == "!" {
+        btop_fg(BTOP_ATTENTION).add_modifier(Modifier::BOLD)
+    } else {
+        btop_header_style()
+    };
+    let key_width = COMMAND_MODAL_KEY_WIDTH.min(column_width.saturating_sub(1));
+    let description_width = column_width.saturating_sub(key_width);
+    let key = truncate_text(key, key_width);
+    let description = truncate_text(&description.into(), description_width);
+    Line::from(vec![
+        Span::styled(format!("{key:<key_width$}"), style),
+        Span::raw(description),
+    ])
+}
+
+fn draw_account_details_modal(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let Some(account) = app.selected_account() else {
+        return;
+    };
+    let status = account_status(account.enabled, account.cooldown);
+    let snapshot_values = account_snapshot_values(&app.data.snapshot, &account);
+    let quota_rows = app
+        .data
+        .quotas
+        .iter()
+        .filter(|quota| {
+            quota.provider == account.provider && quota_matches_account(quota, &account)
+        })
+        .collect::<Vec<_>>();
+    let models = snapshot_model_names(&snapshot_values);
+    let reset_credits = reset_credit_details(&snapshot_values);
+    let endpoint = snapshot_values.iter().find_map(|value| {
+        first_string_recursive(
+            value,
+            &[
+                "api_base_url",
+                "base_url",
+                "resource_url",
+                "openai_base_url",
+                "anthropic_base_url",
+            ],
+        )
+    });
+    let project = snapshot_values.iter().find_map(|value| {
+        first_string_recursive(value, &["project_id", "account_type", "plan_type"])
+    });
+    let generated_at = string_at(&app.data.snapshot, &["generated_at"]);
+
+    let mut lines = vec![
+        Line::from(vec![
+            account_status_circle(status, false),
+            Span::raw(format!(
+                "  {} ({})",
+                account_display(&account),
+                account_status_label(status)
+            )),
+        ]),
+        detail_line(
+            "Provider / ID",
+            format!(
+                "{} / {}",
+                account.provider_label,
+                display_or(&account.account_id, "not reported")
+            ),
+        ),
+        detail_line(
+            "Credential / priority",
+            format!(
+                "{} / {}",
+                display_or(&account.file_name, "not reported"),
+                if account.priority { "first" } else { "normal" }
+            ),
+        ),
+        detail_section("Quota"),
+    ];
+
+    if quota_rows.is_empty() {
+        lines.push(detail_line("Usage", "No quota snapshot for this account"));
+    } else {
+        for quota in &quota_rows {
+            let label = if quota.limit_label.trim().is_empty() {
+                "usage".to_string()
+            } else {
+                quota.limit_label.clone()
+            };
+            let text = if quota.detail_text.trim().is_empty() {
+                let used = display_or(&quota.used_percent, "not reported");
+                let remaining = if quota.remaining_percent.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("; remaining {}", quota.remaining_percent)
+                };
+                let reset = if quota.reset.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; reset {}",
+                        account_usage_reset_label(&account.provider, &quota.reset)
+                    )
+                };
+                format!("{used} used{remaining}{reset}")
+            } else {
+                quota.detail_text.clone()
+            };
+            lines.push(detail_line(&label, text));
+        }
+    }
+
+    lines.push(detail_section("Available reset limit"));
+    match reset_credits {
+        Some((count, credits)) => {
+            lines.push(detail_line(
+                "Available",
+                format!(
+                    "{count} reset credit{} (snapshot only)",
+                    if count == 1 { "" } else { "s" },
+                ),
+            ));
+            for credit in credits {
+                lines.push(detail_line("Reset credit", credit));
+            }
+        }
+        None => lines.push(detail_line("Available", "Not reported by this provider")),
+    }
+
+    lines.push(detail_section("Models"));
+    if models.is_empty() {
+        lines.push(detail_line(
+            "Available",
+            "No model metadata for this account",
+        ));
+    } else {
+        for model in models {
+            lines.push(detail_line("Model", model));
+        }
+    }
+
+    lines.push(detail_section("Connection details"));
+    lines.push(detail_line(
+        "Endpoint / plan",
+        format!(
+            "{}{}",
+            endpoint.unwrap_or_else(|| "not reported".to_string()),
+            project
+                .map(|value| format!(" / {value}"))
+                .unwrap_or_default()
+        ),
+    ));
+    lines.push(detail_line(
+        "Requests / errors",
+        format!(
+            "{} / {}",
+            format_count(account.requests),
+            format_count(account.errors)
+        ),
+    ));
+    lines.push(detail_line(
+        "Last success / snapshot",
+        format!(
+            "{} / {}",
+            display_or(&account.last_success_at, "not recorded"),
+            display_or(&generated_at, "not recorded")
+        ),
+    ));
+
+    lines.push(detail_section("Attention needed / Last error"));
+    let mut attention = Vec::new();
+    attention.extend(account.attention_reasons.iter().cloned());
+    if status == AccountStatus::Disabled {
+        attention.push("Account is disabled".to_string());
+    }
+    if status == AccountStatus::Cooldown {
+        let remaining = account
+            .cooldown_remaining_seconds
+            .map(format_duration)
+            .unwrap_or_else(|| "remaining time unavailable".to_string());
+        attention.push(format!("Router cooldown active ({remaining} remaining)"));
+    }
+    if !account.last_error_message.trim().is_empty() {
+        let when = if account.last_error_at.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" at {}", account.last_error_at)
+        };
+        attention.push(format!(
+            "{}{}",
+            short_message(&account.last_error_message),
+            when
+        ));
+    } else if account.errors > 0 {
+        attention.push(format!(
+            "{} recorded error{}",
+            account.errors,
+            if account.errors == 1 { "" } else { "s" }
+        ));
+    }
+    if quota_rows.is_empty() {
+        attention.push("Quota data is missing from the current snapshot".to_string());
+    }
+    if attention.is_empty() {
+        lines.push(detail_line("Status", "No attention needed"));
+    } else {
+        lines.push(detail_line(
+            "Attention",
+            truncate(&attention.join(" | "), 120),
+        ));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("j/k or Up/Down", btop_header_style()),
+        Span::raw(" scroll  "),
+        Span::styled("Enter/Esc/q", btop_header_style()),
+        Span::raw(" close details"),
+    ]));
+
+    let modal = centered_rect(area, 86, 32);
+    let max_scroll = lines
+        .len()
+        .saturating_sub(modal.height.saturating_sub(2) as usize);
+    let scroll = app.account_details_scroll.min(max_scroll) as u16;
     frame.render_widget(Clear, modal);
     frame.render_widget(
-        Paragraph::new(text)
+        Paragraph::new(lines)
             .style(btop_style())
-            .block(btop_block_with_border("Commands", BTOP_DIV_LINE))
+            .block(btop_block_with_border("Account Details", BTOP_MEM_BOX))
+            .scroll((scroll, 0))
             .wrap(Wrap { trim: false }),
         modal,
     );
+}
+
+fn detail_section(title: &str) -> Line<'static> {
+    Line::from(Span::styled(title.to_string(), btop_header_style()))
+}
+
+fn detail_line(label: &str, value: impl Into<String>) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<18}"), btop_muted_style()),
+        Span::raw(value.into()),
+    ])
+}
+
+fn display_or(value: &str, fallback: &str) -> String {
+    if value.trim().is_empty() {
+        fallback.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn format_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    }
 }
 
 fn draw_confirmation_modal(frame: &mut Frame<'_>, area: Rect, modal: &ConfirmationModal) {
@@ -2896,7 +4680,7 @@ fn draw_confirmation_modal(frame: &mut Frame<'_>, area: Rect, modal: &Confirmati
         Line::from(vec![
             Span::styled("y/Enter", btop_header_style()),
             Span::raw(" confirm"),
-            Span::styled("    n", btop_header_style()),
+            Span::styled("    n/q/Esc", btop_header_style()),
             Span::raw(" cancel"),
         ]),
     ];
@@ -2921,6 +4705,63 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+fn prompt_account_provider(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+) -> Result<String, String> {
+    let value = prompt_in_terminal(
+        terminal,
+        "Provider [1=Codex, 2=Antigravity, 3=Gemini, 4=Qwen, 5=DeepSeek, 6=MiniMax, 7=Grok, 8=Copilot, 9=Claude, 10=GLM]: ",
+    )?;
+    let normalized = value.trim().to_ascii_lowercase();
+    let provider = match normalized.as_str() {
+        "1" | "codex" | "chatgpt" => "codex",
+        "2" | "antigravity" | "agw" => "antigravity",
+        "3" | "gemini" => "gemini",
+        "4" | "qwen" => "qwen",
+        "5" | "deepseek" => "deepseek",
+        "6" | "minimax" => "minimax",
+        "7" | "grok" | "xai" => "grok",
+        "8" | "copilot" | "github" => "copilot",
+        "9" | "claude" | "anthropic" => "claude",
+        "10" | "glm" | "zai" | "z.ai" => "glm",
+        _ => return Err("unknown provider; choose a listed number or provider name".to_string()),
+    };
+    Ok(provider.to_string())
+}
+
+fn prompt_optional(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    prompt: &str,
+) -> Result<Option<String>, String> {
+    let value = prompt_in_terminal(terminal, prompt)?.trim().to_string();
+    Ok((!value.is_empty()).then_some(value))
+}
+
+fn prompt_choice(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    prompt: &str,
+    choices: &[(&str, &str)],
+) -> Result<String, String> {
+    let value = prompt_in_terminal(terminal, prompt)?;
+    let value = value.trim().to_ascii_lowercase();
+    choices
+        .iter()
+        .find(|(key, label)| value == *key || value == *label)
+        .map(|(_, label)| (*label).to_string())
+        .ok_or_else(|| "invalid choice".to_string())
+}
+
+fn open_account_login_url(url: &str) {
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn();
+}
+
 fn prompt_in_terminal(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     prompt: &str,
@@ -2933,6 +4774,46 @@ fn prompt_in_terminal(
     enable_raw_mode().map_err(|err| err.to_string())?;
     terminal.clear().map_err(|err| err.to_string())?;
     value
+}
+
+fn prompt_in_terminal_with_notice(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    notice: &str,
+    prompt: &str,
+) -> Result<String, String> {
+    disable_raw_mode().map_err(|err| err.to_string())?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show)
+        .map_err(|err| err.to_string())?;
+    println!("{notice}");
+    let value = prompt_line(prompt).map_err(|err| err.to_string());
+    execute!(io::stdout(), EnterAlternateScreen, cursor::Hide).map_err(|err| err.to_string())?;
+    enable_raw_mode().map_err(|err| err.to_string())?;
+    terminal.clear().map_err(|err| err.to_string())?;
+    value
+}
+
+fn prompt_api_key_access(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    existing: Option<&Value>,
+) -> Result<Value, String> {
+    let prompt = if existing.is_some() {
+        "Access JSON (blank = keep current): "
+    } else {
+        "Access JSON (blank = all providers/accounts): "
+    };
+    let input = prompt_in_terminal(terminal, prompt)?;
+    let input = input.trim();
+    let access = if input.is_empty() {
+        existing
+            .cloned()
+            .unwrap_or_else(|| json!({ "all": true, "providers": [] }))
+    } else {
+        parse_json_arg(input)?
+    };
+    if !access.is_object() {
+        return Err("API key access JSON must be an object".to_string());
+    }
+    Ok(access)
 }
 
 fn account_rows(summary: &Value, routing: &Value) -> Vec<AccountRow> {
@@ -2971,6 +4852,9 @@ fn account_rows(summary: &Value, routing: &Value) -> Vec<AccountRow> {
                 account_id: string_at(account, &["account_id"]),
                 file_name: string_at(account, &["credential_file"]),
                 enabled: bool_at(account, &["enabled"]),
+                cooldown: false,
+                cooldown_remaining_seconds: None,
+                attention_reasons: Vec::new(),
                 priority: provider_priority.contains(&key),
                 requests: number_at(&account_usage, &["requests"]),
                 errors: number_at(&account_usage, &["errors"]),
@@ -2991,6 +4875,9 @@ fn account_rows(summary: &Value, routing: &Value) -> Vec<AccountRow> {
                 label: string_at(&account_usage, &["label"]),
                 account_id: string_at(&account_usage, &["account_id"]),
                 enabled: true,
+                cooldown: false,
+                cooldown_remaining_seconds: None,
+                attention_reasons: Vec::new(),
                 requests: number_at(&account_usage, &["requests"]),
                 errors: number_at(&account_usage, &["errors"]),
                 total_tokens: number_at(&account_usage, &["total_tokens"]),
@@ -3009,6 +4896,275 @@ fn account_rows(summary: &Value, routing: &Value) -> Vec<AccountRow> {
             .then_with(|| left.key.cmp(&right.key))
     });
     rows
+}
+
+fn apply_account_runtime_status(accounts: &mut [AccountRow], snapshot: &Value) {
+    for account in accounts {
+        let runtime =
+            snapshot_account_for_account(snapshot, account).and_then(|value| value.get("runtime"));
+        account.cooldown = runtime
+            .and_then(|value| value.get("status"))
+            .and_then(Value::as_str)
+            .is_some_and(|status| status.eq_ignore_ascii_case("cooldown"));
+        account.cooldown_remaining_seconds = runtime
+            .and_then(|value| value.get("cooldown_remaining_seconds"))
+            .and_then(|value| {
+                value
+                    .as_u64()
+                    .or_else(|| value.as_i64().map(|n| n.max(0) as u64))
+            });
+    }
+}
+
+fn apply_account_attention(accounts: &mut [AccountRow], snapshot: &Value, quotas: &[QuotaRow]) {
+    for account in accounts {
+        let mut reasons = Vec::new();
+        if snapshot_account_is_expired(snapshot, account) {
+            reasons.push("expired tokens".to_string());
+        }
+        if has_current_account_error(account) {
+            reasons.push("errors".to_string());
+        }
+
+        let max_quota = quotas
+            .iter()
+            .filter(|quota| {
+                quota.provider == account.provider && quota_matches_account(quota, account)
+            })
+            .filter_map(|quota| quota.used_percent_value)
+            .filter(|percent| percent.is_finite())
+            .fold(0.0_f64, f64::max);
+        if max_quota >= 95.0 {
+            reasons.push("quota almost exhausted".to_string());
+        } else if max_quota >= 75.0 {
+            reasons.push("near quota".to_string());
+        }
+        account.attention_reasons = reasons;
+    }
+}
+
+fn snapshot_account_is_expired(snapshot: &Value, account: &AccountRow) -> bool {
+    let Some(value) = snapshot_account_for_account(snapshot, account) else {
+        return false;
+    };
+    ["expired_at", "expires_at", "copilot_expires_at"]
+        .iter()
+        .filter_map(|key| {
+            let value = string_at(value, &[*key]);
+            (!value.trim().is_empty()).then_some(value)
+        })
+        .any(|value| is_expired_timestamp(&value))
+}
+
+fn has_current_account_error(account: &AccountRow) -> bool {
+    if account.errors == 0 {
+        return false;
+    }
+    let last_error = parse_timestamp_millis(&account.last_error_at);
+    let last_success = parse_timestamp_millis(&account.last_success_at);
+    !(last_error.is_some() && last_success.is_some() && last_success > last_error)
+}
+
+fn is_expired_timestamp(value: &str) -> bool {
+    parse_timestamp_millis(value).is_some_and(|timestamp| timestamp < Utc::now().timestamp_millis())
+}
+
+fn parse_timestamp_millis(value: &str) -> Option<i64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(timestamp) = DateTime::parse_from_rfc3339(value) {
+        return Some(timestamp.timestamp_millis());
+    }
+    value.parse::<i64>().ok().map(|timestamp| {
+        if timestamp.unsigned_abs() < 100_000_000_000 {
+            timestamp.saturating_mul(1_000)
+        } else {
+            timestamp
+        }
+    })
+}
+
+fn snapshot_account_for_account<'a>(
+    snapshot: &'a Value,
+    account: &AccountRow,
+) -> Option<&'a Value> {
+    let candidates = snapshot_accounts_for_provider(snapshot, &account.provider);
+    let account_keys = normalized_match_keys(&account_row_identity_keys(account));
+
+    let exact = candidates.iter().find(|candidate| {
+        let candidate_keys = normalized_match_keys(&account_identity_keys(candidate));
+        candidate_keys
+            .iter()
+            .any(|key| account_keys.iter().any(|account_key| key == account_key))
+    });
+    if exact.is_some() {
+        return exact.copied();
+    }
+
+    let fuzzy = candidates.iter().find(|candidate| {
+        let candidate_keys = normalized_match_keys(&account_identity_keys(candidate));
+        candidate_keys.iter().any(|candidate_key| {
+            account_keys
+                .iter()
+                .any(|account_key| fuzzy_key_match(candidate_key, account_key))
+        })
+    });
+    if fuzzy.is_some() {
+        return fuzzy.copied();
+    }
+
+    (candidates.len() == 1).then(|| candidates[0])
+}
+
+fn account_snapshot_values<'a>(snapshot: &'a Value, account: &AccountRow) -> Vec<&'a Value> {
+    let mut values = Vec::new();
+    if let Some(value) = snapshot_account_for_account(snapshot, account) {
+        values.push(value);
+    }
+    for value in snapshot_quota_values_for_provider(snapshot, &account.provider) {
+        if snapshot_value_matches_account(value, account) {
+            values.push(value);
+        }
+    }
+    values
+}
+
+fn snapshot_quota_values_for_provider<'a>(snapshot: &'a Value, provider: &str) -> Vec<&'a Value> {
+    let Some(quotas) = snapshot.get("quotas").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    snapshot_provider_keys(provider)
+        .into_iter()
+        .find_map(|key| quotas.get(key).map(quota_account_values))
+        .unwrap_or_default()
+}
+
+fn snapshot_value_matches_account(value: &Value, account: &AccountRow) -> bool {
+    let account_keys = normalized_match_keys(&account_row_identity_keys(account));
+    let value_keys = normalized_match_keys(&account_identity_keys(value));
+    value_keys.iter().any(|value_key| {
+        account_keys
+            .iter()
+            .any(|account_key| value_key == account_key || fuzzy_key_match(value_key, account_key))
+    })
+}
+
+fn find_value_by_key<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    match value {
+        Value::Object(map) => {
+            if let Some(found) = map.get(key) {
+                return Some(found);
+            }
+            map.values().find_map(|child| find_value_by_key(child, key))
+        }
+        Value::Array(items) => items.iter().find_map(|item| find_value_by_key(item, key)),
+        _ => None,
+    }
+}
+
+fn reset_credit_details(values: &[&Value]) -> Option<(u64, Vec<String>)> {
+    for value in values {
+        let Some(details) = find_value_by_key(value, "rate_limit_reset_credits") else {
+            continue;
+        };
+        let count =
+            number_at(details, &["available_count"]).max(number_at(details, &["availableCount"]));
+        let credits = details
+            .get("credits")
+            .and_then(Value::as_array)
+            .map(|credits| {
+                credits
+                    .iter()
+                    .filter_map(|credit| {
+                        let title =
+                            first_string_recursive(credit, &["title", "description", "id"])?;
+                        let status = string_at(credit, &["status"]);
+                        let expires = first_string_recursive(credit, &["expires_at", "expiresAt"]);
+                        let mut line = title;
+                        if !status.trim().is_empty() {
+                            line.push_str(&format!(" ({status})"));
+                        }
+                        if let Some(expires) = expires.filter(|value| !value.trim().is_empty()) {
+                            line.push_str(&format!("; expires {expires}"));
+                        }
+                        Some(line)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        return Some((count, credits));
+    }
+    None
+}
+
+fn snapshot_model_names(values: &[&Value]) -> Vec<String> {
+    let mut names = Vec::new();
+    for value in values {
+        collect_model_arrays(value, &mut names);
+    }
+    let mut seen = HashSet::new();
+    names
+        .into_iter()
+        .filter(|name| !name.trim().is_empty() && seen.insert(name.clone()))
+        .collect()
+}
+
+fn collect_model_arrays(value: &Value, names: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if matches!(key.as_str(), "models" | "available_models") {
+                    collect_model_values(child, names);
+                } else {
+                    collect_model_arrays(child, names);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_model_arrays(item, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_model_values(value: &Value, names: &mut Vec<String>) {
+    match value {
+        Value::String(name) => names.push(name.clone()),
+        Value::Array(items) => {
+            for item in items {
+                collect_model_values(item, names);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(name) = [
+                "display_name",
+                "displayName",
+                "model_id",
+                "modelId",
+                "id",
+                "name",
+                "alias",
+            ]
+            .iter()
+            .find_map(|key| map.get(*key).and_then(Value::as_str))
+            {
+                names.push(name.to_string());
+            } else {
+                for (key, child) in map {
+                    if child.is_object() || child.is_array() {
+                        collect_model_values(child, names);
+                    } else if child.is_null() {
+                        names.push(key.clone());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn priority_map(routing: &Value) -> HashMap<String, HashSet<String>> {
@@ -3062,6 +5218,24 @@ fn quota_rows_from_provider(provider: &str, value: &Value) -> Vec<QuotaRow> {
         source_accounts.extend(value.as_array().into_iter().flatten().cloned());
     }
 
+    // Grok's live quota endpoint keeps the account identity under `account`
+    // and the live request/token limits beside it under `kinds`. Attach the
+    // latter to the account copy so the row parser can preserve every kind.
+    if provider == "grok" {
+        let kinds = value.get("kinds").cloned();
+        let observed = value.get("observed_rate_limits").cloned();
+        for account in &mut source_accounts {
+            if let Value::Object(map) = account {
+                if let Some(kinds) = &kinds {
+                    map.insert("kinds".to_string(), kinds.clone());
+                }
+                if let Some(observed) = &observed {
+                    map.insert("limits".to_string(), observed.clone());
+                }
+            }
+        }
+    }
+
     source_accounts
         .iter()
         .flat_map(|account| quota_rows_from_account(&provider, account))
@@ -3079,32 +5253,574 @@ fn quota_rows_from_account(provider: &str, account: &Value) -> Vec<QuotaRow> {
         .next()
         .unwrap_or_else(|| base_label.clone());
     let mut rows = Vec::new();
-    collect_quota_limit_rows(
-        provider,
-        &account_key,
-        &base_label,
-        account,
-        None,
-        &mut rows,
-    );
+    match provider {
+        "codex" => push_codex_quota_rows(&mut rows, provider, &account_key, &base_label, account),
+        "antigravity" | "gemini" => {
+            push_google_quota_rows(&mut rows, provider, &account_key, &base_label, account)
+        }
+        "qwen" | "claude" => {
+            push_named_limit_rows(&mut rows, provider, &account_key, &base_label, account)
+        }
+        "minimax" => {
+            push_minimax_quota_rows(&mut rows, provider, &account_key, &base_label, account)
+        }
+        "grok" => push_grok_quota_rows(&mut rows, provider, &account_key, &base_label, account),
+        _ => {}
+    }
+    if rows.is_empty() {
+        collect_quota_limit_rows(
+            provider,
+            &account_key,
+            &base_label,
+            account,
+            None,
+            &mut rows,
+        );
+    }
     if rows.is_empty() {
         let used_percent_value =
             first_number_recursive(account, &["used_percent", "usage_percent", "percent_used"])
                 .or_else(|| quota_percent_value(account));
+        let remaining_percent = quota_remaining_percent_value(account);
+        let reset = first_string_recursive(account, &["reset_label", "reset_at", "window"])
+            .unwrap_or_default();
         rows.push(QuotaRow {
             provider: provider.to_string(),
             account_key,
             account_label: base_label.clone(),
             limit_label: String::new(),
             label: base_label,
+            detail_text: quota_detail_from_parts(
+                provider,
+                used_percent_value,
+                remaining_percent,
+                &reset,
+                account,
+            ),
+            overview: true,
             used_percent_value,
             used_percent: percent(used_percent_value),
-            remaining_percent: percent(first_number_recursive(account, &["remaining_percent"])),
-            reset: first_string_recursive(account, &["reset_label", "reset_at", "window"])
-                .unwrap_or_default(),
+            remaining_percent: percent(remaining_percent),
+            reset,
         });
     }
+    disambiguate_quota_labels(&mut rows);
     rows
+}
+
+fn push_codex_quota_rows(
+    rows: &mut Vec<QuotaRow>,
+    provider: &str,
+    account_key: &str,
+    account_label: &str,
+    account: &Value,
+) {
+    for (field, label) in [
+        ("code_generation", "Code Gen"),
+        ("code_review", "Code Review"),
+    ] {
+        if let Some(value) = account.get(field) {
+            push_window_rows(
+                rows,
+                provider,
+                account_key,
+                account_label,
+                label,
+                value,
+                true,
+            );
+        }
+    }
+    for limit in array_values(account.get("additional_rate_limits")) {
+        let label = first_string_recursive(
+            limit,
+            &[
+                "display_name",
+                "displayName",
+                "limit_name",
+                "limitName",
+                "name",
+            ],
+        )
+        .unwrap_or_else(|| "Model limit".to_string());
+        if let Some(rate_limit) = limit.get("rate_limit").or_else(|| limit.get("rateLimit")) {
+            push_window_rows(
+                rows,
+                provider,
+                account_key,
+                account_label,
+                &label,
+                rate_limit,
+                true,
+            );
+        } else {
+            push_window_rows(
+                rows,
+                provider,
+                account_key,
+                account_label,
+                &label,
+                limit,
+                true,
+            );
+        }
+    }
+}
+
+fn push_google_quota_rows(
+    rows: &mut Vec<QuotaRow>,
+    provider: &str,
+    account_key: &str,
+    account_label: &str,
+    account: &Value,
+) {
+    for group in array_values(account.get("groups")) {
+        let label = first_string_recursive(group, &["display_name", "displayName", "name"])
+            .unwrap_or_else(|| "Group".to_string());
+        push_window_rows(
+            rows,
+            provider,
+            account_key,
+            account_label,
+            &label,
+            group,
+            true,
+        );
+    }
+
+    let mut families = HashMap::<String, (Option<f64>, Option<f64>, String)>::new();
+    for model in array_values(account.get("models")) {
+        let model_label = first_string_recursive(
+            model,
+            &["display_name", "displayName", "model_id", "modelId", "name"],
+        )
+        .unwrap_or_else(|| "Model".to_string());
+        let family = gemini_model_family(&model_label);
+        let bucket = model
+            .get("current")
+            .or_else(|| model.get("quota"))
+            .or_else(|| model.get("limit"));
+        if let Some(bucket) = bucket {
+            let used = quota_percent_value(bucket);
+            let remaining = quota_remaining_percent_value(bucket);
+            if provider == "gemini" {
+                if let Some(family) = family {
+                    let entry =
+                        families
+                            .entry(family.to_string())
+                            .or_insert((None, None, String::new()));
+                    if used.is_some_and(|value| entry.0.is_none_or(|current| value > current)) {
+                        entry.0 = used;
+                        entry.2 = first_string_recursive(bucket, &["reset_label", "reset_at"])
+                            .unwrap_or_default();
+                    }
+                    if remaining.is_some_and(|value| entry.1.is_none_or(|current| value < current))
+                    {
+                        entry.1 = remaining;
+                    }
+                }
+            }
+            let label = if provider == "gemini" {
+                model_label.clone()
+            } else {
+                model_label.clone()
+            };
+            rows.push(quota_row_from_value(
+                provider,
+                account_key,
+                account_label,
+                &label,
+                bucket,
+                false,
+            ));
+        }
+    }
+
+    if provider == "gemini" {
+        for family in ["Flash", "Flash Lite", "Pro"] {
+            if let Some((used, remaining, reset)) = families.remove(family) {
+                rows.push(quota_row_from_parts(
+                    provider,
+                    account_key,
+                    account_label,
+                    &format!("Gemini {family}"),
+                    used,
+                    remaining,
+                    &reset,
+                    true,
+                ));
+            }
+        }
+        let mut extra = families.into_iter().collect::<Vec<_>>();
+        extra.sort_by(|left, right| left.0.cmp(&right.0));
+        for (family, (used, remaining, reset)) in extra {
+            rows.push(quota_row_from_parts(
+                provider,
+                account_key,
+                account_label,
+                &format!("Gemini {family}"),
+                used,
+                remaining,
+                &reset,
+                true,
+            ));
+        }
+    }
+}
+
+fn push_named_limit_rows(
+    rows: &mut Vec<QuotaRow>,
+    provider: &str,
+    account_key: &str,
+    account_label: &str,
+    account: &Value,
+) {
+    for limit in array_values(account.get("limits")) {
+        let label = first_string_recursive(limit, &["label", "scope", "name"])
+            .unwrap_or_else(|| "Limit".to_string());
+        rows.push(quota_row_from_value(
+            provider,
+            account_key,
+            account_label,
+            &label,
+            limit,
+            true,
+        ));
+    }
+    if let Some(current) = account.get("current_window") {
+        rows.push(quota_row_from_value(
+            provider,
+            account_key,
+            account_label,
+            "5h window",
+            current,
+            true,
+        ));
+    }
+    if let Some(weekly) = account.get("weekly") {
+        rows.push(quota_row_from_value(
+            provider,
+            account_key,
+            account_label,
+            "Weekly window",
+            weekly,
+            true,
+        ));
+    }
+    for limit in array_values(account.get("additional_rate_limits")) {
+        let label = first_string_recursive(limit, &["display_name", "displayName", "name"])
+            .unwrap_or_else(|| "Model limit".to_string());
+        push_window_rows(
+            rows,
+            provider,
+            account_key,
+            account_label,
+            &label,
+            limit,
+            true,
+        );
+    }
+}
+
+fn push_minimax_quota_rows(
+    rows: &mut Vec<QuotaRow>,
+    provider: &str,
+    account_key: &str,
+    account_label: &str,
+    account: &Value,
+) {
+    if let Some(current) = account.get("current_window") {
+        rows.push(quota_row_from_value(
+            provider,
+            account_key,
+            account_label,
+            "5h window",
+            current,
+            true,
+        ));
+    }
+    if let Some(weekly) = account.get("weekly") {
+        rows.push(quota_row_from_value(
+            provider,
+            account_key,
+            account_label,
+            "Weekly window",
+            weekly,
+            true,
+        ));
+    }
+    for model in array_values(account.get("models")) {
+        let model_label = first_string_recursive(
+            model,
+            &[
+                "display_name",
+                "displayName",
+                "model_id",
+                "model_name",
+                "name",
+            ],
+        )
+        .unwrap_or_else(|| "Model".to_string());
+        for (field, suffix) in [("current", "5h window"), ("weekly", "Weekly window")] {
+            if let Some(bucket) = model.get(field) {
+                rows.push(quota_row_from_value(
+                    provider,
+                    account_key,
+                    account_label,
+                    &format!("{model_label} {suffix}"),
+                    bucket,
+                    false,
+                ));
+            }
+        }
+    }
+}
+
+fn push_grok_quota_rows(
+    rows: &mut Vec<QuotaRow>,
+    provider: &str,
+    account_key: &str,
+    account_label: &str,
+    account: &Value,
+) {
+    for (kind, kind_label, show_tokens) in [
+        ("DEFAULT_TEXT", "Text", true),
+        ("DEFAULT_IMAGE", "Image", false),
+        ("DEFAULT_VIDEO", "Video", false),
+    ] {
+        let Some(rate_limits) = account
+            .get("kinds")
+            .and_then(|kinds| kinds.get(kind))
+            .and_then(|kind| kind.get("rate_limits"))
+        else {
+            continue;
+        };
+        for (scope, label) in [("requests", "requests"), ("tokens", "tokens")] {
+            if scope == "tokens" && !show_tokens {
+                continue;
+            }
+            if let Some(bucket) = rate_limits.get(scope) {
+                rows.push(quota_row_from_value(
+                    provider,
+                    account_key,
+                    account_label,
+                    &format!("{kind_label} {label}"),
+                    bucket,
+                    true,
+                ));
+            }
+        }
+    }
+    for limit in array_values(account.get("limits")) {
+        let label = first_string_recursive(limit, &["label", "scope", "name"])
+            .unwrap_or_else(|| "Limit".to_string());
+        rows.push(quota_row_from_value(
+            provider,
+            account_key,
+            account_label,
+            &label,
+            limit,
+            true,
+        ));
+    }
+}
+
+fn push_window_rows(
+    rows: &mut Vec<QuotaRow>,
+    provider: &str,
+    account_key: &str,
+    account_label: &str,
+    label: &str,
+    value: &Value,
+    overview: bool,
+) {
+    for (field, suffix) in [("five_hour", "5h"), ("weekly", "Weekly")] {
+        if let Some(bucket) = value.get(field) {
+            rows.push(quota_row_from_value(
+                provider,
+                account_key,
+                account_label,
+                &format!("{label} {suffix}"),
+                bucket,
+                overview,
+            ));
+        }
+    }
+}
+
+fn quota_row_from_value(
+    provider: &str,
+    account_key: &str,
+    account_label: &str,
+    limit_label: &str,
+    value: &Value,
+    overview: bool,
+) -> QuotaRow {
+    let used_percent_value = quota_percent_value(value);
+    let remaining_percent = quota_remaining_percent_value(value);
+    let reset = first_string_recursive(value, &["reset_label", "reset_at", "reset_time"])
+        .unwrap_or_default();
+    QuotaRow {
+        provider: provider.to_string(),
+        account_key: account_key.to_string(),
+        account_label: account_label.to_string(),
+        limit_label: limit_label.to_string(),
+        label: format!("{account_label} / {limit_label}"),
+        detail_text: quota_detail_from_parts(
+            provider,
+            used_percent_value,
+            remaining_percent,
+            &reset,
+            value,
+        ),
+        overview,
+        used_percent_value,
+        used_percent: percent(used_percent_value),
+        remaining_percent: percent(remaining_percent),
+        reset,
+    }
+}
+
+fn quota_row_from_parts(
+    provider: &str,
+    account_key: &str,
+    account_label: &str,
+    limit_label: &str,
+    used_percent_value: Option<f64>,
+    remaining_percent: Option<f64>,
+    reset: &str,
+    overview: bool,
+) -> QuotaRow {
+    QuotaRow {
+        provider: provider.to_string(),
+        account_key: account_key.to_string(),
+        account_label: account_label.to_string(),
+        limit_label: limit_label.to_string(),
+        label: format!("{account_label} / {limit_label}"),
+        detail_text: quota_detail_from_parts(
+            provider,
+            used_percent_value,
+            remaining_percent,
+            reset,
+            &Value::Null,
+        ),
+        overview,
+        used_percent_value,
+        used_percent: percent(used_percent_value),
+        remaining_percent: percent(remaining_percent),
+        reset: reset.to_string(),
+    }
+}
+
+fn quota_detail_from_parts(
+    provider: &str,
+    used_percent: Option<f64>,
+    remaining_percent: Option<f64>,
+    reset: &str,
+    value: &Value,
+) -> String {
+    let used_text = first_string_recursive(value, &["used_text"])
+        .or_else(|| scalar_text(value, &["used"]))
+        .unwrap_or_default();
+    let limit_text = first_string_recursive(value, &["limit_text"])
+        .or_else(|| scalar_text(value, &["limit"]))
+        .unwrap_or_default();
+    if (provider == "qwen" || provider == "claude")
+        && (!used_text.is_empty() || !limit_text.is_empty())
+    {
+        let mut text = format!("{used_text}/{limit_text}");
+        if !reset.trim().is_empty() {
+            text.push(' ');
+            text.push_str(reset.trim());
+        }
+        return text;
+    }
+    if provider == "grok" && (!used_text.is_empty() || !limit_text.is_empty()) {
+        let remaining = scalar_text(value, &["remaining"]).unwrap_or_else(|| "?".to_string());
+        let limit = if limit_text.is_empty() {
+            "?".to_string()
+        } else {
+            limit_text
+        };
+        return format!("{remaining}/{limit} (no reset info)");
+    }
+    if provider == "minimax" {
+        let used = used_percent
+            .map(|value| format!("{value:.1}% used"))
+            .unwrap_or_else(|| "— used".to_string());
+        let reset = if reset.trim().is_empty() {
+            "resets in —".to_string()
+        } else if reset.to_ascii_lowercase().starts_with("resets in ") {
+            reset.trim().to_string()
+        } else {
+            format!("resets in {}", reset.trim())
+        };
+        return format!("{used} · {reset}");
+    }
+    let used = used_percent
+        .or_else(|| remaining_percent.map(|value| 100.0 - value))
+        .map(|value| format!("{value:.1}%"))
+        .unwrap_or_else(|| "N/A".to_string());
+    if reset.trim().is_empty() {
+        used
+    } else {
+        format!("{used} {}", reset.trim())
+    }
+}
+
+fn scalar_text(value: &Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        let Some(candidate) = value.get(*key) else {
+            continue;
+        };
+        let text = match candidate {
+            Value::String(text) => text.clone(),
+            Value::Number(number) => number.to_string(),
+            _ => continue,
+        };
+        if !text.trim().is_empty() {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn quota_remaining_percent_value(value: &Value) -> Option<f64> {
+    number_field(value, "remaining_percent").or_else(|| {
+        let limit = number_field(value, "limit")?;
+        let remaining = number_field(value, "remaining")?;
+        (limit > 0.0).then_some(remaining * 100.0 / limit)
+    })
+}
+
+fn gemini_model_family(value: &str) -> Option<&'static str> {
+    let lower = value.to_ascii_lowercase();
+    if !lower.contains("gemini") {
+        return None;
+    }
+    if lower.contains("flash-lite") || lower.contains("flash_lite") || lower.contains("flash lite")
+    {
+        Some("Flash Lite")
+    } else if lower.contains("flash") {
+        Some("Flash")
+    } else if lower.contains("pro") {
+        Some("Pro")
+    } else {
+        None
+    }
+}
+
+fn disambiguate_quota_labels(rows: &mut [QuotaRow]) {
+    let mut counts = HashMap::<(String, String), usize>::new();
+    for row in rows.iter_mut() {
+        let key = (row.account_key.clone(), row.limit_label.clone());
+        let count = counts.entry(key).or_insert(0);
+        *count += 1;
+        if *count > 1 {
+            row.limit_label = format!("{} ({})", row.limit_label, *count);
+            row.label = format!("{} / {}", row.account_label, row.limit_label);
+        }
+    }
 }
 
 fn collect_quota_limit_rows(
@@ -3138,23 +5854,28 @@ fn collect_quota_limit_rows(
                     &["used_percent", "usage_percent", "percent_used"],
                 )
                 .or_else(|| quota_percent_value(value));
+                let remaining_percent = quota_remaining_percent_value(value);
+                let reset =
+                    first_string_recursive(value, &["reset_label", "reset_at", "reset_time"])
+                        .unwrap_or_default();
                 out.push(QuotaRow {
                     provider: provider.to_string(),
                     account_key: account_key.to_string(),
                     account_label: parent_label.to_string(),
-                    limit_label,
+                    limit_label: limit_label.clone(),
                     label,
+                    detail_text: quota_detail_from_parts(
+                        provider,
+                        used_percent_value,
+                        remaining_percent,
+                        &reset,
+                        value,
+                    ),
+                    overview: true,
                     used_percent_value,
                     used_percent: percent(used_percent_value),
-                    remaining_percent: percent(first_number_recursive(
-                        value,
-                        &["remaining_percent"],
-                    )),
-                    reset: first_string_recursive(
-                        value,
-                        &["reset_label", "reset_at", "reset_time"],
-                    )
-                    .unwrap_or_default(),
+                    remaining_percent: percent(remaining_percent),
+                    reset,
                 });
             }
             for (key, child) in map {
@@ -3189,6 +5910,8 @@ fn collect_quota_limit_rows(
 
 fn format_quota_label_hint(value: &str) -> String {
     match value.trim().trim_matches('_') {
+        "code_generation" => "Code Gen".to_string(),
+        "code_review" => "Code Review".to_string(),
         "five_hour" | "5h" => "5h".to_string(),
         "weekly" => "Weekly".to_string(),
         "current_window" => "5h window".to_string(),
@@ -3199,8 +5922,8 @@ fn format_quota_label_hint(value: &str) -> String {
 fn quota_child_label_hint(parent_hint: Option<&str>, child_key: &str) -> String {
     let child = format_quota_label_hint(child_key);
     match parent_hint {
-        Some("code_generation") | Some("Code Gen") => format!("Code Gen {child}"),
-        Some("code_review") | Some("Code Review") => format!("Code Review {child}"),
+        Some("Code Gen") => format!("Code Gen {child}"),
+        Some("Code Review") => format!("Code Review {child}"),
         _ => child,
     }
 }
@@ -3211,15 +5934,21 @@ fn key_rows_from_response(value: &Value) -> Vec<KeyRow> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .map(|key| KeyRow {
-            id: string_at(key, &["id"]),
-            label: string_at(key, &["label"]),
-            prefix: string_at(key, &["key_prefix"]),
-            source: string_at(key, &["source"]),
-            revoked: key.get("revoked_at").is_some_and(|value| !value.is_null()),
-            created_at: string_at(key, &["created_at"]),
-            last_used_at: string_at(key, &["last_used_at"]),
-            access: access_summary(key.get("access").unwrap_or(&Value::Null)),
+        .map(|key| {
+            let access_json = key.get("access").cloned().unwrap_or(Value::Null);
+            let revoked_at = string_at(key, &["revoked_at"]);
+            KeyRow {
+                id: string_at(key, &["id"]),
+                label: string_at(key, &["label"]),
+                prefix: string_at(key, &["key_prefix"]),
+                source: string_at(key, &["source"]),
+                revoked: !revoked_at.is_empty(),
+                revoked_at,
+                created_at: string_at(key, &["created_at"]),
+                last_used_at: string_at(key, &["last_used_at"]),
+                access: access_summary(&access_json),
+                access_json,
+            }
         })
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| {
@@ -3228,6 +5957,173 @@ fn key_rows_from_response(value: &Value) -> Vec<KeyRow> {
             .then_with(|| left.id.cmp(&right.id))
     });
     rows
+}
+
+fn notification_settings_value(value: &Value) -> &Value {
+    value
+        .get("settings")
+        .filter(|settings| settings.is_object())
+        .unwrap_or(value)
+}
+
+fn notification_channel(settings: &Value) -> String {
+    match string_at(settings, &["channel"]).as_str() {
+        "google_chat" => "google_chat".to_string(),
+        _ => "telegram".to_string(),
+    }
+}
+
+fn channel_label(channel: &str) -> &'static str {
+    match channel {
+        "google_chat" => "Google Chat",
+        _ => "Telegram",
+    }
+}
+
+fn notification_watched_keys(settings: &Value) -> Vec<String> {
+    let mut keys = settings
+        .get("watched_accounts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn notification_settings_update_body(
+    enabled: bool,
+    channel: String,
+    watched_accounts: Vec<String>,
+) -> Value {
+    json!({
+        "enabled": enabled,
+        "channel": channel,
+        "watched_accounts": watched_accounts,
+    })
+}
+
+fn notification_account_rows(value: &Value) -> Vec<NotificationAccountRow> {
+    let settings = notification_settings_value(value);
+    let watched = notification_watched_keys(settings)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut rows = settings
+        .get("accounts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|account| {
+            let key = string_at(account, &["key"]);
+            if key.trim().is_empty() {
+                return None;
+            }
+            let provider = normalize_usage_provider(&string_at(account, &["provider"]));
+            let provider_label = {
+                let label = string_at(account, &["provider_label"]);
+                if label.trim().is_empty() {
+                    provider_label(&provider).to_string()
+                } else {
+                    label
+                }
+            };
+            Some(NotificationAccountRow {
+                provider,
+                provider_label,
+                key: key.clone(),
+                label: string_at(account, &["label"]),
+                account_id: string_at(account, &["account_id"]),
+                credential_file: string_at(account, &["credential_file"]),
+                enabled: account
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                watched: watched.contains(&key),
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        notification_provider_rank(&left.provider)
+            .cmp(&notification_provider_rank(&right.provider))
+            .then_with(|| left.provider_label.cmp(&right.provider_label))
+            .then_with(|| left.label.cmp(&right.label))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    rows
+}
+
+fn notification_provider_rank(provider: &str) -> usize {
+    let provider = normalize_usage_provider(provider);
+    PROVIDERS
+        .iter()
+        .position(|spec| spec.key == provider)
+        .unwrap_or(PROVIDERS.len())
+}
+
+fn prompt_notification_settings(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    settings: &Value,
+) -> Result<Value, String> {
+    let current_channel = notification_channel(settings);
+    let channel_input = prompt_in_terminal(
+        terminal,
+        &format!(
+            "Channel (telegram/google_chat, blank = {}): ",
+            channel_label(&current_channel)
+        ),
+    )?;
+    let channel = if channel_input.trim().is_empty() {
+        current_channel
+    } else {
+        match channel_input.trim().to_ascii_lowercase().as_str() {
+            "telegram" => "telegram".to_string(),
+            "google_chat" | "google chat" | "google" => "google_chat".to_string(),
+            _ => return Err("channel must be telegram or google_chat".to_string()),
+        }
+    };
+
+    let mut body = notification_settings_update_body(
+        bool_at(settings, &["enabled"]),
+        channel.clone(),
+        notification_watched_keys(settings),
+    );
+    if channel == "telegram" {
+        let bot_token =
+            prompt_in_terminal(terminal, "Telegram bot token (blank = keep current): ")?;
+        let chat_id = prompt_in_terminal(
+            terminal,
+            &format!(
+                "Telegram chat ID (blank = {}): ",
+                display_or(
+                    &string_at(settings, &["telegram", "chat_id"]),
+                    "keep current"
+                )
+            ),
+        )?;
+        let mut telegram = json!({
+            "chat_id": if chat_id.trim().is_empty() {
+                string_at(settings, &["telegram", "chat_id"])
+            } else {
+                chat_id.trim().to_string()
+            }
+        });
+        if !bot_token.trim().is_empty() {
+            telegram["bot_token"] = json!(bot_token.trim());
+        }
+        body["telegram"] = telegram;
+    } else {
+        let webhook_url =
+            prompt_in_terminal(terminal, "Google Chat webhook URL (blank = keep current): ")?;
+        if !webhook_url.trim().is_empty() {
+            body["google_chat"] = json!({ "webhook_url": webhook_url.trim() });
+        }
+    }
+    Ok(body)
 }
 
 fn model_rows_from_response(value: &Value) -> Vec<ModelRow> {
@@ -3374,11 +6270,14 @@ struct OverviewAccountUsageRow {
     account_label: String,
     limit_label: String,
     label: String,
+    detail_text: Option<String>,
     percent: Option<f64>,
     remaining_percent: String,
     reset: String,
     requests: u64,
     enabled: bool,
+    cooldown: bool,
+    attention: bool,
     priority: bool,
 }
 
@@ -3395,7 +6294,8 @@ fn overview_account_usage_groups(app: &TuiApp) -> Vec<OverviewAccountUsageGroup>
         overview_account_usage_account_groups(app)
     };
 
-    filter_overview_account_usage_groups(app, groups)
+    let groups = filter_overview_account_usage_groups(app, groups);
+    order_overview_account_usage_groups(app, groups)
 }
 
 fn overview_account_usage_account_groups(app: &TuiApp) -> Vec<OverviewAccountUsageGroup> {
@@ -3428,11 +6328,14 @@ fn overview_account_usage_account_groups(app: &TuiApp) -> Vec<OverviewAccountUsa
             account_label: account_display(account),
             limit_label: String::new(),
             label: account_display(account),
+            detail_text: None,
             percent: overview_account_percent(account, quota_rows),
             remaining_percent: String::new(),
             reset: String::new(),
             requests: account.requests,
             enabled: account.enabled,
+            cooldown: account.cooldown,
+            attention: account_has_attention_marker(account),
             priority: account.priority,
         });
     }
@@ -3463,11 +6366,101 @@ fn filter_overview_account_usage_groups(
         .collect()
 }
 
-fn overview_account_usage_row_count(app: &TuiApp) -> usize {
-    overview_account_usage_groups(app)
+fn order_overview_account_usage_groups(
+    app: &TuiApp,
+    mut groups: Vec<OverviewAccountUsageGroup>,
+) -> Vec<OverviewAccountUsageGroup> {
+    for group in &mut groups {
+        let Some(order) = app.account_orders.get(&group.provider) else {
+            continue;
+        };
+        let ranks = order
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key.as_str(), index))
+            .collect::<HashMap<_, _>>();
+        group.accounts.sort_by_key(|row| {
+            ranks
+                .get(row.account_key.as_str())
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+    }
+    let provider_ranks = app
+        .provider_order
         .iter()
-        .map(|group| group.accounts.len())
-        .sum()
+        .enumerate()
+        .map(|(index, provider)| (provider.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    groups.sort_by_key(|group| {
+        provider_ranks
+            .get(group.provider.as_str())
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+    groups
+}
+
+fn provider_order_for_app(app: &TuiApp) -> Vec<String> {
+    let known = app
+        .data
+        .accounts
+        .iter()
+        .map(|account| account.provider.clone())
+        .collect::<Vec<_>>();
+    let known_keys = known.iter().cloned().collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let mut order = app.provider_order.clone();
+    order.retain(|provider| {
+        !provider.is_empty() && known_keys.contains(provider) && seen.insert(provider.clone())
+    });
+    for provider in known {
+        if seen.insert(provider.clone()) {
+            order.push(provider);
+        }
+    }
+    order
+}
+
+fn account_order_for_provider(app: &TuiApp, provider: &str) -> Vec<String> {
+    let known = app
+        .data
+        .accounts
+        .iter()
+        .filter(|account| account.provider == provider)
+        .map(usage_account_filter_key)
+        .collect::<Vec<_>>();
+    let known_keys = known.iter().cloned().collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let mut order = app
+        .account_orders
+        .get(provider)
+        .cloned()
+        .unwrap_or_default();
+    order.retain(|key| !key.is_empty() && known_keys.contains(key) && seen.insert(key.clone()));
+    for key in known {
+        if seen.insert(key.clone()) {
+            order.push(key);
+        }
+    }
+    order
+}
+
+fn overview_account_usage_account_rows(app: &TuiApp) -> Vec<OverviewAccountUsageRow> {
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+    for group in overview_account_usage_groups(app) {
+        for row in group.accounts {
+            if seen.insert(row.account_index) {
+                rows.push(row);
+            }
+        }
+    }
+    rows
+}
+
+fn overview_account_usage_account_count(app: &TuiApp) -> usize {
+    overview_account_usage_account_rows(app).len()
 }
 
 fn selected_overview_account_index(app: &TuiApp) -> Option<usize> {
@@ -3475,16 +6468,14 @@ fn selected_overview_account_index(app: &TuiApp) -> Option<usize> {
 }
 
 fn selected_overview_usage_row(app: &TuiApp) -> Option<OverviewAccountUsageRow> {
-    overview_account_usage_groups(app)
+    overview_account_usage_account_rows(app)
         .into_iter()
-        .flat_map(|group| group.accounts)
         .nth(app.overview_account_selected)
 }
 
 fn overview_selection_for_account(app: &TuiApp, account_index: usize) -> Option<usize> {
-    overview_account_usage_groups(app)
+    overview_account_usage_account_rows(app)
         .into_iter()
-        .flat_map(|group| group.accounts)
         .position(|row| row.account_index == account_index)
 }
 
@@ -3507,7 +6498,11 @@ fn overview_account_usage_limit_groups(app: &TuiApp) -> Vec<OverviewAccountUsage
             .data
             .quotas
             .iter()
-            .filter(|quota| quota.provider == provider && quota_matches_account(quota, account))
+            .filter(|quota| {
+                quota.overview
+                    && quota.provider == provider
+                    && quota_matches_account(quota, account)
+            })
             .peekable();
         if matches.peek().is_none() {
             let account_key = usage_account_filter_key(account);
@@ -3518,11 +6513,14 @@ fn overview_account_usage_limit_groups(app: &TuiApp) -> Vec<OverviewAccountUsage
                 account_label: account_display(account),
                 limit_label: String::new(),
                 label: account_display(account),
+                detail_text: None,
                 percent: None,
                 remaining_percent: String::new(),
                 reset: String::new(),
                 requests: account.requests,
                 enabled: account.enabled,
+                cooldown: account.cooldown,
+                attention: account_has_attention_marker(account),
                 priority: account.priority,
             });
             continue;
@@ -3537,11 +6535,14 @@ fn overview_account_usage_limit_groups(app: &TuiApp) -> Vec<OverviewAccountUsage
                 account_label: account_display(account),
                 limit_label: quota.limit_label.clone(),
                 label: account_usage_limit_label(account, quota),
+                detail_text: Some(quota.detail_text.clone()),
                 percent: quota.used_percent_value,
                 remaining_percent: quota.remaining_percent.clone(),
                 reset: quota.reset.clone(),
                 requests: account.requests,
                 enabled: account.enabled,
+                cooldown: account.cooldown,
+                attention: account_has_attention_marker(account),
                 priority: account.priority,
             });
         }
@@ -3790,6 +6791,7 @@ fn best_quota_source_index(
 
 fn account_identity_keys(value: &Value) -> Vec<String> {
     unique_non_empty_strings([
+        string_at(value, &["key"]),
         string_at(value, &["file_name"]),
         string_at(value, &["label"]),
         string_at(value, &["email"]),
@@ -4178,7 +7180,11 @@ fn print_accounts(accounts: &[AccountRow]) {
         accounts.iter().map(|account| {
             vec![
                 account.provider_label.clone(),
-                if account.enabled { "on" } else { "off" }.to_string(),
+                if account_has_attention_marker(account) {
+                    "●!".to_string()
+                } else {
+                    "●".to_string()
+                },
                 if account.priority { "first" } else { "" }.to_string(),
                 account.label.clone(),
                 account.file_name.clone(),
@@ -4396,6 +7402,8 @@ fn quota_json(rows: &[QuotaRow]) -> Value {
                     "account_label": row.account_label,
                     "limit_label": row.limit_label,
                     "label": row.label,
+                    "detail_text": row.detail_text,
+                    "overview": row.overview,
                     "used_percent_value": row.used_percent_value,
                     "used_percent": row.used_percent,
                     "remaining_percent": row.remaining_percent,
@@ -4453,6 +7461,32 @@ fn load_tui_preferences(path: &Path) -> TuiPreferenceState {
         return TuiPreferenceState::default();
     };
 
+    let account_orders = preferences
+        .account_orders
+        .into_iter()
+        .filter_map(|entry| {
+            let provider = normalize_usage_provider(&entry.provider);
+            let mut seen = HashSet::new();
+            let account_keys = entry
+                .account_keys
+                .into_iter()
+                .filter(|key| !key.is_empty() && seen.insert(key.clone()))
+                .collect::<Vec<_>>();
+            if provider.is_empty() || account_keys.is_empty() {
+                None
+            } else {
+                Some((provider, account_keys))
+            }
+        })
+        .collect();
+    let mut seen_providers = HashSet::new();
+    let provider_order = preferences
+        .provider_order
+        .into_iter()
+        .map(|provider| normalize_usage_provider(&provider))
+        .filter(|provider| !provider.is_empty() && seen_providers.insert(provider.clone()))
+        .collect();
+
     TuiPreferenceState {
         limit_display_mode: preferences
             .limit_display_mode
@@ -4476,6 +7510,8 @@ fn load_tui_preferences(path: &Path) -> TuiPreferenceState {
             })
             .filter(|(provider, account_key)| !provider.is_empty() && !account_key.is_empty())
             .collect(),
+        account_orders,
+        provider_order,
     }
 }
 
@@ -4505,10 +7541,39 @@ fn save_tui_preferences(path: &Path, app: &TuiApp) -> Result<(), String> {
             .then_with(|| left.account_key.cmp(&right.account_key))
     });
 
+    let mut account_orders = app
+        .account_orders
+        .iter()
+        .map(|(provider, account_keys)| {
+            let mut seen = HashSet::new();
+            let account_keys = account_keys
+                .iter()
+                .filter(|key| !key.is_empty() && seen.insert((*key).clone()))
+                .cloned()
+                .collect::<Vec<_>>();
+            AccountOrderPreference {
+                provider: provider.clone(),
+                account_keys,
+            }
+        })
+        .filter(|entry| !entry.account_keys.is_empty())
+        .collect::<Vec<_>>();
+    account_orders.sort_by(|left, right| left.provider.cmp(&right.provider));
+
+    let mut seen_providers = HashSet::new();
+    let provider_order = app
+        .provider_order
+        .iter()
+        .filter(|provider| !provider.is_empty() && seen_providers.insert((*provider).clone()))
+        .cloned()
+        .collect::<Vec<_>>();
+
     let preferences = TuiPreferences {
         limit_display_mode: Some(app.limit_display_mode.preference_value().to_string()),
         hidden_usage_providers,
         hidden_usage_accounts,
+        account_orders,
+        provider_order,
     };
     let data = serde_json::to_vec_pretty(&preferences).map_err(|err| err.to_string())?;
     fs::write(path, data).map_err(|err| err.to_string())
@@ -4998,6 +8063,496 @@ impl EmptyStringExt for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_runtime_snapshot_marks_cooldown_without_overriding_disabled() {
+        let mut accounts = vec![
+            AccountRow {
+                provider: "codex".to_string(),
+                key: "one.json".to_string(),
+                file_name: "one.json".to_string(),
+                enabled: true,
+                ..AccountRow::default()
+            },
+            AccountRow {
+                provider: "codex".to_string(),
+                key: "two.json".to_string(),
+                file_name: "two.json".to_string(),
+                enabled: false,
+                ..AccountRow::default()
+            },
+        ];
+        let snapshot = json!({
+            "dashboard": {"accounts": [
+                {"file_name": "one.json", "runtime": {
+                    "status": "cooldown",
+                    "cooldown_remaining_seconds": 42
+                }},
+                {"file_name": "two.json", "runtime": {"status": "disabled"}}
+            ]}
+        });
+
+        apply_account_runtime_status(&mut accounts, &snapshot);
+
+        assert!(accounts[0].cooldown);
+        assert_eq!(accounts[0].cooldown_remaining_seconds, Some(42));
+        assert!(!accounts[1].cooldown);
+        assert_eq!(
+            account_status(accounts[0].enabled, accounts[0].cooldown),
+            AccountStatus::Cooldown
+        );
+        assert_eq!(
+            account_status(accounts[1].enabled, accounts[1].cooldown),
+            AccountStatus::Disabled
+        );
+    }
+
+    #[test]
+    fn account_details_collects_reset_credits_and_models_from_quota_snapshot() {
+        let account = AccountRow {
+            provider: "codex".to_string(),
+            key: "account@example.com".to_string(),
+            account_id: "account@example.com".to_string(),
+            enabled: true,
+            ..AccountRow::default()
+        };
+        let snapshot = json!({
+            "quotas": {"codex": {"accounts": [{
+                "account_id": "account@example.com",
+                "rate_limit_reset_credits": {
+                    "available_count": 2,
+                    "credits": [{"title": "Weekly reset", "expires_at": "tomorrow"}]
+                },
+                "models": [{"model_id": "gpt-test", "display_name": "Test model"}]
+            }]}}
+        });
+        let values = account_snapshot_values(&snapshot, &account);
+
+        assert_eq!(reset_credit_details(&values).unwrap().0, 2);
+        assert_eq!(
+            reset_credit_details(&values).unwrap().1,
+            vec!["Weekly reset; expires tomorrow"]
+        );
+        assert_eq!(snapshot_model_names(&values), vec!["Test model"]);
+    }
+
+    #[test]
+    fn account_attention_matches_web_thresholds_and_expiry() {
+        let mut accounts = vec![AccountRow {
+            provider: "codex".to_string(),
+            key: "one.json".to_string(),
+            file_name: "one.json".to_string(),
+            enabled: true,
+            errors: 2,
+            last_error_at: "2026-01-01T00:00:00Z".to_string(),
+            last_success_at: "2026-02-01T00:00:00Z".to_string(),
+            ..AccountRow::default()
+        }];
+        let snapshot = json!({
+            "dashboard": {"accounts": [{
+                "file_name": "one.json",
+                "expired_at": "2000-01-01T00:00:00Z"
+            }]}
+        });
+        let quotas = vec![QuotaRow {
+            provider: "codex".to_string(),
+            account_key: "one.json".to_string(),
+            account_label: "one.json".to_string(),
+            used_percent_value: Some(80.0),
+            ..QuotaRow::default()
+        }];
+
+        apply_account_attention(&mut accounts, &snapshot, &quotas);
+
+        assert_eq!(
+            accounts[0].attention_reasons,
+            vec!["expired tokens", "near quota"]
+        );
+        assert!(!accounts[0]
+            .attention_reasons
+            .iter()
+            .any(|reason| reason == "errors"));
+    }
+
+    #[test]
+    fn notification_rows_mirror_web_settings_and_keep_watch_state() {
+        let settings = json!({
+            "ok": true,
+            "settings": {
+                "enabled": true,
+                "channel": "google_chat",
+                "telegram": {"bot_token_configured": false, "chat_id": ""},
+                "google_chat": {"webhook_configured": true},
+                "watched_accounts": ["gemini:two"],
+                "accounts": [
+                    {"provider":"gemini", "provider_label":"Gemini", "key":"gemini:two", "label":"Two", "enabled":false},
+                    {"provider":"codex", "provider_label":"Codex", "key":"codex:one", "label":"One", "account_id":"one@example.com", "enabled":true}
+                ]
+            }
+        });
+
+        let rows = notification_account_rows(&settings);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.provider.as_str())
+                .collect::<Vec<_>>(),
+            vec!["codex", "gemini"]
+        );
+        assert!(!rows[0].watched);
+        assert!(rows[1].watched);
+        assert!(!rows[1].enabled);
+        assert_eq!(
+            notification_channel(notification_settings_value(&settings)),
+            "google_chat"
+        );
+        assert_eq!(
+            notification_settings_update_body(
+                true,
+                "telegram".to_string(),
+                vec!["codex:one".to_string()]
+            ),
+            json!({"enabled":true,"channel":"telegram","watched_accounts":["codex:one"]})
+        );
+    }
+
+    #[test]
+    fn command_modal_keymaps_follow_the_active_section() {
+        let mut app =
+            TuiApp::new(GatewayClient::new("http://127.0.0.1:1".to_string()).unwrap()).unwrap();
+
+        let keys = |app: &TuiApp| {
+            command_modal_rows(app)
+                .into_iter()
+                .map(|(key, _)| key)
+                .filter(|key| !key.is_empty())
+                .collect::<Vec<_>>()
+        };
+
+        app.overview_section = OverviewSection::AccountUsage;
+        let account_usage = keys(&app);
+        assert!(account_usage.iter().any(|key| key == "Ctrl+j/k/Enter"));
+        assert!(account_usage.iter().any(|key| key == "x"));
+        assert!(account_usage.iter().any(|key| key == "n"));
+
+        app.overview_section = OverviewSection::CustomModels;
+        let models = keys(&app);
+        assert!(models.iter().any(|key| key == "e"));
+        assert!(models.iter().any(|key| key == "x"));
+        assert!(!models.iter().any(|key| key == "Ctrl+j/k/Enter"));
+
+        app.tab = Tab::Keys;
+        let api_keys = keys(&app);
+        assert!(api_keys.iter().any(|key| key == "n"));
+        assert!(api_keys.iter().any(|key| key == "Enter"));
+        assert!(!api_keys.iter().any(|key| key == "c"));
+
+        app.tab = Tab::Notifications;
+        let notifications = keys(&app);
+        assert!(notifications.iter().any(|key| key == "a/u"));
+        assert!(notifications.iter().any(|key| key == "s"));
+        assert!(!notifications.iter().any(|key| key == "n"));
+    }
+
+    #[test]
+    fn quota_rows_keep_web_labels_text_and_duplicate_limits_distinct() {
+        let codex = quota_rows_from_provider(
+            "codex",
+            &json!({"accounts": [{
+                "label": "Ada",
+                "code_generation": {
+                    "five_hour": {"used_percent": 12.5, "reset_label": "2h"},
+                    "weekly": {"used_percent": 31.0, "reset_label": "4d"}
+                },
+                "code_review": {"five_hour": {"used_percent": 4.0}}
+            }]}),
+        );
+        let labels = codex
+            .iter()
+            .map(|row| row.limit_label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec!["Code Gen 5h", "Code Gen Weekly", "Code Review 5h"]
+        );
+        assert_eq!(codex[0].detail_text, "12.5% 2h");
+
+        let qwen = quota_rows_from_provider(
+            "qwen",
+            &json!({"accounts": [{
+                "label": "Qwen",
+                "limits": [
+                    {"label": "Requests", "used_text": "10", "limit_text": "100", "reset_label": "in 1h"},
+                    {"label": "Requests", "used_text": "20", "limit_text": "200", "reset_label": "in 2h"}
+                ]
+            }]}),
+        );
+        assert_eq!(qwen[0].detail_text, "10/100 in 1h");
+        assert_eq!(
+            qwen.iter()
+                .map(|row| row.limit_label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Requests", "Requests (2)"]
+        );
+
+        let gemini = quota_rows_from_provider(
+            "gemini",
+            &json!({"accounts": [{
+                "label": "Gemini",
+                "models": [
+                    {"model_id": "gemini-2.5-flash", "display_name": "gemini-2.5-flash", "current": {"used_percent": 55.0}},
+                    {"model_id": "gemini-2.5-pro", "display_name": "gemini-2.5-pro", "current": {"used_percent": 25.0}}
+                ]
+            }]}),
+        );
+        assert!(gemini.iter().any(|row| row.limit_label == "Gemini Flash"));
+        assert!(gemini
+            .iter()
+            .any(|row| { row.limit_label == "gemini-2.5-flash" && !row.overview }));
+    }
+
+    #[test]
+    fn grok_quota_rows_include_each_kind_from_the_live_snapshot() {
+        let rows = quota_rows_from_provider(
+            "grok",
+            &json!({
+                "account": {"label": "Grok", "file_name": "grok.json"},
+                "kinds": {
+                    "DEFAULT_TEXT": {"rate_limits": {
+                        "requests": {"remaining": 8, "limit": 10},
+                        "tokens": {"remaining": 900, "limit": 1000}
+                    }},
+                    "DEFAULT_IMAGE": {"rate_limits": {
+                        "requests": {"remaining": 2, "limit": 4}
+                    }}
+                }
+            }),
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.limit_label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Text requests", "Text tokens", "Image requests"]
+        );
+        assert_eq!(rows[0].detail_text, "8/10 (no reset info)");
+    }
+
+    #[test]
+    fn account_reorder_keymap_accepts_control_key_variants() {
+        let control = KeyModifiers::CONTROL;
+        assert_eq!(
+            account_reorder_delta(KeyEvent::new(KeyCode::Up, control)),
+            None
+        );
+        assert_eq!(
+            account_reorder_delta(KeyEvent::new(KeyCode::Down, control)),
+            None
+        );
+        assert_eq!(
+            account_reorder_delta(KeyEvent::new(KeyCode::Char('k'), control)),
+            Some(-1)
+        );
+        assert_eq!(
+            account_reorder_delta(KeyEvent::new(KeyCode::Char('K'), control)),
+            Some(-1)
+        );
+        assert_eq!(
+            account_reorder_delta(KeyEvent::new(KeyCode::Char('j'), control)),
+            Some(1)
+        );
+        assert_eq!(
+            account_reorder_delta(KeyEvent::new(KeyCode::Char('J'), control)),
+            Some(1)
+        );
+        assert_eq!(
+            account_reorder_delta(KeyEvent::new(KeyCode::Enter, control)),
+            Some(1)
+        );
+        assert_eq!(
+            account_reorder_delta(KeyEvent::new(KeyCode::Char('\u{0b}'), KeyModifiers::NONE)),
+            Some(-1)
+        );
+        assert_eq!(
+            account_reorder_delta(KeyEvent::new(KeyCode::Char('\u{0a}'), KeyModifiers::NONE)),
+            Some(1)
+        );
+        assert_eq!(
+            account_reorder_delta(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            account_reorder_delta(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            provider_reorder_delta(KeyEvent::new(KeyCode::Up, control)),
+            Some(-1)
+        );
+        assert_eq!(
+            provider_reorder_delta(KeyEvent::new(KeyCode::Down, control)),
+            Some(1)
+        );
+        assert_eq!(
+            provider_reorder_delta(KeyEvent::new(KeyCode::Char('j'), control)),
+            None
+        );
+        assert_eq!(
+            provider_reorder_delta(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn overview_account_usage_navigation_moves_by_account_in_all_limits_mode() {
+        let mut app =
+            TuiApp::new(GatewayClient::new("http://127.0.0.1:1".to_string()).unwrap()).unwrap();
+        app.overview_section = OverviewSection::AccountUsage;
+        app.limit_display_mode = LimitDisplayMode::AllPerAccount;
+        app.data.accounts = vec![
+            AccountRow {
+                provider: "codex".to_string(),
+                key: "one".to_string(),
+                label: "One".to_string(),
+                enabled: true,
+                ..AccountRow::default()
+            },
+            AccountRow {
+                provider: "codex".to_string(),
+                key: "two".to_string(),
+                label: "Two".to_string(),
+                enabled: true,
+                ..AccountRow::default()
+            },
+        ];
+        app.data.quotas = vec![
+            QuotaRow {
+                provider: "codex".to_string(),
+                account_key: "one".to_string(),
+                limit_label: "5h".to_string(),
+                used_percent_value: Some(20.0),
+                ..QuotaRow::default()
+            },
+            QuotaRow {
+                provider: "codex".to_string(),
+                account_key: "one".to_string(),
+                limit_label: "weekly".to_string(),
+                used_percent_value: Some(30.0),
+                ..QuotaRow::default()
+            },
+            QuotaRow {
+                provider: "codex".to_string(),
+                account_key: "two".to_string(),
+                limit_label: "5h".to_string(),
+                used_percent_value: Some(40.0),
+                ..QuotaRow::default()
+            },
+        ];
+
+        assert_eq!(
+            overview_account_usage_groups(&app)
+                .iter()
+                .map(|group| group.accounts.len())
+                .sum::<usize>(),
+            3
+        );
+        assert_eq!(overview_account_usage_account_count(&app), 2);
+        app.move_selection(1);
+        assert_eq!(app.overview_account_selected, 1);
+        assert_eq!(
+            selected_overview_usage_row(&app).unwrap().account_label,
+            "Two"
+        );
+        app.move_selection(-1);
+        assert_eq!(app.overview_account_selected, 0);
+        assert_eq!(
+            selected_overview_usage_row(&app).unwrap().account_label,
+            "One"
+        );
+        app.move_selected_usage_account(1);
+        assert_eq!(app.overview_account_selected, 1);
+        assert_eq!(
+            overview_account_usage_account_rows(&app)
+                .into_iter()
+                .map(|row| row.account_label)
+                .collect::<Vec<_>>(),
+            vec!["Two", "One"]
+        );
+        assert_eq!(
+            selected_overview_usage_row(&app).unwrap().account_label,
+            "One"
+        );
+        app.move_selected_usage_account(-1);
+        assert_eq!(app.overview_account_selected, 0);
+        assert_eq!(
+            overview_account_usage_account_rows(&app)
+                .into_iter()
+                .map(|row| row.account_label)
+                .collect::<Vec<_>>(),
+            vec!["One", "Two"]
+        );
+    }
+
+    #[test]
+    fn overview_account_usage_provider_reordering_preserves_account_selection() {
+        let mut app =
+            TuiApp::new(GatewayClient::new("http://127.0.0.1:1".to_string()).unwrap()).unwrap();
+        app.overview_section = OverviewSection::AccountUsage;
+        app.account_orders.clear();
+        app.provider_order.clear();
+        app.data.accounts = vec![
+            AccountRow {
+                provider: "codex".to_string(),
+                key: "codex-account".to_string(),
+                label: "Codex account".to_string(),
+                enabled: true,
+                ..AccountRow::default()
+            },
+            AccountRow {
+                provider: "claude".to_string(),
+                key: "claude-account".to_string(),
+                label: "Claude account".to_string(),
+                enabled: true,
+                ..AccountRow::default()
+            },
+            AccountRow {
+                provider: "gemini".to_string(),
+                key: "gemini-account".to_string(),
+                label: "Gemini account".to_string(),
+                enabled: true,
+                ..AccountRow::default()
+            },
+        ];
+
+        app.move_selected_usage_provider(1);
+        assert_eq!(
+            overview_account_usage_groups(&app)
+                .into_iter()
+                .map(|group| group.provider)
+                .collect::<Vec<_>>(),
+            vec!["claude", "codex", "gemini"]
+        );
+        assert_eq!(
+            selected_overview_usage_row(&app).unwrap().account_label,
+            "Codex account"
+        );
+        assert_eq!(app.overview_account_selected, 1);
+
+        app.move_selected_usage_provider(1);
+        assert_eq!(
+            overview_account_usage_groups(&app)
+                .into_iter()
+                .map(|group| group.provider)
+                .collect::<Vec<_>>(),
+            vec!["claude", "gemini", "codex"]
+        );
+        app.move_selected_usage_provider(-1);
+        assert_eq!(
+            overview_account_usage_groups(&app)
+                .into_iter()
+                .map(|group| group.provider)
+                .collect::<Vec<_>>(),
+            vec!["claude", "codex", "gemini"]
+        );
+    }
 
     #[test]
     fn renewable_quota_cli_accepts_create_update_and_balance_commands() {
