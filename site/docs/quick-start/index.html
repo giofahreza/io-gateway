@@ -134,6 +134,11 @@
                 <small>Validate upstream routes in operator-bypass mode or against a selected managed-key policy.</small>
               </a>
 
+              <a href="/docs/terminal-ui/" data-title="Terminal UI and animated themes" data-category="How-to guides" data-summary="Preview the normal TUI and three animated themes, install only what you need, and manage a local or remote gateway." data-keywords="iogw tui terminal install animated plugin pixel cafe office station cat preview screenshot F4 quota remote ssh cpu gpu memory disk network login">
+                <span>Terminal UI and animated themes</span>
+                <small>Preview the normal TUI and three animated themes, install only what you need, and manage a local or remote gateway.</small>
+              </a>
+
               <a href="/docs/usage-and-quota/" data-title="Usage and quota" data-category="Reference" data-summary="Read usage history, context-token charts, account health, provider quota, and useful admin endpoints." data-keywords="usage quota history context tokens account health endpoints dashboard json account-routing">
                 <span>Usage and quota</span>
                 <small>Read usage history, context-token charts, account health, provider quota, and useful admin endpoints.</small>
@@ -165,7 +170,7 @@
           <div class="docs-heading">
             <p class="eyebrow">Tutorials</p>
             <h1>Quick start</h1>
-            <dl class="docs-meta"><div><dt>Use when</dt><dd>New local, desktop, and server installs</dd></div><div><dt>Updated</dt><dd>September 2, 2026</dd></div></dl>
+            <dl class="docs-meta"><div><dt>Use when</dt><dd>New local, desktop, and server installs</dd></div><div><dt>Updated</dt><dd>November 17, 2026</dd></div></dl>
           </div>
 
       <p class="docs-lead">Install a published IO Gateway release or build it from source, then open the operator dashboard, add upstream credentials, and verify that a model request reaches a provider account.</p>
@@ -201,7 +206,7 @@
       <ul class="docs-list">
         <li><strong>Installs per user</strong> No <code>sudo</code> or Administrator prompt is needed by default.</li>
         <li><strong>Choose a local port</strong> The first question chooses a TCP port from 1 through 65535 (default <code>8319</code>). The installer preflights <code>127.0.0.1:&lt;port&gt;</code>: an occupied interactive choice is asked again, while an explicit or unattended occupied port fails before a new config is created. The generated config stays localhost-only, creates <code>auths/</code>, and generates a private client API key.</li>
-        <li><strong>Choose the terminal client</strong> Decide whether to install the optional <code>iogw</code> management client and TUI beside the gateway binary.</li>
+        <li><strong>Choose the terminal client</strong> Decide whether to install the optional <code>iogw</code> management client and TUI beside the gateway binary. It opens the normal UI without any theme download. See the <a class="docs-inline-link" href="/docs/terminal-ui/">terminal previews and installation guide</a> to add optional animated themes later.</li>
         <li><strong>Choose autostart at sign-in</strong> Enable a systemd user service on Linux, a LaunchAgent on macOS, or a per-user Scheduled Task on Windows. This is a persistent next-sign-in choice, not an immediate launch.</li>
         <li><strong>Choose whether to start now</strong> Start the gateway immediately after installation, independently of autostart. Choose this for a one-off local background process even when sign-in autostart is off, or decline it while enabling the next-sign-in service.</li>
       </ul>
@@ -227,13 +232,19 @@ bash -c 'set -o pipefail; curl -fsSL https://github.com/giofahreza/io-gateway/re
 curl http://127.0.0.1:8319/health
 curl http://127.0.0.1:8319/ready</code></pre>
       <p>After the health checks pass, use <a class="docs-inline-link" href="/docs/test-api/">Test API</a> from the dashboard to send a short prompt through one model route.</p>
-      <h2>Build from source</h2>
+      <h2 id="build-from-source">Build from source</h2>
       <p>For development or an unsupported platform, work from a repository checkout with Rust installed.</p>
       <pre><code>cargo build --release
 cp config.example.json config.json
 # Edit config.json before exposing the gateway.
 ./target/release/io-gateway --config ./config.json</code></pre>
       <p><code>--config PATH</code> takes precedence over <code>IO_GATEWAY_CONFIG</code>. When a selected configuration uses a relative <code>auth_dir</code>, IO Gateway resolves it from that configuration file's directory rather than the current working directory.</p>
+      <p>For development, check formatting, run the tests, and build with the committed lockfile:</p>
+      <pre><code>cargo fmt --check
+cargo test --locked
+cargo build --release --locked</code></pre>
+      <p>On Linux or macOS, test terminal responsiveness against a local mock gateway without using production credentials:</p>
+      <pre><code>python3 scripts/test-iogw-performance.py --binary target/release/iogw</code></pre>
       <h2>Next steps</h2>
       <ul class="docs-list">
         <li><strong>Secure dashboard access</strong> Configure admin auth before exposing the service.</li>
@@ -245,7 +256,8 @@ cp config.example.json config.json
           <section class="docs-related" aria-labelledby="continue-the-route">
             <h2 id="continue-the-route">Continue the route</h2>
             <ul class="docs-link-list">
-              <li><a href="/docs/configuration/">Configuration</a> - Core config.json fields, environment overrides, dashboard auth, proxy safety, and optional Codex App Server reset-credit profiles.</li>
+              <li><a href="/docs/terminal-ui/">Terminal UI and animated themes</a> - Preview the normal TUI and three animated themes, install only what you need, and manage a local or remote gateway.</li>
+<li><a href="/docs/configuration/">Configuration</a> - Core config.json fields, environment overrides, dashboard auth, proxy safety, and optional Codex App Server reset-credit profiles.</li>
 <li><a href="/docs/provider-accounts/">Provider accounts</a> - Add, enable, refresh, re-auth, and test upstream provider accounts.</li>
 <li><a href="/docs/test-api/">Test API</a> - Validate upstream routes in operator-bypass mode or against a selected managed-key policy.</li>
             </ul>

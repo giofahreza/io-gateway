@@ -134,6 +134,11 @@
                 <small>Validate upstream routes in operator-bypass mode or against a selected managed-key policy.</small>
               </a>
 
+              <a href="/docs/terminal-ui/" data-title="Terminal UI and animated themes" data-category="How-to guides" data-summary="Preview the normal TUI and three animated themes, install only what you need, and manage a local or remote gateway." data-keywords="iogw tui terminal install animated plugin pixel cafe office station cat preview screenshot F4 quota remote ssh cpu gpu memory disk network login">
+                <span>Terminal UI and animated themes</span>
+                <small>Preview the normal TUI and three animated themes, install only what you need, and manage a local or remote gateway.</small>
+              </a>
+
               <a href="/docs/usage-and-quota/" data-title="Usage and quota" data-category="Reference" data-summary="Read usage history, context-token charts, account health, provider quota, and useful admin endpoints." data-keywords="usage quota history context tokens account health endpoints dashboard json account-routing">
                 <span>Usage and quota</span>
                 <small>Read usage history, context-token charts, account health, provider quota, and useful admin endpoints.</small>
@@ -165,7 +170,7 @@
           <div class="docs-heading">
             <p class="eyebrow">Operations</p>
             <h1>Deployment</h1>
-            <dl class="docs-meta"><div><dt>Use when</dt><dd>GitHub tag releases, production deployment, and GitHub Pages</dd></div><div><dt>Updated</dt><dd>September 1, 2026</dd></div></dl>
+            <dl class="docs-meta"><div><dt>Use when</dt><dd>GitHub tag releases, production deployment, and GitHub Pages</dd></div><div><dt>Updated</dt><dd>November 17, 2026</dd></div></dl>
           </div>
 
       <p class="docs-lead">A version tag builds native release archives, verifies the application build, publishes downloadable assets and installers to GitHub Releases, and deploys the Linux production binary when application code changed. Static product pages deploy separately.</p>
@@ -185,7 +190,7 @@
         <tr><td>Windows x86_64</td><td><code>io-gateway-&lt;tag&gt;-windows-x86_64.zip</code></td></tr>
         <tr><td>Windows ARM64</td><td><code>io-gateway-&lt;tag&gt;-windows-aarch64.zip</code></td></tr>
       </tbody></table></div>
-      <p>Every release also includes <code>SHA256SUMS</code>, <code>install.sh</code>, and <code>install.ps1</code>. The checksum file covers every archive and both installers. Each archive contains <code>io-gateway</code>, <code>iogw</code>, and <code>config.example.json</code> (with <code>.exe</code> names on Windows).</p>
+      <p>Every release also includes <code>SHA256SUMS</code>, <code>install.sh</code>, and <code>install.ps1</code>. Each archive contains <code>io-gateway</code>, <code>iogw</code>, and <code>config.example.json</code> (with <code>.exe</code> names on Windows). The current release workflow additionally publishes <code>iogw-pixel-cafe.json</code>, <code>iogw-pixel-office.json</code>, and <code>iogw-pixel-station.json</code> as optional assets, outside the binary archives. <code>SHA256SUMS</code> covers the archives, installers, and scene packs. Older releases may lack the packs; see the <a class="docs-inline-link" href="/docs/terminal-ui/">terminal installation guide</a> before downloading.</p>
       <p>The installer URLs use GitHub’s <code>releases/latest/download/</code> endpoint. They become available after a version tag has completed the release workflow successfully.</p>
       <h2>Tag release flow</h2>
       <ol class="docs-steps">

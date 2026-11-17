@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-09-04",
+  "generatedAt": "2026-11-17",
   "docsVersion": "v0.1.11+",
   "pages": [
     {
@@ -35,6 +35,33 @@
         "Next steps"
       ],
       "excerpt": "Install a published IO Gateway release or build it from source, then open the operator dashboard, add upstream credentials, and verify that a model request reaches a provider account. The dashboard is the first place to verify that the gateway sees accounts, quota, and routes. Choose an install path Published release Recommended for a desktop or server. It d"
+    },
+    {
+      "title": "Terminal UI and animated themes",
+      "category": "How-to guides",
+      "type": "How-to guide",
+      "summary": "Preview the normal TUI and three animated themes, install only what you need, and manage a local or remote gateway.",
+      "href": "/docs/terminal-ui/",
+      "keywords": "iogw tui terminal install animated plugin pixel cafe office station cat preview screenshot F4 quota remote ssh cpu gpu memory disk network login",
+      "headings": [
+        "What the terminal looks like",
+        "Normal management UI",
+        "Pixel Café",
+        "Pixel Office",
+        "Pixel Station",
+        "Install without animation",
+        "Add optional animated themes",
+        "Build the current source",
+        "Use only the TUI with a remote gateway",
+        "Keyboard controls",
+        "Read the scene accurately",
+        "Data refresh and quota details",
+        "Local hardware measurements",
+        "Terminal support and reduced motion",
+        "Update, remove, or troubleshoot packs",
+        "Scene pack format and artwork"
+      ],
+      "excerpt": "One terminal client, two ways to see your gateway. Use the normal management UI on its own, or add separately downloaded scene packs for a Café, Office, or Station overview. Accounts, authentication, and management actions are shared. Choose downloads, not another application The standard iogw binary includes the lightweight renderer, but not the optional ar"
     },
     {
       "title": "First client request",

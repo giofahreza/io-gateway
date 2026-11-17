@@ -23,6 +23,10 @@ const docsFigureDimensions = {
   "docs-provider-accounts.png": [947, 366],
   "docs-test-api.png": [720, 741],
   "docs-usage-quota.png": [1412, 367],
+  "iogw-tui.png": [1518, 672],
+  "iogw-pixel-cafe.png": [1518, 672],
+  "iogw-pixel-office.png": [1518, 672],
+  "iogw-pixel-station.png": [1518, 672],
 };
 
 const pages = [
@@ -33,11 +37,11 @@ const pages = [
     type: "Tutorial",
     appliesTo: "New local, desktop, and server installs",
     introduced: docsVersion,
-    updated: "September 2, 2026",
+    updated: "November 17, 2026",
     categories: ["Tutorials", "Configuration"],
     keywords: "setup install local run build config dashboard test api health ready first run",
     summary: "Build, configure, run, and smoke-test IO Gateway for the first time.",
-    seeAlso: ["configuration", "provider-accounts", "test-api"],
+    seeAlso: ["terminal-ui", "configuration", "provider-accounts", "test-api"],
     body: `
       <p class="docs-lead">Install a published IO Gateway release or build it from source, then open the operator dashboard, add upstream credentials, and verify that a model request reaches a provider account.</p>
       ${docsFigure("docs-dashboard-overview.png", "IO Gateway dashboard populated with usage totals, context chart, custom routes, and provider account cards.", "The dashboard is the first place to verify that the gateway sees accounts, quota, and routes.")}
@@ -66,7 +70,7 @@ const pages = [
       <ul class="docs-list">
         <li><strong>Installs per user</strong> No <code>sudo</code> or Administrator prompt is needed by default.</li>
         <li><strong>Choose a local port</strong> The first question chooses a TCP port from 1 through 65535 (default <code>8319</code>). The installer preflights <code>127.0.0.1:&lt;port&gt;</code>: an occupied interactive choice is asked again, while an explicit or unattended occupied port fails before a new config is created. The generated config stays localhost-only, creates <code>auths/</code>, and generates a private client API key.</li>
-        <li><strong>Choose the terminal client</strong> Decide whether to install the optional <code>iogw</code> management client and TUI beside the gateway binary.</li>
+        <li><strong>Choose the terminal client</strong> Decide whether to install the optional <code>iogw</code> management client and TUI beside the gateway binary. It opens the normal UI without any theme download. See the <a class="docs-inline-link" href="/docs/terminal-ui/">terminal previews and installation guide</a> to add optional animated themes later.</li>
         <li><strong>Choose autostart at sign-in</strong> Enable a systemd user service on Linux, a LaunchAgent on macOS, or a per-user Scheduled Task on Windows. This is a persistent next-sign-in choice, not an immediate launch.</li>
         <li><strong>Choose whether to start now</strong> Start the gateway immediately after installation, independently of autostart. Choose this for a one-off local background process even when sign-in autostart is off, or decline it while enabling the next-sign-in service.</li>
       </ul>
@@ -92,19 +96,148 @@ bash -c 'set -o pipefail; curl -fsSL https://github.com/giofahreza/io-gateway/re
 curl http://127.0.0.1:8319/health
 curl http://127.0.0.1:8319/ready</code></pre>
       <p>After the health checks pass, use <a class="docs-inline-link" href="/docs/test-api/">Test API</a> from the dashboard to send a short prompt through one model route.</p>
-      <h2>Build from source</h2>
+      <h2 id="build-from-source">Build from source</h2>
       <p>For development or an unsupported platform, work from a repository checkout with Rust installed.</p>
       <pre><code>cargo build --release
 cp config.example.json config.json
 # Edit config.json before exposing the gateway.
 ./target/release/io-gateway --config ./config.json</code></pre>
       <p><code>--config PATH</code> takes precedence over <code>IO_GATEWAY_CONFIG</code>. When a selected configuration uses a relative <code>auth_dir</code>, IO Gateway resolves it from that configuration file's directory rather than the current working directory.</p>
+      <p>For development, check formatting, run the tests, and build with the committed lockfile:</p>
+      <pre><code>cargo fmt --check
+cargo test --locked
+cargo build --release --locked</code></pre>
+      <p>On Linux or macOS, test terminal responsiveness against a local mock gateway without using production credentials:</p>
+      <pre><code>python3 scripts/test-iogw-performance.py --binary target/release/iogw</code></pre>
       <h2>Next steps</h2>
       <ul class="docs-list">
         <li><strong>Secure dashboard access</strong> Configure admin auth before exposing the service.</li>
         <li><strong>Create managed API keys</strong> Replace broad shared-key access with provider/account scopes, per-request input caps, and optional input-token budgets.</li>
         <li><strong>Plan routing</strong> Use priority routing or custom models when traffic should prefer specific accounts.</li>
       </ul>
+    `,
+  },
+  {
+    slug: "terminal-ui",
+    title: "Terminal UI and animated themes",
+    group: "How-to guides",
+    type: "How-to guide",
+    appliesTo: "Local or remote gateway management with iogw",
+    introduced: "Current source; animated packs require a compatible release",
+    updated: "November 17, 2026",
+    categories: ["How-to guides", "Accounts", "Limits", "Deployment"],
+    keywords: "iogw tui terminal install animated plugin pixel cafe office station cat preview screenshot F4 quota remote ssh cpu gpu memory disk network login",
+    summary: "Preview the normal TUI and three animated themes, install only what you need, and manage a local or remote gateway.",
+    seeAlso: ["quick-start", "provider-accounts", "usage-and-quota", "deployment", "troubleshooting"],
+    body: `
+      <p class="docs-lead">One terminal client, two ways to see your gateway. Use the normal management UI on its own, or add separately downloaded scene packs for a Café, Office, or Station overview. Accounts, authentication, and management actions are shared.</p>
+      <div class="docs-note"><strong>Choose downloads, not another application</strong><p>The standard <code>iogw</code> binary includes the lightweight renderer, but not the optional artwork or an extra runtime. There is no separate animated executable or installer. The normal UI always opens first, even with packs installed.</p></div>
+      <h2>What the terminal looks like</h2>
+      <p>These static screenshots were captured from the actual current-source TUI against a local test gateway with demo accounts. They contain no production account credentials. Open the full-size images to inspect the terminal text: <a class="docs-inline-link" href="/assets/iogw-tui.png">Normal</a>, <a class="docs-inline-link" href="/assets/iogw-pixel-cafe.png">Café</a>, <a class="docs-inline-link" href="/assets/iogw-pixel-office.png">Office</a>, <a class="docs-inline-link" href="/assets/iogw-pixel-station.png">Station</a>.</p>
+      <h3>Normal management UI</h3>
+      ${docsFigure("iogw-tui.png", "Normal iogw terminal UI showing usage totals, custom models, and provider account quotas with demo accounts.", "The default UI keeps metrics, model aliases, and account usage in dense keyboard-driven panels. No theme pack is needed.")}
+      <h3>Pixel Café</h3>
+      ${docsFigure("iogw-pixel-cafe.png", "Pixel Café terminal overview with cats, account quota bubbles, a local machine rack, and a gateway statistics TV.", "A warm café with rain, coffee tools, provider-colored account cats, following quota bubbles, and a wall-mounted Machine cabinet.")}
+      <h3>Pixel Office</h3>
+      ${docsFigure("iogw-pixel-office.png", "Pixel Office terminal overview with account cats, desks, monitors, plants, and the same account bubbles.", "A cool-toned office arrangement with the same real data, login, and account controls.")}
+      <h3>Pixel Station</h3>
+      ${docsFigure("iogw-pixel-station.png", "Pixel Station terminal overview with a train, canopy, lanterns, a service cabinet, bench, and account cats.", "A warm railway platform with an arriving/departing train, drifting leaves, and the café's articulated cat rig. Motion is decorative, not request activity.")}
+      <h2>Install without animation</h2>
+      <p>Install the gateway and explicitly include its terminal client. The installers select the native archive and verify its checksum. Rust, Docker, and administrator access are not required for a published release.</p>
+      <p><strong>Linux and macOS</strong></p>
+      <pre><code>bash -c 'set -o pipefail; curl -fsSL https://github.com/giofahreza/io-gateway/releases/latest/download/install.sh | sh -s -- --with-iogw'</code></pre>
+      <p><strong>Windows PowerShell</strong></p>
+      <pre><code>Invoke-WebRequest https://github.com/giofahreza/io-gateway/releases/latest/download/install.ps1 -OutFile ./install.ps1
+&amp; .\\install.ps1 -InstallIogw</code></pre>
+      <p>The installer also installs the gateway. Follow its prompts for port, autostart, and start-now choices. If it added the binary directory to <code>PATH</code>, reopen your terminal. Then launch the normal UI:</p>
+      <pre><code>iogw
+# Explicit equivalent:
+iogw tui</code></pre>
+      <p>Do not use <code>--without-iogw</code> for a non-animated TUI: that flag skips the terminal client entirely and installs only the gateway. You do not need to install or remove any themes to use the normal UI.</p>
+      <h2>Add optional animated themes</h2>
+      <div class="docs-note warning"><strong>Check release availability first</strong><p>Use a release whose Assets list the theme JSON files and whose <code>iogw</code> supports <code>plugins</code>. Older releases such as <code>v0.1.20</code> do not include these packs. The screenshots show the current source build, not a promise that a compatible release has been published. If the assets are missing, use the source-build path below.</p></div>
+      <ol class="docs-steps">
+        <li><span>1</span><div><strong>Choose the same release as your binary.</strong><p>Open <a class="docs-inline-link" href="https://github.com/giofahreza/io-gateway/releases">GitHub Releases</a>. If upgrading, install that release's binary too; a JSON file alone cannot add a layout to an older host.</p></div></li>
+        <li><span>2</span><div><strong>Download only the scenes you want.</strong><p>Choose <code>iogw-pixel-cafe.json</code>, <code>iogw-pixel-office.json</code>, and/or <code>iogw-pixel-station.json</code>. Also download <code>SHA256SUMS</code> from that same release. Each scene is a small architecture-independent JSON file, not a second installer.</p></div></li>
+        <li><span>3</span><div><strong>Check the SHA-256.</strong><p>Compare the file's hash with its exact filename in <code>SHA256SUMS</code>. Use <code>sha256sum iogw-pixel-cafe.json</code> on Linux, <code>shasum -a 256 iogw-pixel-cafe.json</code> on macOS, or <code>Get-FileHash ./iogw-pixel-cafe.json -Algorithm SHA256</code> in PowerShell. Repeat for each downloaded pack.</p></div></li>
+        <li><span>4</span><div><strong>Install locally.</strong><p>Run the commands below from the directory containing the downloaded files. Each theme works independently; install one, two, or all three. Packs belong on the machine running <code>iogw</code>, not on a remote gateway.</p></div></li>
+      </ol>
+      <pre><code>iogw plugins install ./iogw-pixel-cafe.json
+# Optional additional scenes:
+iogw plugins install ./iogw-pixel-office.json
+iogw plugins install ./iogw-pixel-station.json
+iogw plugins list
+iogw</code></pre>
+      <p>Press <kbd>F4</kbd> or <kbd>Ctrl+V</kbd> to switch to the animated Overview. Press <kbd>t</kbd> to cycle installed themes; missing or invalid alternatives are skipped. Press <kbd>Esc</kbd> to return to the normal UI. Installing packs does not force animation at startup.</p>
+      <h2>Build the current source</h2>
+      <p>Use a repository checkout with Rust installed when the release you downloaded does not yet include animation. These commands build only the terminal client and install the source packs:</p>
+      <pre><code>cargo build --release --locked --bin iogw
+./target/release/iogw plugins install ./src/bin/iogw/plugins/pixel-cafe.json
+./target/release/iogw plugins install ./src/bin/iogw/plugins/pixel-office.json
+./target/release/iogw plugins install ./src/bin/iogw/plugins/pixel-station.json
+./target/release/iogw</code></pre>
+      <p>Start a local gateway separately using the <a class="docs-inline-link" href="/docs/quick-start/">quick start</a>, or pass <code>--base-url</code> to connect to an existing gateway. Windows source builds produce <code>target/release/iogw.exe</code>.</p>
+      <h2>Use only the TUI with a remote gateway</h2>
+      <p>There is no dedicated TUI-only release installer today. Download the matching platform archive, verify it against the release's <code>SHA256SUMS</code>, and extract only <code>iogw</code> (<code>iogw.exe</code> on Windows) to a directory on <code>PATH</code>. You do not need to start a local gateway:</p>
+      <pre><code>iogw --base-url https://your-gateway.example.com</code></pre>
+      <p>Use HTTPS for remote access. Configure gateway administrator authentication before exposing its listener. Press <kbd>o</kbd> when login is required; a gateway administrator key and TOTP are separate from client/proxy API keys. Do not put credentials in screenshots, command history, or shared terminal recordings.</p>
+      <h2>Keyboard controls</h2>
+      <div class="docs-table-wrap"><table class="docs-table"><thead><tr><th>Key</th><th>Action</th></tr></thead><tbody>
+        <tr><td><kbd>F4</kbd> / <kbd>Ctrl+V</kbd></td><td>Switch between normal and animated UI after installing a valid pack.</td></tr>
+        <tr><td><kbd>t</kbd></td><td>Cycle installed animated themes.</td></tr>
+        <tr><td><kbd>h</kbd> / <kbd>l</kbd>, <kbd>←</kbd> / <kbd>→</kbd></td><td>Select the previous/next cat in animation. Normal UI h/l keeps its usual section navigation.</td></tr>
+        <tr><td><kbd>j</kbd> / <kbd>k</kbd>, <kbd>↓</kbd> / <kbd>↑</kbd></td><td>Move through accounts; on the gold model cat, select a custom model.</td></tr>
+        <tr><td><kbd>Enter</kbd> / <kbd>?</kbd></td><td>Open full details / the context-sensitive Commands help.</td></tr>
+        <tr><td><kbd>b</kbd> / <kbd>Space</kbd></td><td>Toggle account bubbles / pause or resume scene motion. The login prompt stays visible.</td></tr>
+        <tr><td><kbd>r</kbd> / <kbd>R</kbd> / <kbd>Ctrl+R</kbd></td><td>Refresh the focused account / read all dashboard data / force fresh server quotas for all accounts.</td></tr>
+        <tr><td><kbd>Tab</kbd> / <kbd>Shift+Tab</kbd></td><td>Switch Overview, API Keys, and Notifications. Other tabs retain the normal management UI.</td></tr>
+        <tr><td><kbd>PageUp</kbd> / <kbd>PageDown</kbd>, <kbd>Home</kbd> / <kbd>End</kbd></td><td>Page through cats or select the first/last cat.</td></tr>
+        <tr><td><kbd>o</kbd> / <kbd>Esc</kbd> / <kbd>Ctrl+C</kbd></td><td>Log in / leave animation / exit the application.</td></tr>
+      </tbody></table></div>
+      <p>Ordinary account/model actions remain active: <code>n</code> adds an account; <code>e/d</code> enables/disables the focused item; <code>x</code> deletes with confirmation; <code>a</code> changes quota mode; <code>v/p/u</code> controls account/provider visibility. These can change gateway state, just as in the normal UI. Use <kbd>?</kbd> for the current context.</p>
+      <h2>Read the scene accurately</h2>
+      <ul class="docs-list">
+        <li><strong>Account cats</strong> Provider-colored cats represent real accounts. Bubbles show provider and status above the email, or the account name when email is unavailable. Quota percentages and compact reset countdowns use two rows normally and at most four with <code>a</code>; Enter shows original complete details.</li>
+        <li><strong>Gold model cat</strong> The leftmost cat lists custom model aliases, not an extra provider account.</li>
+        <li><strong>Gateway metrics</strong> The TV/board shows requests, tokens, accounts, error rate, and context traffic over 24 hours. Context traffic is not a model's context-window fullness.</li>
+        <li><strong>LOCAL machine</strong> CPU, GPU, RAM, disk, and network readings describe the machine running <code>iogw</code>, not a remote gateway. Hardware telemetry currently requires Linux; unsupported or inaccessible counters show <code>N/A</code>. History is not fabricated.</li>
+        <li><strong>Decorative motion</strong> Sleeping, jumping, rolling cats, rain, and trains do not prove an account is busy. Status text remains the source of truth. Empty gateways may show resident cats without account bubbles.</li>
+        <li><strong>Login feedback</strong> Every theme uses the same floating padlock and host cat. A key turns only during real login/session verification. Confirmed authentication opens the lock; failure stays locked with a retry cue and the actual error in the footer.</li>
+      </ul>
+      <h2>Data refresh and quota details</h2>
+      <p>Sections load independently in the background so navigation stays responsive. Visible usage refreshes every 5 seconds, accounts and quota snapshots every 15 seconds, charts every 30 seconds, and custom models every 60 seconds. Keys and notification settings normally load only while their tab is open and refresh every 30 seconds. Failed sections retain their last values; footer ages describe when the client received each section, not when a provider last measured its quota.</p>
+      <p><code>r</code> refreshes the focused Overview account; in other tabs it refreshes the current data. <code>R</code> reads all dashboard sections without forcing upstream quotas. <code>Ctrl+R</code> requests fresh server quotas for all accounts and reloads dashboard data; most terminals encode Ctrl+Shift+R identically. Repeated refreshes share outstanding requests. Focused account refresh requires a credential-file identity and never silently refreshes everyone instead. Grok quotas remain passive and header-derived: refresh does not make a paid probe request.</p>
+      <p>The gateway's quota endpoints and authenticated <code>/dashboard/snapshot.json</code> expose a <code>quota_summary</code> array of <code>{label, value}</code> fields when data is available. The Enter modal uses these allowlisted fields in both UIs, with a local projection for older gateways. They include reported limits, counts, percentages, balances, plans, and extra-usage metadata without credentials or raw response dumps. Updating only the terminal cannot recover data an older gateway discarded.</p>
+      <p>Bubble labels are shortened without dropping model versions, periods, or scopes: <code>Code Gen 5h</code> becomes <code>Gen 5h</code>, and MiniMax's <code>5h window</code> becomes <code>5h</code>. Reset countdowns use at most two time units, such as <code>1d2h</code> or <code>1h23m</code>. Unknown resets show a dash; missing quota is unavailable, never a fabricated zero. Overview buckets take priority over redundant model limits, but a more-used model limit is retained. Enter shows the complete details.</p>
+      <h3>Local hardware measurements</h3>
+      <p>Sampling runs off the drawing thread once per second, stops outside the animated Overview, and can continue while motion is paused. CPU, GPU, and RAM history bars use a fixed 0–100% scale with up to 120 real samples; unavailable samples leave gaps. Disk capacity describes the root filesystem, while read/write rates cover whole physical disks. Network rates describe one default-route interface, not a sum that double-counts bridges or VPNs. Rates require two samples.</p>
+      <p>Linux metrics use <code>/proc</code>, <code>/sys</code>, and filesystem counters. GPU readings support AMD/DRM, a timeout-bounded <code>nvidia-smi</code> query, and Intel i915/xe. Intel uses native performance counters when already permitted, otherwise accessible process DRM engine counters. An asterisk and <code>readable clients</code> identify that fallback: it may cover only part of the machine and differ from privileged btop. Shared Intel RAM is not presented as dedicated VRAM. No sudo, capability, or kernel-permission change is required or performed; unsupported platforms and inaccessible counters stay unavailable.</p>
+      <h2>Terminal support and reduced motion</h2>
+      <p>A true-color terminal with Unicode half-block characters gives the clearest result. No Kitty graphics protocol, Nerd Font, desktop application, or extra animation runtime is needed. Compact layouts prioritize readable data and may omit scenery. Scene motion is capped at 20 FPS; data polling continues when paused.</p>
+      <pre><code># Linux/macOS: enter animation with motion paused by default.
+IOGW_REDUCED_MOTION=1 iogw</code></pre>
+      <pre><code># Windows PowerShell:
+$env:IOGW_REDUCED_MOTION = "1"
+iogw</code></pre>
+      <p><kbd>Space</kbd> pauses or resumes motion during the session. A successful login confirmation still dismisses while paused.</p>
+      <h2>Update, remove, or troubleshoot packs</h2>
+      <p>Update a theme by verifying and installing its replacement JSON again. Re-enter animation or change theme to reload it. The selected theme is remembered locally; removing a pack does not delete gateway accounts, credentials, or the normal UI.</p>
+      <pre><code>iogw plugins list
+iogw plugins remove pixel-cafe
+iogw plugins remove pixel-office
+iogw plugins remove pixel-station</code></pre>
+      <ul class="docs-list">
+        <li><strong>No plugins command</strong> Upgrade the host binary to a compatible release, or build the current source. Downloading a pack alone is not enough.</li>
+        <li><strong>Animation unavailable</strong> Confirm that <code>iogw plugins list</code> shows a valid installed pack for the same user/config environment. A missing or invalid file leaves the normal UI available.</li>
+        <li><strong>Can't change themes</strong> Install another compatible pack; a single-theme installation is valid.</li>
+        <li><strong>Login required</strong> Use <code>o</code> or <code>iogw login</code> for the chosen gateway. Theme installation does not authenticate you.</li>
+        <li><strong>GPU or other hardware says N/A</strong> It can be unsupported, inaccessible, or waiting for a second sample. Do not treat unknown values as zero or grant elevated permissions just to enable decoration.</li>
+        <li><strong>Room appears monochrome</strong> Check true-color support and whether your shell sets <code>NO_COLOR</code>. That variable disables terminal colors; use a color-enabled shell for the pixel-art scenes.</li>
+      </ul>
+      <h2>Scene pack format and artwork</h2>
+      <p>Renderer, loader, and source artwork live together under <code>src/bin/iogw/</code>; there is no second application or desktop project. Only the lightweight renderer is compiled into the client. Release CI packages each JSON separately with checksums, and scene API version 1 packs work across supported architectures. New host layouts still require a compatible binary.</p>
+      <p>Packs are validated palette/sprite JSON limited to 256 KiB, not native libraries or JavaScript extensions. Palette and sprite dimensions are checked. A pack cannot execute code, read your credentials, call the gateway, fetch external resources, or add a new host layout on its own. Missing or invalid packs leave the normal UI available and report a local error.</p>
+      <p>The Café's visual direction is inspired by <a class="docs-inline-link" href="https://github.com/Itz-Agasta/metrocity">Metrocity's cat café</a>; Station adapts the composition of this <a class="docs-inline-link" href="https://www.reddit.com/r/PixelArt/comments/1fd8cg9/train_station/">train-station pixel-art reference</a>. Scenes use original code-drawn artwork and JSON sprites, not redistributed reference images, Pixel Agents artwork, or fonts. Unlike Metrocity's Kitty-protocol graphics, these scenes use terminal-resolution Unicode half-block pixels rather than aiming for a pixel-identical reproduction.</p>
     `,
   },
   {
@@ -687,7 +820,7 @@ ADMIN_AUTH_SECURE_COOKIES=true</code></pre>
     type: "Operations",
     appliesTo: "GitHub tag releases, production deployment, and GitHub Pages",
     introduced: docsVersion,
-    updated: "September 1, 2026",
+    updated: "November 17, 2026",
     categories: ["Operations", "Deployment"],
     keywords: "deployment release tags github actions pages health ready artifact systemd ci cd",
     summary: "Release with tag-triggered app deployment and push-triggered GitHub Pages deployment.",
@@ -710,7 +843,7 @@ ADMIN_AUTH_SECURE_COOKIES=true</code></pre>
         <tr><td>Windows x86_64</td><td><code>io-gateway-&lt;tag&gt;-windows-x86_64.zip</code></td></tr>
         <tr><td>Windows ARM64</td><td><code>io-gateway-&lt;tag&gt;-windows-aarch64.zip</code></td></tr>
       </tbody></table></div>
-      <p>Every release also includes <code>SHA256SUMS</code>, <code>install.sh</code>, and <code>install.ps1</code>. The checksum file covers every archive and both installers. Each archive contains <code>io-gateway</code>, <code>iogw</code>, and <code>config.example.json</code> (with <code>.exe</code> names on Windows).</p>
+      <p>Every release also includes <code>SHA256SUMS</code>, <code>install.sh</code>, and <code>install.ps1</code>. Each archive contains <code>io-gateway</code>, <code>iogw</code>, and <code>config.example.json</code> (with <code>.exe</code> names on Windows). The current release workflow additionally publishes <code>iogw-pixel-cafe.json</code>, <code>iogw-pixel-office.json</code>, and <code>iogw-pixel-station.json</code> as optional assets, outside the binary archives. <code>SHA256SUMS</code> covers the archives, installers, and scene packs. Older releases may lack the packs; see the <a class="docs-inline-link" href="/docs/terminal-ui/">terminal installation guide</a> before downloading.</p>
       <p>The installer URLs use GitHub’s <code>releases/latest/download/</code> endpoint. They become available after a version tag has completed the release workflow successfully.</p>
       <h2>Tag release flow</h2>
       <ol class="docs-steps">
@@ -787,7 +920,7 @@ const journeys = [
     number: "04",
     title: "Prove and observe",
     description: "Send a real client request, test a route deliberately, and read the account and quota evidence it leaves behind.",
-    pageSlugs: ["first-client-request", "test-api", "usage-and-quota", "notifications"],
+    pageSlugs: ["first-client-request", "test-api", "terminal-ui", "usage-and-quota", "notifications"],
   },
   {
     number: "05",
@@ -1152,7 +1285,7 @@ function buildSearchIndex() {
   }));
 
   return {
-    generatedAt: "2026-09-04",
+    generatedAt: "2026-11-17",
     docsVersion,
     pages: [
       {
