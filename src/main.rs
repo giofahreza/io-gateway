@@ -36,6 +36,7 @@ mod codex_reset_credit;
 mod custom_models;
 mod input_assessment;
 mod notifications;
+mod provider_quota_summary;
 mod quota_usage;
 mod source;
 mod stats_store;
@@ -12211,9 +12212,9 @@ async fn dashboard_snapshot_route(State(state): State<AppState>, headers: Header
     );
 
     let quota = |provider: &str| {
-        serde_json::json!({
+        provider_quota_summary::with_summaries(serde_json::json!({
             "accounts": quota_snapshot(&state, provider)
-        })
+        }))
     };
     axum::Json(serde_json::json!({
         "generated_at": now_rfc3339(),
@@ -12236,7 +12237,7 @@ async fn dashboard_snapshot_route(State(state): State<AppState>, headers: Header
             "qwen": quota("qwen"),
             "deepseek": quota("deepseek"),
             "minimax": quota("minimax"),
-            "grok": target::grok::admin::cached_quota_json(&state),
+            "grok": provider_quota_summary::with_summaries(target::grok::admin::cached_quota_json(&state)),
             "copilot": quota("copilot"),
             "claude": quota("claude"),
             "glm": quota("glm")
@@ -13272,7 +13273,10 @@ fn quota_accounts_json_response(
         notification_account_options(state),
         &now_rfc3339(),
     );
-    axum::Json(serde_json::json!({ "accounts": accounts })).into_response()
+    axum::Json(provider_quota_summary::with_summaries(
+        serde_json::json!({ "accounts": accounts }),
+    ))
+    .into_response()
 }
 
 async fn custom_models_json_route(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -14813,7 +14817,10 @@ async fn grok_quota_route(State(state): State<AppState>, headers: HeaderMap) -> 
     if let Some(response) = require_admin_session_json(&state, &headers) {
         return response;
     }
-    axum::Json(target::grok::admin::cached_quota_json(&state)).into_response()
+    axum::Json(provider_quota_summary::with_summaries(
+        target::grok::admin::cached_quota_json(&state),
+    ))
+    .into_response()
 }
 
 async fn grok_login_start_route(State(state): State<AppState>, headers: HeaderMap) -> Response {

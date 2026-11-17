@@ -127,6 +127,9 @@ pub async fn get_quota_summaries(state: &crate::AppState) -> Vec<Value> {
                         "remains_time": s.remains_time,
                         "total_count": s.total_count,
                         "usage_count": s.usage_count,
+                        "start_time": s.start_time,
+                        "end_time": s.end_time,
+                        "status": s.status,
                     })
                 })
             };

@@ -28,7 +28,35 @@ pub struct QuotaSummary {
     pub code_review: QuotaRateSummary,
     pub additional_rate_limits: Vec<AdditionalRateLimitSummary>,
     pub rate_limit_reset_credits: Option<RateLimitResetCreditsSummary>,
+    /// Monetary/prepaid usage credits, distinct from redeemable reset credits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credits: Option<CreditsSummary>,
     pub models: Vec<ModelSummary>,
+}
+
+#[derive(Default, Clone, Serialize)]
+pub struct CreditsSummary {
+    pub has_credits: Option<bool>,
+    pub unlimited: Option<bool>,
+    pub balance: Option<String>,
+}
+
+fn extract_credits(value: Option<&serde_json::Value>) -> Option<CreditsSummary> {
+    let value = value?.as_object()?;
+    let has_credits = value
+        .get("has_credits")
+        .and_then(serde_json::Value::as_bool);
+    let unlimited = value.get("unlimited").and_then(serde_json::Value::as_bool);
+    let balance = value.get("balance").and_then(|value| match value {
+        serde_json::Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    });
+    (has_credits.is_some() || unlimited.is_some() || balance.is_some()).then_some(CreditsSummary {
+        has_credits,
+        unlimited,
+        balance,
+    })
 }
 
 #[derive(Default, Clone, Serialize)]
@@ -187,6 +215,7 @@ pub async fn get_quota_summaries(state: &crate::AppState) -> Vec<serde_json::Val
                 "code_review": entry.summary.code_review,
                 "additional_rate_limits": entry.summary.additional_rate_limits,
                 "rate_limit_reset_credits": entry.summary.rate_limit_reset_credits,
+                "credits": entry.summary.credits,
                 "models": entry.summary.models
             }));
         }
@@ -249,6 +278,7 @@ async fn fetch_codex_quota(
         code_review,
         additional_rate_limits,
         rate_limit_reset_credits,
+        credits: extract_credits(v.get("credits")),
         models: fetch_codex_models(state, token).await.unwrap_or_default(),
     };
     QuotaCacheEntry {
@@ -863,6 +893,25 @@ fn extract_from_usage_nodes(nodes: &[serde_json::Value]) -> (QuotaRateSummary, Q
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn usage_credit_balance_is_optional_and_distinct_from_reset_credits() {
+        assert!(extract_credits(None).is_none());
+        assert!(extract_credits(Some(&json!({"access_token":"SECRET"}))).is_none());
+        for balance in [json!(0), json!("12.75")] {
+            let credits = extract_credits(Some(&json!({"balance":balance,"has_credits":false,"unlimited":false,"access_token":"SECRET"}))).unwrap();
+            let value = serde_json::to_value(credits).unwrap();
+            assert_eq!(
+                value["balance"],
+                balance
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| balance.to_string())
+            );
+            assert_eq!(value["unlimited"], false);
+            assert!(!value.to_string().contains("SECRET"));
+        }
+    }
 
     #[test]
     fn extracts_additional_codex_spark_rate_limit() {

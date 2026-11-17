@@ -46,6 +46,8 @@ use utoipa_swagger_ui::Config;
         DashboardAccount,
         QuotaResponse,
         QuotaAccount,
+        QuotaSummaryField,
+        QuotaCredits,
         QuotaRateSummary,
         QuotaWindowSummary,
         LoginStartResponse,
@@ -175,7 +177,22 @@ pub(crate) struct QuotaAccount {
     plan_type: Option<String>,
     code_generation: Option<QuotaRateSummary>,
     code_review: Option<QuotaRateSummary>,
+    credits: Option<QuotaCredits>,
+    quota_summary: Option<Vec<QuotaSummaryField>>,
     error: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct QuotaSummaryField {
+    label: String,
+    value: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct QuotaCredits {
+    has_credits: Option<bool>,
+    unlimited: Option<bool>,
+    balance: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
