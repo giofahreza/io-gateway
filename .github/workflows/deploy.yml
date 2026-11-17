@@ -290,6 +290,11 @@ jobs:
           chmod 0755 scripts/install.sh
           cp scripts/install.sh release-assets/install.sh
           cp scripts/install.ps1 release-assets/install.ps1
+          # Optional, architecture-independent scene pack. Never include it in
+          # the standard binary archives; users install it separately with iogw.
+          cp src/bin/iogw/plugins/pixel-cafe.json release-assets/iogw-pixel-cafe.json
+          cp src/bin/iogw/plugins/pixel-office.json release-assets/iogw-pixel-office.json
+          cp src/bin/iogw/plugins/pixel-station.json release-assets/iogw-pixel-station.json
 
           cd release-assets
           for asset in \
@@ -300,7 +305,10 @@ jobs:
             "io-gateway-${GITHUB_REF_NAME}-windows-x86_64.zip" \
             "io-gateway-${GITHUB_REF_NAME}-windows-aarch64.zip" \
             install.sh \
-            install.ps1
+            install.ps1 \
+            iogw-pixel-cafe.json \
+            iogw-pixel-office.json \
+            iogw-pixel-station.json
           do
             test -f "${asset}"
           done
@@ -312,7 +320,10 @@ jobs:
             "io-gateway-${GITHUB_REF_NAME}-windows-x86_64.zip" \
             "io-gateway-${GITHUB_REF_NAME}-windows-aarch64.zip" \
             install.sh \
-            install.ps1 > SHA256SUMS
+            install.ps1 \
+            iogw-pixel-cafe.json \
+            iogw-pixel-office.json \
+            iogw-pixel-station.json > SHA256SUMS
 
       - name: Create or update GitHub Release
         shell: bash
