@@ -27,9 +27,15 @@ use std::{
     io::{self, Stdout, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+#[path = "iogw/animated.rs"]
+mod animated;
+#[path = "../provider_quota_summary.rs"]
+mod provider_quota_summary;
+#[path = "iogw/system_metrics.rs"]
+mod system_metrics;
 #[path = "iogw/tui_network.rs"]
 mod tui_network;
 use tui_network::{AccountLoginPrompt, NetworkEvent, Section, TuiCommand, TuiNetwork};
@@ -133,6 +139,8 @@ struct Cli {
 enum Command {
     /// Open the interactive terminal UI.
     Tui,
+    /// Install, inspect or remove optional animated UI scene packs.
+    Plugins(animated::PluginsCommand),
     /// Create and store an admin session cookie.
     Login(LoginArgs),
     /// Log out and remove the stored session cookie.
@@ -634,6 +642,7 @@ struct TuiApp {
     confirmation_modal: Option<ConfirmationModal>,
     message: String,
     network: TuiNetwork,
+    animation: animated::Animation,
 }
 
 #[tokio::main]
@@ -646,9 +655,14 @@ async fn main() {
 
 async fn run() -> Result<(), String> {
     let cli = Cli::parse();
+    // Plugin management is entirely local and must not require gateway access.
+    if let Some(Command::Plugins(command)) = cli.command {
+        return print_response(cli.json, animated::command(command)?);
+    }
     let mut client = GatewayClient::new(resolve_base_url(cli.base_url.as_deref()))?;
     match cli.command.unwrap_or(Command::Tui) {
         Command::Tui => run_tui(client).await,
+        Command::Plugins(_) => unreachable!("handled before gateway initialization"),
         Command::Login(args) => {
             let otp = match args.otp {
                 Some(otp) => otp,
@@ -1205,19 +1219,41 @@ async fn run_tui(client: GatewayClient) -> Result<(), String> {
     result
 }
 
+fn animation_toggle_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::F(4)
+        || (key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
 async fn run_tui_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     client: GatewayClient,
 ) -> Result<(), String> {
     let mut app = TuiApp::new(client)?;
+    let mut last_draw = Instant::now() - Duration::from_millis(250);
     loop {
         app.poll_network();
+        let animated_overview = app.animation.active && app.tab == Tab::Overview;
+        app.animation.poll_system(animated_overview);
+        if animated_overview {
+            let size = terminal.size().map_err(|err| err.to_string())?;
+            app.animation.resize(size.width, size.height);
+        }
         app.continue_pending_account_login(terminal)?;
-        terminal
-            .draw(|frame| draw_tui(frame, &app))
-            .map_err(|err| err.to_string())?;
-
-        if !event::poll(Duration::from_millis(250)).map_err(|err| err.to_string())? {
+        let frame_ms = if animated_overview && !app.animation.paused {
+            50
+        } else {
+            250
+        };
+        let interval = Duration::from_millis(frame_ms);
+        if !animated_overview || last_draw.elapsed() >= interval {
+            terminal
+                .draw(|frame| draw_tui(frame, &app))
+                .map_err(|err| err.to_string())?;
+            last_draw = Instant::now();
+        }
+        if !event::poll(interval.saturating_sub(last_draw.elapsed()))
+            .map_err(|err| err.to_string())?
+        {
             continue;
         }
         let Event::Key(key) = event::read().map_err(|err| err.to_string())? else {
@@ -1228,6 +1264,65 @@ async fn run_tui_loop(
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(());
+        }
+        if animation_toggle_key(key) && key.kind == KeyEventKind::Press {
+            if let Err(error) = app.animation.toggle() {
+                app.message = error;
+            } else if app.animation.active {
+                app.tab = Tab::Overview;
+                app.clamp_selection();
+                app.animation.observe(&app.data);
+                app.sync_animated_accounts();
+            }
+            continue;
+        }
+        // Modals and every ordinary Overview action use the shared dispatcher
+        // below. Only scene-specific, otherwise-unused shortcuts are intercepted.
+        if animated_overview && !app.has_modal() {
+            match key.code {
+                KeyCode::Esc => {
+                    app.animation.exit();
+                    continue;
+                }
+                KeyCode::Char(' ') if key.kind == KeyEventKind::Press => {
+                    app.animation.pause();
+                    continue;
+                }
+                KeyCode::Char('t') if key.kind == KeyEventKind::Press => {
+                    app.animation.cycle_theme();
+                    continue;
+                }
+                KeyCode::Char('b') if key.kind == KeyEventKind::Press => {
+                    app.animation.toggle_bubbles();
+                    continue;
+                }
+                KeyCode::Char('h') | KeyCode::Char('l') | KeyCode::Left | KeyCode::Right
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    app.animation.move_cat(
+                        if matches!(key.code, KeyCode::Char('h') | KeyCode::Left) {
+                            -1
+                        } else {
+                            1
+                        },
+                    );
+                    app.sync_from_animated_cat();
+                    continue;
+                }
+                KeyCode::PageDown | KeyCode::PageUp | KeyCode::Home | KeyCode::End => {
+                    match key.code {
+                        KeyCode::PageDown => app.animation.turn_page(1),
+                        KeyCode::PageUp => app.animation.turn_page(-1),
+                        KeyCode::Home => app.animation.first(),
+                        _ => app.animation.last(),
+                    }
+                    app.sync_from_animated_cat();
+                    continue;
+                }
+                _ => {}
+            }
         }
         if app.confirmation_modal.is_some() {
             match key.code {
@@ -1328,10 +1423,12 @@ async fn run_tui_loop(
         }
         if let Some(delta) = account_reorder_delta(key) {
             app.move_selected_usage_account(delta);
+            app.sync_animated_accounts();
             continue;
         }
         if let Some(delta) = provider_reorder_delta(key) {
             app.move_selected_usage_provider(delta);
+            app.sync_animated_accounts();
             continue;
         }
         match key.code {
@@ -1365,7 +1462,17 @@ async fn run_tui_loop(
             {
                 app.hide_selected_usage_account();
             }
-            KeyCode::Char('r') => app.refresh(),
+            KeyCode::Char('r' | 'R') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.refresh_quota(true)
+            }
+            KeyCode::Char('R') => app.refresh(),
+            KeyCode::Char('r') => {
+                if app.tab == Tab::Overview {
+                    app.refresh_quota(false);
+                } else {
+                    app.network.refresh_visible(app.tab);
+                }
+            }
             KeyCode::Char('a') if app.tab == Tab::Notifications => {
                 app.set_all_notification_accounts(true);
             }
@@ -1498,10 +1605,58 @@ async fn run_tui_loop(
             }
             _ => {}
         }
+        app.sync_animated_accounts();
     }
 }
 
 impl TuiApp {
+    fn has_modal(&self) -> bool {
+        self.show_command_modal
+            || self.show_account_details
+            || self.show_api_key_details
+            || self.show_api_key_reveal
+            || self.confirmation_modal.is_some()
+    }
+
+    fn sync_animated_accounts(&mut self) {
+        if !self.animation.active {
+            return;
+        }
+        let order: Vec<_> = overview_account_usage_account_rows(self)
+            .into_iter()
+            .map(|row| row.account_index)
+            .collect();
+        if self.tab == Tab::Overview {
+            if order.is_empty() {
+                self.overview_section = OverviewSection::CustomModels;
+            } else if matches!(
+                self.overview_section,
+                OverviewSection::Metrics | OverviewSection::ContextUsage
+            ) {
+                self.overview_section = OverviewSection::AccountUsage;
+            }
+            self.sync_selected_from_overview_section();
+        }
+        self.animation.set_view(
+            order,
+            self.overview_account_selected,
+            self.limit_display_mode == LimitDisplayMode::AllPerAccount,
+            self.overview_section == OverviewSection::CustomModels,
+            self.overview_model_selected,
+        );
+    }
+
+    fn sync_from_animated_cat(&mut self) {
+        if self.animation.models_focused() {
+            self.overview_section = OverviewSection::CustomModels;
+        } else {
+            self.overview_section = OverviewSection::AccountUsage;
+            self.overview_account_selected = self.animation.selection();
+        }
+        self.sync_selected_from_overview_section();
+        self.message.clear();
+    }
+
     fn new(client: GatewayClient) -> Result<Self, String> {
         let preferences_path = preferences_path(&client.base_url)?;
         let preferences = load_tui_preferences(&preferences_path);
@@ -1531,20 +1686,70 @@ impl TuiApp {
             confirmation_modal: None,
             message: String::new(),
             network: TuiNetwork::new(),
+            animation: animated::Animation::new(),
         })
     }
 
     fn refresh(&mut self) {
-        self.network.refresh_visible(self.tab);
+        self.network.refresh_all();
+        self.animation.refresh_started("ALL");
         self.message.clear();
     }
 
+    fn refresh_quota(&mut self, hard: bool) {
+        if !hard && self.overview_section != OverviewSection::AccountUsage {
+            self.message = "no focused account: use R to refresh all data".into();
+            return;
+        }
+        if self.needs_login() || !self.network.has_data(Section::Session) {
+            self.message = "admin login required: press o".into();
+            return;
+        }
+        let target = if hard {
+            None
+        } else {
+            let Some(account) =
+                selected_overview_account_index(self).and_then(|i| self.data.accounts.get(i))
+            else {
+                self.message = "no focused account: use R to refresh all data".into();
+                return;
+            };
+            let Some(provider) = normalize_refresh_provider(&account.provider) else {
+                self.message = "provider does not support quota refresh".into();
+                return;
+            };
+            if account.file_name.is_empty() {
+                self.message =
+                    "account credential file unavailable; focused refresh skipped".into();
+                return;
+            }
+            Some((provider.to_string(), account.file_name.clone()))
+        };
+        if self.network.refresh_quotas(&self.client, target) {
+            if hard {
+                self.network.refresh_all();
+            }
+            self.animation
+                .refresh_started(if hard { "HARD" } else { "ACCOUNT" });
+            self.message = if hard {
+                "fetching fresh quotas from server"
+            } else {
+                "refreshing focused account"
+            }
+            .into();
+        } else {
+            self.message = "a refresh/action is already in progress".into();
+        }
+    }
+
     fn start_command(&mut self, command: TuiCommand) {
-        if !matches!(command, TuiCommand::Login { .. })
-            && (self.needs_login() || !self.network.has_data(Section::Session))
-        {
+        let login = matches!(command, TuiCommand::Login { .. });
+        if !login && (self.needs_login() || !self.network.has_data(Section::Session)) {
             self.message = "admin login required: press o".to_string();
         } else if self.network.start_command(&self.client, command) {
+            if login {
+                self.animation.login_started();
+            }
             self.message = "action in progress".to_string();
         } else {
             self.message = "an action is already in progress".to_string();
@@ -1819,6 +2024,7 @@ impl TuiApp {
             session: json!({ "enabled": true, "authenticated": false }),
             ..GatewayData::default()
         };
+        self.animation.observe(&self.data);
         self.confirmation_modal = None;
         self.message = "admin login required: press o".to_string();
     }
@@ -1834,11 +2040,30 @@ impl TuiApp {
                     self.apply_section(section, body);
                 }
                 NetworkEvent::Section {
+                    section,
+                    result: Err(error),
+                    ..
+                } => {
+                    if error.unauthorized {
+                        self.expire_session();
+                    }
+                    if section == Section::Session {
+                        self.animation.login_failed();
+                    }
+                }
+                NetworkEvent::QuotaRefresh {
+                    result: Ok(body), ..
+                } => {
+                    self.apply_section(Section::Snapshot, body);
+                    self.message = "quota refresh complete".into();
+                }
+                NetworkEvent::QuotaRefresh {
                     result: Err(error), ..
                 } => {
                     if error.unauthorized {
                         self.expire_session();
                     }
+                    self.message = error.message;
                 }
                 NetworkEvent::Command(Ok(outcome)) => {
                     if let Some(reveal) = outcome.reveal {
@@ -1846,9 +2071,11 @@ impl TuiApp {
                         self.show_api_key_reveal = true;
                     }
                     if let Some(client) = outcome.client {
+                        self.animation.login_accepted();
                         self.client = client;
                         self.network.forget_data();
                         self.data = GatewayData::default();
+                        self.animation.observe(&self.data);
                     }
                     self.pending_account_login = outcome.account_login;
                     if outcome.refresh {
@@ -1858,6 +2085,7 @@ impl TuiApp {
                     self.message = outcome.message;
                 }
                 NetworkEvent::Command(Err(error)) => {
+                    self.animation.login_failed();
                     if error.unauthorized {
                         self.expire_session();
                     }
@@ -1867,6 +2095,8 @@ impl TuiApp {
         }
         let authenticated = self.network.has_data(Section::Session) && !self.needs_login();
         self.network.schedule(&self.client, self.tab, authenticated);
+        self.animation
+            .refresh_pending(self.network.refresh_pending(), self.network.reads_pending());
     }
 
     fn apply_section(&mut self, section: Section, body: Value) {
@@ -1971,6 +2201,8 @@ impl TuiApp {
             self.overview_account_selected = index;
         }
         self.clamp_selection();
+        self.animation.observe(&self.data);
+        self.sync_animated_accounts();
     }
 
     fn needs_login(&self) -> bool {
@@ -2387,7 +2619,7 @@ impl TuiApp {
     }
 
     fn enable_selected(&mut self) {
-        if self.selected_model().is_some() {
+        if self.overview_section == OverviewSection::CustomModels {
             self.toggle_selected_model(true);
         } else {
             self.toggle_selected_account(true);
@@ -2395,7 +2627,7 @@ impl TuiApp {
     }
 
     fn disable_selected(&mut self) {
-        if self.selected_model().is_some() {
+        if self.overview_section == OverviewSection::CustomModels {
             self.toggle_selected_model(false);
         } else {
             self.toggle_selected_account(false);
@@ -2755,6 +2987,16 @@ fn btop_plain_block() -> Block<'static> {
 }
 
 fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp) {
+    if app.animation.active && app.tab == Tab::Overview {
+        app.animation.draw(
+            frame,
+            app.network
+                .connection_label(Tab::Overview, &app.data.session),
+        );
+        draw_animated_overview_context(frame, app);
+        draw_tui_modals(frame, app);
+        return;
+    }
     frame.render_widget(btop_plain_block(), frame.area());
 
     let root = Layout::default()
@@ -2802,7 +3044,7 @@ fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp) {
         Tab::Notifications => draw_notifications(frame, root[2], app),
     }
 
-    let footer = if app.message.trim().is_empty() {
+    let mut footer = if app.message.trim().is_empty() {
         if app.tab == Tab::Notifications {
             " ? commands | tab switch | j/k move | Enter/Space watch | e enable | c channel | s settings | a/u all/none | p provider | t test "
                 .to_string()
@@ -2819,19 +3061,162 @@ fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp) {
                 _ => "".to_string(),
             };
             format!(
-                " ? commands | tab switch | h/l section | j/k move | r refresh | o login | {} ",
+                " ? commands | tab switch | h/l section | j/k move | r account | R all | Ctrl+R hard | o login | {} ",
                 section_hint
             )
         }
     } else {
         format!(" {}", app.message)
     };
+    if app.message.trim().is_empty() && animated::any_installed() {
+        footer = format!(" F4 animated |{footer}");
+    }
     let status = app.network.status(app.tab);
     frame.render_widget(
         Paragraph::new(vec![Line::from(footer), Line::from(status)]).style(btop_muted_style()),
         root[3],
     );
 
+    draw_tui_modals(frame, app);
+}
+
+fn draw_animated_overview_context(frame: &mut Frame<'_>, app: &TuiApp) {
+    let area = frame.area();
+    let footer = animated::footer_area(area);
+    if footer.height >= 3 {
+        let status = format!(
+            "{} · {} · quota {} · {} hidden{}{}",
+            app.overview_section.title(),
+            app.animation.selected_identity(),
+            app.limit_display_mode.label(),
+            app.usage_filter_count(),
+            if app.message.is_empty() { "" } else { " · " },
+            app.message
+        );
+        frame.render_widget(
+            Clear,
+            Rect::new(footer.x, footer.y, footer.width, footer.height - 1),
+        );
+        frame.render_widget(
+            Paragraph::new(status).style(btop_title_style()),
+            Rect::new(footer.x, footer.y, footer.width, 1),
+        );
+        let lines = focused_account_footer(app, footer.width);
+        frame.render_widget(
+            Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+                .style(btop_style()),
+            Rect::new(footer.x, footer.y + 1, footer.width, footer.height - 2),
+        );
+    }
+    // Gateway statistics live on the wall TV; custom models live with their cat.
+    // Keep the normal Overview's panels and action routing without floating them
+    // over the artwork in animated mode.
+}
+
+/// Pack prioritized fields into the terminal width. Never dump credential JSON
+/// or account IDs; the modal remains available for longer details.
+fn focused_account_footer(app: &TuiApp, width: u16) -> Vec<String> {
+    if width == 0 {
+        return vec![];
+    }
+    let mut fields = Vec::new();
+    if let Some(notice) = app.animation.notice() {
+        fields.push(format!("! {notice}"));
+    }
+    if app.animation.models_focused() {
+        fields.push("j/k models · e/d enable/disable · x delete · Enter details".into());
+        fields.extend(app.data.models.iter().map(|model| {
+            format!(
+                "{} {}",
+                if model.alias.is_empty() {
+                    &model.id
+                } else {
+                    &model.alias
+                },
+                if model.enabled { "on" } else { "off" }
+            )
+        }));
+    } else if let Some(account) = app.selected_account() {
+        fields.push(format!(
+            "{} · {} req · {} tokens · {} errors ({}){}",
+            account.provider_label,
+            format_short(account.requests),
+            format_short(account.total_tokens),
+            format_count(account.errors),
+            error_rate(account.requests, account.errors),
+            if account.priority { " · priority" } else { "" }
+        ));
+        let status = account_status(account.enabled, account.cooldown);
+        fields.push(format!(
+            "Status {}{}",
+            account_status_label(status),
+            account
+                .cooldown_remaining_seconds
+                .filter(|_| account.cooldown)
+                .map(|s| format!(" {}", format_duration(s)))
+                .unwrap_or_default()
+        ));
+        if !account.attention_reasons.is_empty() {
+            fields.push(format!(
+                "Attention {}",
+                account.attention_reasons.join(" / ")
+            ));
+        }
+        fields.extend(app.animation.focused_limits(width));
+        let values = account_snapshot_values(&app.data.snapshot, &account);
+        if let Some(plan) = values
+            .iter()
+            .find_map(|value| first_string_recursive(value, &["plan_type", "account_type"]))
+        {
+            fields.push(format!("Plan {plan}"));
+        }
+        if let Some((count, _)) = reset_credit_details(&values) {
+            fields.push(format!("Reset credits {count}"));
+        }
+        let models = snapshot_model_names(&values);
+        fields.push(format!(
+            "Snapshot {}",
+            display_or(&string_at(&app.data.snapshot, &["generated_at"]), "pending")
+        ));
+        if !account.last_success_at.is_empty() {
+            fields.push(format!("Last OK {}", account.last_success_at));
+        }
+        if !account.last_error_at.is_empty() {
+            fields.push(format!("Last error {}", account.last_error_at));
+        }
+        fields.extend(models.into_iter().map(|model| format!("Model {model}")));
+        if !account.file_name.is_empty() {
+            fields.push(format!("Credential {}", account.file_name));
+        }
+    } else {
+        fields.push("No focused account · R refresh · Enter details".into());
+    }
+    pack_footer_fields(&fields, width)
+}
+
+fn pack_footer_fields(fields: &[String], width: u16) -> Vec<String> {
+    let mut lines = Vec::<String>::new();
+    for field in fields {
+        let field = animated::clipped(
+            &field.split_whitespace().collect::<Vec<_>>().join(" "),
+            width,
+        );
+        if field.is_empty() {
+            continue;
+        }
+        if let Some(line) = lines.last_mut() {
+            if Line::from(format!("{line} · {field}")).width() <= width as usize {
+                line.push_str(" · ");
+                line.push_str(&field);
+                continue;
+            }
+        }
+        lines.push(field);
+    }
+    lines
+}
+
+fn draw_tui_modals(frame: &mut Frame<'_>, app: &TuiApp) {
     if app.show_command_modal {
         draw_command_modal(frame, frame.area(), app);
     }
@@ -4297,7 +4682,19 @@ fn command_modal_rows(app: &TuiApp) -> Vec<(String, String)> {
         ("Ctrl+C".to_string(), "quit the TUI".to_string()),
         ("Tab".to_string(), "next tab".to_string()),
         ("Shift-Tab".to_string(), "previous tab".to_string()),
-        ("r".to_string(), "refresh the current data".to_string()),
+        (
+            "r".to_string(),
+            "refresh focused account (other tabs: current data)".to_string(),
+        ),
+        ("R".to_string(), "refresh all displayed data".to_string()),
+        (
+            "Ctrl+R".to_string(),
+            "force fresh server quotas (Ctrl+Shift+R too)".to_string(),
+        ),
+        (
+            "b".to_string(),
+            "animated UI: toggle usage bubbles".to_string(),
+        ),
         ("o".to_string(), "log in to the gateway".to_string()),
         (String::new(), "MODAL NAVIGATION".to_string()),
         (
@@ -4314,15 +4711,46 @@ fn command_modal_rows(app: &TuiApp) -> Vec<(String, String)> {
         ),
     ];
 
+    rows.insert(
+        5,
+        (
+            "F4 / Ctrl+V".to_string(),
+            "switch to/from optional animated UI (Esc returns)".to_string(),
+        ),
+    );
+    rows.insert(
+        6,
+        (
+            "Space · PgUp/PgDn".to_string(),
+            "animated UI: pause motion · page cats (Home/End: first/last)".to_string(),
+        ),
+    );
+    rows.insert(
+        7,
+        (
+            "t · j/k".to_string(),
+            "animated Overview: switch theme · move in focused section".to_string(),
+        ),
+    );
+
     match app.tab {
         Tab::Overview => {
             rows.push((String::new(), "OVERVIEW".to_string()));
             rows.push((
-                "h/l".to_string(),
-                format!(
-                    "previous/next section (currently {})",
-                    app.overview_section.title()
-                ),
+                if app.animation.active {
+                    "h/l · Left/Right"
+                } else {
+                    "h/l"
+                }
+                .to_string(),
+                if app.animation.active {
+                    "previous/next cat; model cat is leftmost".into()
+                } else {
+                    format!(
+                        "previous/next section (currently {})",
+                        app.overview_section.title()
+                    )
+                },
             ));
             match app.overview_section {
                 OverviewSection::Metrics => {
@@ -4462,6 +4890,7 @@ fn draw_account_details_modal(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         first_string_recursive(value, &["project_id", "account_type", "plan_type"])
     });
     let generated_at = string_at(&app.data.snapshot, &["generated_at"]);
+    let summary = account_quota_summary_fields(&app.data.snapshot, &account);
 
     let mut lines = vec![
         Line::from(vec![
@@ -4491,7 +4920,11 @@ fn draw_account_details_modal(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         detail_section("Quota"),
     ];
 
-    if quota_rows.is_empty() {
+    if !summary.is_empty() {
+        for field in &summary {
+            lines.push(detail_line(&field.label, field.value.clone()));
+        }
+    } else if quota_rows.is_empty() {
         lines.push(detail_line("Usage", "No quota snapshot for this account"));
     } else {
         for quota in &quota_rows {
@@ -4630,6 +5063,9 @@ fn draw_account_details_modal(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     ]));
 
     let modal = centered_rect(area, 86, 32);
+    // Summaries can wrap on compact terminals. Count rendered rows so the last
+    // balances/models remain reachable rather than stopping at logical lines.
+    let lines = wrap_detail_lines(lines, modal.width.saturating_sub(2));
     let max_scroll = lines
         .len()
         .saturating_sub(modal.height.saturating_sub(2) as usize);
@@ -4639,10 +5075,78 @@ fn draw_account_details_modal(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         Paragraph::new(lines)
             .style(btop_style())
             .block(btop_block_with_border("Account Details", BTOP_MEM_BOX))
-            .scroll((scroll, 0))
-            .wrap(Wrap { trim: false }),
+            .scroll((scroll, 0)),
         modal,
     );
+}
+
+fn wrap_detail_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for line in lines {
+        let mut row = Line::default().style(line.style);
+        let mut columns = 0;
+        for span in line.spans {
+            let mut part = String::new();
+            for ch in span.content.chars() {
+                let size = Span::raw(ch.to_string()).width();
+                if columns + size > usize::from(width) && columns > 0 {
+                    row.spans
+                        .push(Span::styled(std::mem::take(&mut part), span.style));
+                    out.push(row);
+                    row = Line::default().style(line.style);
+                    columns = 0;
+                }
+                if size <= usize::from(width) {
+                    part.push(ch);
+                    columns += size;
+                }
+            }
+            row.spans.push(Span::styled(part, span.style));
+        }
+        out.push(row);
+    }
+    out
+}
+
+fn account_quota_summary_fields(
+    snapshot: &Value,
+    account: &AccountRow,
+) -> Vec<provider_quota_summary::Field> {
+    let mut fields = Vec::new();
+    for value in snapshot_quota_values_for_provider(snapshot, &account.provider) {
+        if !snapshot_value_matches_account(value, account) {
+            continue;
+        }
+        // Prefer the gateway's additive contract. Older gateways still work
+        // through the identical local allowlisted projection, never raw JSON.
+        let summary = value
+            .get("quota_summary")
+            .and_then(|value| {
+                serde_json::from_value::<Vec<provider_quota_summary::Field>>(value.clone()).ok()
+            })
+            .unwrap_or_else(|| provider_quota_summary::summarize(value));
+        for mut field in summary {
+            field.label = field
+                .label
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(180)
+                .collect();
+            field.value = field
+                .value
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(600)
+                .collect();
+            if !fields.contains(&field) {
+                fields.push(field);
+            }
+        }
+    }
+    fields
 }
 
 fn detail_section(title: &str) -> Line<'static> {
@@ -4651,7 +5155,7 @@ fn detail_section(title: &str) -> Line<'static> {
 
 fn detail_line(label: &str, value: impl Into<String>) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{label:<18}"), btop_muted_style()),
+        Span::styled(format!("{label:<18}  "), btop_muted_style()),
         Span::raw(value.into()),
     ])
 }
@@ -8134,6 +8638,50 @@ mod tests {
             vec!["Weekly reset; expires tomorrow"]
         );
         assert_eq!(snapshot_model_names(&values), vec!["Test model"]);
+    }
+
+    #[test]
+    fn account_summary_works_with_new_and_old_gateways_and_never_crosses_accounts() {
+        let account = AccountRow {
+            provider: "deepseek".into(),
+            file_name: "one.json".into(),
+            key: "one.json".into(),
+            ..Default::default()
+        };
+        let quota = json!({"accounts":[
+            {"file_name":"one.json","balances":[{"currency":"USD","total_balance":"4.50"}],"api_key":"SECRET"},
+            {"file_name":"two.json","balances":[{"currency":"USD","total_balance":"999"}]}
+        ]});
+        let old = json!({"quotas":{"deepseek":quota}});
+        let new = json!({"quotas":{"deepseek":provider_quota_summary::with_summaries(quota)}});
+        let fields = account_quota_summary_fields(&old, &account);
+        assert_eq!(fields, account_quota_summary_fields(&new, &account));
+        let text = serde_json::to_string(&fields).unwrap();
+        assert!(text.contains("USD") && text.contains("4.50"));
+        assert!(!text.contains("999") && !text.contains("SECRET"));
+        assert!(account_quota_summary_fields(&json!({"quotas":{}}), &account).is_empty());
+    }
+
+    #[test]
+    fn detail_wrapping_preserves_unicode_styles_and_makes_final_rows_reachable() {
+        let content = "wide 日本語 email@example.com end";
+        let lines = wrap_detail_lines(
+            vec![Line::from(Span::styled(content, btop_header_style()))],
+            12,
+        );
+        assert!(lines.len() > 2);
+        assert!(lines.iter().all(|line| line.width() <= 12));
+        let joined = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(joined, content);
+        assert!(lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .all(|span| span.style == btop_header_style()));
+        assert!(wrap_detail_lines(vec![Line::from("unavailable")], 0).is_empty());
     }
 
     #[test]

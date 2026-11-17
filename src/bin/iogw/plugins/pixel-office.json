@@ -1,0 +1,184 @@
+{
+  "schema_version": 1,
+  "id": "pixel-office",
+  "version": "1.0.0",
+  "palette": {
+    "b": "#101D22",
+    "w": "#263C42",
+    "f": "#1B2D34",
+    "g": "#20343B",
+    "t": "#426169",
+    "i": "#101B20",
+    "m": "#9CA89A",
+    "o": "#C9D8AD",
+    "h": "#8DD1B3",
+    "c": "#89BBDD",
+    "d": "#8F9B9F",
+    "a": "#F0B879",
+    "n": "#19262D",
+    "e": "#EEF2DF",
+    "s": "#9BADAA",
+    "l": "#6FAD88",
+    "p": "#71877D",
+    "v": "#132B3C",
+    "u": "#244B5E",
+    "k": "#B6CBC6",
+    "r": "#30484D",
+    "z": "#C1BA84",
+    "q": "#50778A",
+    "j": "#F2DB9A",
+    "x": "#C28C71",
+    "y": "#344B58"
+  },
+  "sprites": {
+    "desk": {
+      "frame_ms": 1000,
+      "frames": [
+        [
+          "....................",
+          "mmmmmmmmmmmmmmmmmmmm",
+          "moooooooooooooooooot",
+          "mmmmmmmmmmmmmmmmmmmm",
+          ".tt..............tt.",
+          ".tt..............tt.",
+          ".tt....rrrrrr....tt.",
+          ".tt....rhhhhr....tt.",
+          ".tt....rrrrrr....tt.",
+          ".tt......rr......tt.",
+          ".tt.....rrrr.....tt.",
+          "......rr.rr.rr......"
+        ]
+      ]
+    },
+    "agent": {
+      "frame_ms": 320,
+      "frames": [
+        [
+          "..nnnn..",
+          ".nnnnnn.",
+          ".nnxxnn.",
+          "..xxxx..",
+          "...xx...",
+          "..hhhh..",
+          ".hhhhhh.",
+          "x.hhhh.x",
+          "..yyyy..",
+          "..y..y..",
+          ".yy..yy.",
+          "nnn..nnn"
+        ],
+        [
+          "..nnnn..",
+          ".nnnnnn.",
+          ".nnxxnn.",
+          "..xxxx..",
+          "...xx...",
+          "..hhhh..",
+          "xhhhhhh.",
+          "..hhhh.x",
+          "..yyyy..",
+          "..y..y..",
+          ".yy..yy.",
+          "nnn..nnn"
+        ],
+        [
+          "..nnnn..",
+          ".nnnnnn.",
+          ".nnxxnn.",
+          "..xxxx..",
+          "...xx...",
+          "..hhhh..",
+          ".hhhhhhx",
+          "x.hhhh..",
+          "..yyyy..",
+          "..y..y..",
+          ".yy..yy.",
+          "nnn..nnn"
+        ]
+      ]
+    },
+    "plant": {
+      "frame_ms": 900,
+      "frames": [
+        [
+          "....ll....",
+          "...llll...",
+          "l...ll....",
+          "ll..ll..ll",
+          ".ll.ll.ll.",
+          "..llllll..",
+          "...llll...",
+          "....ll....",
+          ".pppppppp.",
+          ".pooooppp.",
+          "..pppppp..",
+          "..pppppp..",
+          "...iiii..."
+        ],
+        [
+          ".....ll...",
+          "....llll..",
+          ".l..ll....",
+          "ll..ll..ll",
+          ".ll.ll.ll.",
+          "..llllll..",
+          "...llll...",
+          "....ll....",
+          ".pppppppp.",
+          ".pooooppp.",
+          "..pppppp..",
+          "..pppppp..",
+          "...iiii..."
+        ]
+      ]
+    },
+    "terminal": {
+      "frame_ms": 600,
+      "frames": [
+        [
+          "ttttttttttttttt",
+          "tnnnnnnnnnnnnnt",
+          "tnhhhhhhhhhnnnt",
+          "tnhnnnnnnnhnnnt",
+          "tnhnnhhnnnhnnnt",
+          "tnhnnnnnnnhnnnt",
+          "tnhhhhhhhhhnnnt",
+          "tnnnnnnnnnnnnnt",
+          "ttttttttttttttt",
+          "......rrr......",
+          "....rrrrrrr...."
+        ],
+        [
+          "ttttttttttttttt",
+          "tnnnnnnnnnnnnnt",
+          "tnhhhhhhhhhnnnt",
+          "tnhnnnnnnnhnnnt",
+          "tnhnnhhhnnhnnnt",
+          "tnhnnnnnnnhnnnt",
+          "tnhhhhhhhhhnnnt",
+          "tnnnnnnnnnnnnnt",
+          "ttttttttttttttt",
+          "......rrr......",
+          "....rrrrrrr...."
+        ]
+      ]
+    },
+    "lock": {
+      "frame_ms": 1000,
+      "frames": [
+        [
+          "..hhhhh..",
+          ".hh...hh.",
+          ".hh...hh.",
+          ".hh...hh.",
+          "hhhhhhhhh",
+          "hhhhhhhhh",
+          "hhhhnnhhh",
+          "hhhhnnhhh",
+          "hhhhhhhhh",
+          ".hhhhhhh."
+        ]
+      ]
+    }
+  }
+}

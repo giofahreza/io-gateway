@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "id": "pixel-station",
+  "version": "1.0.0",
+  "palette": {
+    "b": "#272326", "w": "#49413C", "f": "#373136", "g": "#534941",
+    "t": "#79604A", "i": "#2D272B", "m": "#AD7D59", "o": "#D39E73",
+    "h": "#ADC59A", "c": "#91B5C0", "d": "#9C9183", "a": "#EEAE82",
+    "n": "#292C30", "e": "#F2E2BB", "s": "#A5A57A", "l": "#73846A",
+    "p": "#A77857", "v": "#35464B", "u": "#60796E", "k": "#DCBD89",
+    "r": "#573A35", "z": "#CE9968", "q": "#7A8D84", "j": "#F2D79B",
+    "x": "#985447", "y": "#555155"
+  },
+  "sprites": {
+    "cat": {
+      "frame_ms": 380,
+      "frames": [
+        ["..n...n......", ".nxn.nxn.....", ".nnnnnnn.....", ".nknnnkn.....", "..nnxnn......", "..nnhnn......", "..nnnnnnn..n.", "..nnnnnnnn.nn", "..nnnnnnnnnn.", "..nyynnyyn...", ".nnn..nnn...."],
+        ["..n...n......", ".nxn.nxn.....", ".nnnnnnn.....", ".nynnnyn.....", "..nnxnn......", "..nnhnn......", "..nnnnnnn....", "..nnnnnnnnnn.", "..nnnnnnnn..n", "..nyynnyyn...", ".nnn..nnn...."]
+      ]
+    },
+    "cat_light": {
+      "frame_ms": 480,
+      "frames": [
+        ["..e...e......", ".exe.exe.....", ".eeeeeee.....", ".eneeene.....", "..eexee......", "..eehee......", "..eeeeeee..e.", "..eeeeeeee.ee", "..eeeeeeeeee.", "..esseesse...", ".eee..eee...."],
+        ["..e...e......", ".exe.exe.....", ".eeeeeee.....", ".eseeese.....", "..eexee......", "..eehee......", "..eeeeeee....", "..eeeeeeeeee.", "..eeeeeeee..e", "..esseesse...", ".eee..eee...."]
+      ]
+    },
+    "cat_sleep": {
+      "frame_ms": 1200,
+      "frames": [[".............", ".............", ".............", "..e...e......", ".eeeeeee.....", ".eseeeseeee..", "..eexeeeeeee.", "..eeheesseeee", "..eeeeesseeee", "...eeeeeeeee.", "....sssssss.."]]
+    },
+    "plant": {
+      "frame_ms": 900,
+      "frames": [["....ll....", "...llll...", "l...ll....", "ll..ll..ll", ".ll.ll.ll.", "..llllll..", "...llll...", "....ll....", ".pppppppp.", ".pooooppp.", "..pppppp..", "..pppppp..", "...iiii..."]]
+    },
+    "lock": {
+      "frame_ms": 1000,
+      "frames": [["..hhhhh..", ".hh...hh.", ".hh...hh.", ".hh...hh.", "hhhhhhhhh", "hhhhhhhhh", "hhhhnnhhh", "hhhhnnhhh", "hhhhhhhhh", ".hhhhhhh."]]
+    }
+  }
+}

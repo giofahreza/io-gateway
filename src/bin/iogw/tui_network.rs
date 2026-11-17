@@ -140,6 +140,10 @@ pub(super) enum NetworkEvent {
         result: Result<Value, RequestError>,
     },
     Command(Result<CommandOutcome, RequestError>),
+    QuotaRefresh {
+        generation: u64,
+        result: Result<Value, RequestError>,
+    },
 }
 
 pub(super) enum TuiCommand {
@@ -553,6 +557,7 @@ fn is_copilot_pending(message: &str) -> bool {
 
 #[derive(Default)]
 struct FetchState {
+    manual: bool,
     generation: u64,
     task: Option<JoinHandle<()>>,
     attempted_at: Option<Instant>,
@@ -568,11 +573,13 @@ pub(super) struct TuiNetwork {
     rx: mpsc::Receiver<NetworkEvent>,
     command: Option<JoinHandle<()>>,
     logging_in: bool,
+    refresh: Option<JoinHandle<()>>,
+    refresh_generation: u64,
 }
 
 impl TuiNetwork {
     pub(super) fn new() -> Self {
-        // At most eight section results and one action can be outstanding.
+        // Eight section results, one action and one quota-refresh result fit.
         let (tx, rx) = mpsc::channel(16);
         Self {
             sections: std::array::from_fn(|_| FetchState::default()),
@@ -580,6 +587,8 @@ impl TuiNetwork {
             rx,
             command: None,
             logging_in: false,
+            refresh: None,
+            refresh_generation: 0,
         }
     }
 
@@ -593,10 +602,12 @@ impl TuiNetwork {
             .filter(|section| !section.visible(tab))
         {
             let state = &mut self.sections[section as usize];
-            if let Some(task) = state.task.take() {
-                task.abort();
-                state.generation += 1;
-                state.attempted_at = None;
+            if !state.manual {
+                if let Some(task) = state.task.take() {
+                    task.abort();
+                    state.generation += 1;
+                    state.attempted_at = None;
+                }
             }
         }
         let now = Instant::now();
@@ -604,12 +615,16 @@ impl TuiNetwork {
             .sections
             .iter()
             .filter(|state| state.task.is_some())
-            .count();
+            .count()
+            + usize::from(self.refresh.is_some());
         for section in Section::ALL {
             if active >= MAX_FETCHES {
                 break;
             }
-            if !section.visible(tab) || (section != Section::Session && !authenticated) {
+            if (!section.visible(tab) && !self.sections[section as usize].manual)
+                || (section != Section::Session && !authenticated)
+                || (section == Section::Snapshot && self.refresh.is_some())
+            {
                 continue;
             }
             // Keep a slot available for counters even when metadata endpoints
@@ -681,12 +696,79 @@ impl TuiNetwork {
         }
     }
 
+    pub(super) fn refresh_all(&mut self) {
+        for state in &mut self.sections {
+            state.manual = true;
+            if state.task.is_none() {
+                state.attempted_at = None;
+                state.retry_at = None;
+            }
+        }
+    }
+
+    fn invalidate_snapshot(&mut self) {
+        let state = &mut self.sections[Section::Snapshot as usize];
+        if let Some(task) = state.task.take() {
+            task.abort();
+        }
+        state.generation += 1;
+        state.attempted_at = None;
+        state.retry_at = None;
+    }
+
+    pub(super) fn refresh_pending(&self) -> bool {
+        self.refresh.is_some()
+    }
+
+    pub(super) fn reads_pending(&self) -> bool {
+        self.sections
+            .iter()
+            .any(|state| state.manual || state.task.is_some())
+    }
+
+    pub(super) fn refresh_quotas(
+        &mut self,
+        client: &GatewayClient,
+        target: Option<(String, String)>,
+    ) -> bool {
+        if self.refresh.is_some() || self.command.is_some() {
+            return false;
+        }
+        self.invalidate_snapshot();
+        self.refresh_generation += 1;
+        let generation = self.refresh_generation;
+        let client = client.clone();
+        let tx = self.tx.clone();
+        self.refresh = Some(tokio::spawn(async move {
+            let result = async {
+                let fields = target
+                    .into_iter()
+                    .flat_map(|(provider, file)| [("provider", provider), ("file_name", file)])
+                    .collect::<Vec<_>>();
+                let response = client.post_form("/models/refresh", &fields).await?;
+                ensure_action_success(&response)?;
+                let response = client.get(Section::Snapshot.path()).await?;
+                ensure_action_success(&response)?;
+                if !Section::Snapshot.valid_body(&response.body) {
+                    return Err("invalid quota snapshot response".to_string().into());
+                }
+                Ok(response.body)
+            }
+            .await;
+            let _ = tx
+                .send(NetworkEvent::QuotaRefresh { generation, result })
+                .await;
+        }));
+        true
+    }
+
     pub(super) fn invalidate(&mut self, include_session: bool) {
         for section in Section::ALL {
             if section == Section::Session && !include_session {
                 continue;
             }
             let state = &mut self.sections[section as usize];
+            state.manual = false;
             if let Some(task) = state.task.take() {
                 task.abort();
             }
@@ -697,6 +779,10 @@ impl TuiNetwork {
     }
 
     pub(super) fn forget_data(&mut self) {
+        if let Some(task) = self.refresh.take() {
+            task.abort();
+        }
+        self.refresh_generation += 1;
         self.invalidate(false);
         for section in Section::ALL
             .into_iter()
@@ -710,7 +796,7 @@ impl TuiNetwork {
     }
 
     pub(super) fn start_command(&mut self, client: &GatewayClient, command: TuiCommand) -> bool {
-        if self.command.is_some() {
+        if self.command.is_some() || self.refresh.is_some() {
             return false;
         }
         self.logging_in = matches!(command, TuiCommand::Login { .. });
@@ -744,6 +830,7 @@ impl TuiNetwork {
                         continue;
                     }
                     state.task = None;
+                    state.manual = false;
                     match result {
                         Ok(_) => {
                             state.succeeded_at = Some(Instant::now());
@@ -763,6 +850,24 @@ impl TuiNetwork {
                 NetworkEvent::Command(_) => {
                     self.command = None;
                     self.logging_in = false;
+                }
+                NetworkEvent::QuotaRefresh { generation, result } => {
+                    if *generation != self.refresh_generation {
+                        continue;
+                    }
+                    self.refresh = None;
+                    // A read begun before the POST must never replace its result.
+                    self.invalidate_snapshot();
+                    let state = &mut self.sections[Section::Snapshot as usize];
+                    state.manual = false;
+                    state.attempted_at = Some(Instant::now());
+                    if result.is_ok() {
+                        state.succeeded_at = Some(Instant::now());
+                        state.error = None;
+                        state.failures = 0;
+                    } else if let Err(error) = result {
+                        state.error = Some(error.message.clone());
+                    }
                 }
             }
             return Some(event);
@@ -843,6 +948,9 @@ impl Drop for TuiNetwork {
     fn drop(&mut self) {
         self.invalidate(true);
         if let Some(task) = self.command.take() {
+            task.abort();
+        }
+        if let Some(task) = self.refresh.take() {
             task.abort();
         }
     }
@@ -990,6 +1098,140 @@ mod tests {
         })
         .await
         .expect("background requests made progress");
+    }
+
+    #[tokio::test]
+    async fn focused_refresh_captures_target_coalesces_and_keeps_navigation_live() {
+        let mock = MockGateway::new().await;
+        let gate = Arc::new(Semaphore::new(0));
+        mock.reply(
+            "/models/refresh",
+            StatusCode::OK,
+            json!({"ok":true}),
+            Some(gate.clone()),
+        );
+        mock.reply(
+            Section::Routing.path(),
+            StatusCode::OK,
+            json!({"accounts":[
+                {"provider":"codex","key":"one","credential_file":"one.json","enabled":true},
+                {"provider":"gemini","key":"two","credential_file":"two.json","enabled":true}
+            ]}),
+            None,
+        );
+        let mut app = mock.app();
+        drive(&mut app, |app| {
+            app.data.accounts.len() == 2 && app.network.has_data(Section::Snapshot)
+        })
+        .await;
+        app.overview_section = OverviewSection::AccountUsage;
+        app.overview_account_selected = 0;
+        app.sync_selected_from_overview_section();
+        let expected = app.data.accounts[selected_overview_account_index_for_test(&app)]
+            .file_name
+            .clone();
+        app.refresh_quota(false);
+        app.move_selection(1);
+        for _ in 0..20 {
+            app.refresh_quota(false);
+            app.poll_network();
+        }
+        drive(&mut app, |_| mock.count("/models/refresh") == 1).await;
+        assert!(app.network.refresh_pending());
+        assert!(!app.has_modal());
+        let requests = mock.state.requests.lock().unwrap();
+        let (_, _, body, _) = requests
+            .iter()
+            .find(|(method, path, _, _)| method == "POST" && path == "/models/refresh")
+            .unwrap();
+        let form = String::from_utf8(body.clone()).unwrap();
+        assert!(form.contains(&format!("file_name={expected}")), "{form}");
+        assert!(form.contains("provider=cod"), "{form}");
+        drop(requests);
+        mock.reply(
+            Section::Snapshot.path(),
+            StatusCode::OK,
+            json!({"quotas":{"codex":{"accounts":[{"key":"one","used_percent":87}]}}}),
+            None,
+        );
+        gate.add_permits(1);
+        drive(&mut app, |app| {
+            !app.network.refresh_pending()
+                && app
+                    .data
+                    .quotas
+                    .iter()
+                    .any(|quota| quota.used_percent_value == Some(87.0))
+        })
+        .await;
+        assert_eq!(mock.count("/models/refresh"), 1);
+        assert!(app.network.has_data(Section::Snapshot));
+    }
+
+    fn selected_overview_account_index_for_test(app: &TuiApp) -> usize {
+        super::super::selected_overview_account_index(app).unwrap()
+    }
+
+    #[tokio::test]
+    async fn all_data_is_read_only_but_hard_reload_posts_unscoped_and_errors_recover() {
+        let mock = MockGateway::new().await;
+        let mut app = mock.app();
+        drive(&mut app, |app| app.network.has_data(Section::Chart)).await;
+        app.refresh();
+        drive(&mut app, |app| {
+            app.network.has_data(Section::Keys)
+                && app.network.has_data(Section::Notifications)
+                && !app.network.reads_pending()
+        })
+        .await;
+        assert_eq!(mock.count("/models/refresh"), 0);
+        mock.reply(
+            "/models/refresh",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"message":"refresh failed"}),
+            None,
+        );
+        app.refresh_quota(true);
+        drive(&mut app, |app| !app.network.refresh_pending()).await;
+        assert!(app.message.contains("refresh failed"));
+        assert!(app.network.has_data(Section::Snapshot));
+        mock.reply("/models/refresh", StatusCode::OK, json!({"ok":true}), None);
+        app.refresh_quota(true);
+        drive(&mut app, |app| {
+            !app.network.refresh_pending() && app.message == "quota refresh complete"
+        })
+        .await;
+        assert_eq!(mock.count("/models/refresh"), 2);
+        assert!(mock
+            .state
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, path, _, _)| method == "POST" && path == "/models/refresh")
+            .all(|(_, _, body, _)| body.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn missing_identity_and_unauthenticated_refresh_never_fan_out() {
+        let mock = MockGateway::new().await;
+        let mut app = mock.app();
+        app.refresh_quota(true);
+        assert!(app.message.contains("login required"));
+        drive(&mut app, |app| app.network.has_data(Section::Snapshot)).await;
+        app.refresh_quota(false);
+        assert!(app.message.contains("no focused account"));
+        assert_eq!(mock.count("/models/refresh"), 0);
+        mock.reply(
+            "/models/refresh",
+            StatusCode::UNAUTHORIZED,
+            json!({"message":"login required"}),
+            None,
+        );
+        app.refresh_quota(true);
+        drive(&mut app, |app| !app.network.refresh_pending()).await;
+        assert!(app.needs_login());
+        assert!(app.data.quotas.is_empty());
     }
 
     #[tokio::test]

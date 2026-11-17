@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "id": "pixel-cafe",
+  "version": "1.0.0",
+  "palette": {
+    "b": "#14100E", "w": "#30231D", "f": "#241B16", "g": "#2D2019",
+    "t": "#614025", "i": "#160F0D", "m": "#A86B3B", "o": "#DA9D5C",
+    "h": "#96C4A0", "c": "#7EA8C0", "d": "#877A6E", "a": "#EFB266",
+    "n": "#191A1B", "e": "#E9DAC5", "s": "#AA9A84", "l": "#748E55",
+    "p": "#AC7547", "v": "#111E2C", "u": "#233949", "k": "#D7AF72",
+    "r": "#473020", "z": "#BA874A", "q": "#456072", "j": "#F4CA7F",
+    "x": "#B3888E", "y": "#343436"
+  },
+  "sprites": {
+    "cat": {
+      "frame_ms": 380,
+      "frames": [
+        ["..n...n......", ".nxn.nxn.....", ".nnnnnnn.....", ".nknnnkn.....", "..nnxnn......", "..nnhnn......", "..nnnnnnn..n.", "..nnnnnnnn.nn", "..nnnnnnnnnn.", "..nyynnyyn...", ".nnn..nnn...."],
+        ["..n...n......", ".nxn.nxn.....", ".nnnnnnn.....", ".nknnnkn.....", "..nnxnn......", "..nnhnn......", "..nnnnnnn....", "..nnnnnnnnnn.", "..nnnnnnnn..n", "..nyynnyyn...", ".nnn..nnn...."],
+        ["..n...n......", ".nxn.nxn.....", ".nnnnnnn.....", ".nynnnyn.....", "..nnxnn......", "..nnhnn......", "..nnnnnnn..n.", "..nnnnnnnn.nn", "..nnnnnnnnnn.", "..nyynnyyn...", ".nnn..nnn...."],
+        ["..n...n......", ".nxn.nxn.....", ".nnnnnnn.....", ".nknnnkn.....", "..nnxnn......", "..nnhnn......", "..nnnnnnn....", "..nnnnnnnnnn.", "..nnnnnnnn..n", "..nyynnyyn...", ".nnn..nnn...."]
+      ]
+    },
+    "cat_light": {
+      "frame_ms": 480,
+      "frames": [
+        ["..e...e......", ".exe.exe.....", ".eeeeeee.....", ".eneeene.....", "..eexee......", "..eehee......", "..eeeeeee..e.", "..eeeeeeee.ee", "..eeeeeeeeee.", "..esseesse...", ".eee..eee...."],
+        ["..e...e......", ".exe.exe.....", ".eeeeeee.....", ".eneeene.....", "..eexee......", "..eehee......", "..eeeeeee....", "..eeeeeeeeee.", "..eeeeeeee..e", "..esseesse...", ".eee..eee...."],
+        ["..e...e......", ".exe.exe.....", ".eeeeeee.....", ".eseeese.....", "..eexee......", "..eehee......", "..eeeeeee..e.", "..eeeeeeee.ee", "..eeeeeeeeee.", "..esseesse...", ".eee..eee...."]
+      ]
+    },
+    "cat_sleep": {
+      "frame_ms": 1200,
+      "frames": [
+        [".............", ".............", ".............", "..e...e......", ".eeeeeee.....", ".eseeeseeee..", "..eexeeeeeee.", "..eeheesseeee", "..eeeeesseeee", "...eeeeeeeee.", "....sssssss.."],
+        [".............", ".............", ".............", "..e...e......", ".eeeeeee.....", ".eseeeseeee..", "..eexeeeeeee.", "..eeheesseeee", "..eeeeesseeee", "...eeeeeeeee.", "....sssssss.."]
+      ]
+    },
+    "plant": {
+      "frame_ms": 900,
+      "frames": [
+        ["....ll....", "...llll...", "l...ll....", "ll..ll..ll", ".ll.ll.ll.", "..llllll..", "...llll...", "....ll....", ".pppppppp.", ".pooooppp.", "..pppppp..", "..pppppp..", "...iiii..."],
+        [".....ll...", "....llll..", ".l..ll....", "ll..ll..ll", ".ll.ll.ll.", "..llllll..", "...llll...", "....ll....", ".pppppppp.", ".pooooppp.", "..pppppp..", "..pppppp..", "...iiii..."]
+      ]
+    },
+    "mug": {
+      "frame_ms": 1000,
+      "frames": [[".kkkk..", ".keekkk", ".keek.k", ".keekkk", ".kkkk..", "..ii..."]]
+    },
+    "terminal": {
+      "frame_ms": 600,
+      "frames": [
+        ["ttttttttttttttt", "tnnnnnnnnnnnnnt", "tnhhhhhhhhhnnnt", "tnhnnnnnnnhnnnt", "tnhnnhhnnnhnnnt", "tnhnnnnnnnhnnnt", "tnhhhhhhhhhnnnt", "tnnnnnnnnnnnnnt", "ttttttttttttttt", "......rrr......", "....rrrrrrr...."],
+        ["ttttttttttttttt", "tnnnnnnnnnnnnnt", "tnhhhhhhhhhnnnt", "tnhnnnnnnnhnnnt", "tnhnnhhhnnhnnnt", "tnhnnnnnnnhnnnt", "tnhhhhhhhhhnnnt", "tnnnnnnnnnnnnnt", "ttttttttttttttt", "......rrr......", "....rrrrrrr...."]
+      ]
+    },
+    "pastry": {
+      "frame_ms": 1500,
+      "frames": [["ttttttttttttttttt", "tooooooooooooooot", "tonnnnnnnnnnnnnot", "ton..kk....x..not", "ton.koko..eee.not", "ton.ookk..xxx.not", "ton..kk...eee.not", "tooooooooooooooot", "tonnnnnnnnnnnnnot", "ton..kk...kkk.not", "ton.kokk.kokoknot", "ton.kkok.kokkknot", "ton..kk...kkk.not", "tonnnnnnnnnnnnnot", "tooooooooooooooot", "ttttttttttttttttt"]]
+    },
+    "cat_sign": {
+      "frame_ms": 1800,
+      "frames": [
+        [".z.........z.", ".zz.......zz.", ".z.z.....z.z.", ".z..zzzzz..z.", ".z.........z.", "z...........z", "z..j.....j..z", "z...........z", "z.....z.....z", ".z...z.z...z.", ".z.........z.", "..zzzzzzzzz..", "............."],
+        [".o.........o.", ".oz.......zo.", ".z.o.....o.z.", ".z..zzzzz..z.", ".z.........z.", "z...........z", "z..j.....j..z", "z...........z", "z.....z.....z", ".z...z.z...z.", ".z.........z.", "..zzzzzzzzz..", "............."]
+      ]
+    },
+    "lock": {
+      "frame_ms": 1000,
+      "frames": [["..hhhhh..", ".hh...hh.", ".hh...hh.", ".hh...hh.", "hhhhhhhhh", "hhhhhhhhh", "hhhhnnhhh", "hhhhnnhhh", "hhhhhhhhh", ".hhhhhhh."]]
+    }
+  }
+}
