@@ -709,6 +709,7 @@
 
       .flow-section,
       .compatibility-section,
+      .terminal-section,
       .install-section,
       .closing-section {
         padding: clamp(82px, 10vw, 138px) 0;
@@ -990,6 +991,124 @@
       .install-section {
         border-bottom: 1px solid var(--line);
         background: var(--surface-raised);
+      }
+
+      .terminal-section {
+        border-bottom: 1px solid var(--line);
+      }
+
+      .terminal-gallery {
+        margin-top: clamp(36px, 5vw, 60px);
+      }
+
+      .terminal-tabs {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 16px;
+      }
+
+      .terminal-tabs button {
+        min-height: 44px;
+        padding: 9px 18px;
+        border: 1px solid var(--line-strong);
+        border-radius: 4px;
+        background: transparent;
+        color: var(--muted);
+        cursor: pointer;
+        font-family: var(--font-data);
+        font-size: 0.8rem;
+      }
+
+      .terminal-tabs button:hover,
+      .terminal-tabs button[aria-selected="true"] {
+        background: var(--signal-soft);
+        border-color: var(--blue-soft);
+        color: var(--ink);
+      }
+
+      .terminal-panel[hidden] {
+        display: none;
+      }
+
+      .terminal-panel {
+        margin: 0;
+      }
+
+      .terminal-preview-frame {
+        overflow-x: auto;
+        border: 1px solid var(--line-strong);
+        background: #000;
+      }
+
+      .terminal-preview-frame img {
+        width: 100%;
+        height: auto;
+      }
+
+      .terminal-panel figcaption {
+        margin: 14px 0 0;
+        color: var(--muted);
+        font-size: 0.88rem;
+      }
+
+      .terminal-panel figcaption a,
+      .terminal-note a,
+      .terminal-path a {
+        color: var(--blue-soft);
+        text-decoration: underline;
+        text-underline-offset: 3px;
+      }
+
+      .terminal-paths {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 40px;
+        margin-top: 36px;
+      }
+
+      .terminal-path {
+        border-top: 1px solid var(--line-strong);
+        padding-top: 22px;
+        min-width: 0;
+      }
+
+      .terminal-path h3 {
+        margin: 0;
+        font-size: 1.2rem;
+      }
+
+      .terminal-path p,
+      .terminal-note {
+        color: var(--muted);
+        font-size: 0.94rem;
+        line-height: 1.7;
+      }
+
+      .terminal-path code {
+        overflow-wrap: anywhere;
+      }
+
+      .terminal-shortcuts {
+        font-family: var(--font-data);
+        font-size: 0.78rem;
+      }
+
+      .terminal-note {
+        border-left: 2px solid var(--warning);
+        padding-left: 18px;
+        margin: 28px 0;
+      }
+
+      @media (max-width: 640px) {
+        .terminal-paths {
+          grid-template-columns: minmax(0, 1fr);
+          gap: 24px;
+        }
+
+        .terminal-tabs button {
+          padding-inline: 12px;
+        }
       }
 
       .install-layout {
@@ -1323,6 +1442,7 @@
 
         .flow-section,
         .compatibility-section,
+        .terminal-section,
         .install-section,
         .closing-section {
           padding-top: 76px;
@@ -1413,6 +1533,7 @@
             <a href="#flow">How it works</a>
             <a href="#controls">Controls</a>
             <a href="#compatibility">Endpoints</a>
+            <a href="#terminal">Terminal</a>
             <a href="#install">Install</a>
             <a href="/docs/">Docs</a>
             <a href="https://github.com/giofahreza/io-gateway">GitHub</a>
@@ -1429,6 +1550,7 @@
                 <a href="#flow">How it works</a>
                 <a href="#controls">Controls</a>
                 <a href="#compatibility">Endpoints</a>
+                <a href="#terminal">Terminal</a>
                 <a href="#install">Install</a>
                 <a href="/docs/">Docs</a>
                 <a href="https://github.com/giofahreza/io-gateway">GitHub</a>
@@ -1764,10 +1886,82 @@ POST /claude/v1/messages</code></pre>
         </div>
       </section>
 
+      <section class="terminal-section" id="terminal" aria-labelledby="terminal-title">
+        <div class="shell">
+          <div class="section-intro reveal">
+            <p class="section-index">04 / terminal</p>
+            <div class="section-title">
+              <h2 id="terminal-title">Your gateway, at the keyboard. A little company is optional.</h2>
+              <p>
+                Keep the dense management UI, or visit a café, office, or train platform.
+                One <code>iogw</code> binary. The same accounts, quota, login, and controls.
+                Add only the scene packs you want; the normal UI always opens first.
+              </p>
+            </div>
+          </div>
+
+          <div class="terminal-gallery reveal" data-terminal-gallery>
+            <div class="terminal-tabs" role="tablist" aria-label="Terminal UI previews">
+              <button type="button" id="terminal-tab-cafe" role="tab" aria-selected="true" aria-controls="terminal-panel-cafe">Pixel Café</button>
+              <button type="button" id="terminal-tab-normal" role="tab" aria-selected="false" aria-controls="terminal-panel-normal" tabindex="-1">Normal TUI</button>
+              <button type="button" id="terminal-tab-office" role="tab" aria-selected="false" aria-controls="terminal-panel-office" tabindex="-1">Pixel Office</button>
+              <button type="button" id="terminal-tab-station" role="tab" aria-selected="false" aria-controls="terminal-panel-station" tabindex="-1">Pixel Station</button>
+            </div>
+            <figure class="terminal-panel" id="terminal-panel-cafe" role="tabpanel" aria-labelledby="terminal-tab-cafe" tabindex="0">
+              <div class="terminal-preview-frame">
+                <img src="/assets/iogw-pixel-cafe.png" width="1518" height="672" loading="lazy" decoding="async" alt="Actual Pixel Café TUI with demo accounts: provider-colored cats, readable quota bubbles, a machine rack, and gateway statistics.">
+              </div>
+              <figcaption>Rain at the window, account cats at the counter. Static capture with demo accounts. <a href="/assets/iogw-pixel-cafe.png">Open full-size preview</a>.</figcaption>
+            </figure>
+            <figure class="terminal-panel" id="terminal-panel-normal" role="tabpanel" aria-labelledby="terminal-tab-normal" tabindex="0" hidden>
+              <div class="terminal-preview-frame">
+                <img src="/assets/iogw-tui.png" width="1518" height="672" loading="lazy" decoding="async" alt="Actual normal iogw TUI with demo accounts: metrics, custom models, provider accounts, and quota usage in keyboard-driven panels.">
+              </div>
+              <figcaption>The default management UI. No theme pack needed. Static capture with demo accounts. <a href="/assets/iogw-tui.png">Open full-size preview</a>.</figcaption>
+            </figure>
+            <figure class="terminal-panel" id="terminal-panel-office" role="tabpanel" aria-labelledby="terminal-tab-office" tabindex="0" hidden>
+              <div class="terminal-preview-frame">
+                <img src="/assets/iogw-pixel-office.png" width="1518" height="672" loading="lazy" decoding="async" alt="Actual Pixel Office TUI with demo accounts: cats at desks, monitors, plants, and account quota bubbles.">
+              </div>
+              <figcaption>Desks, night windows, and the same account controls. Static capture with demo accounts. <a href="/assets/iogw-pixel-office.png">Open full-size preview</a>.</figcaption>
+            </figure>
+            <figure class="terminal-panel" id="terminal-panel-station" role="tabpanel" aria-labelledby="terminal-tab-station" tabindex="0" hidden>
+              <div class="terminal-preview-frame">
+                <img src="/assets/iogw-pixel-station.png" width="1518" height="672" loading="lazy" decoding="async" alt="Actual Pixel Station TUI with demo accounts: a train, warm canopy, lanterns, a service cabinet, and account cats on a platform.">
+              </div>
+              <figcaption>A train comes and goes; your accounts stay in view. Static capture with demo accounts. <a href="/assets/iogw-pixel-station.png">Open full-size preview</a>.</figcaption>
+            </figure>
+            <noscript><p class="terminal-note">More previews: <a href="/assets/iogw-tui.png">Normal TUI</a>, <a href="/assets/iogw-pixel-office.png">Office</a>, <a href="/assets/iogw-pixel-station.png">Station</a>.</p></noscript>
+          </div>
+
+          <div class="terminal-paths reveal">
+            <div class="terminal-path">
+              <h3>Just the terminal.</h3>
+              <p>Use the <a href="#install">release installer</a> and choose to include <code>iogw</code>, or pass <code>--with-iogw</code> on Unix / <code>-InstallIogw</code> in PowerShell. Run <code>iogw</code>. No theme download or extra runtime is needed.</p>
+              <p>Already running a remote gateway? Extract only <code>iogw</code> from the platform archive and connect with <code>iogw --base-url https://your-gateway.example.com</code>.</p>
+            </div>
+            <div class="terminal-path">
+              <h3>A scene on the side.</h3>
+              <p>From a compatible release, download a theme JSON and check its SHA-256. Run <code>iogw plugins install ./iogw-pixel-cafe.json</code>, then open <code>iogw</code>. Office and Station are independent optional downloads, not another installer.</p>
+              <p class="terminal-shortcuts">F4 / Ctrl+V → animated &nbsp; t → theme &nbsp; b → bubbles &nbsp; Space → pause &nbsp; Esc → normal</p>
+            </div>
+          </div>
+          <p class="terminal-note">
+            Previews show the current source build. Older releases such as v0.1.20 do not include theme packs;
+            check the release Assets or use the source-build guide. Cat and train motion is decorative, not live request activity.
+            Hardware readings are local to the machine running <code>iogw</code>; unavailable counters show N/A.
+          </p>
+          <div class="button-row">
+            <a class="button button-primary" href="/docs/terminal-ui/">Install the terminal UI</a>
+            <a class="button button-secondary" href="https://github.com/giofahreza/io-gateway/releases">Check release assets</a>
+          </div>
+        </div>
+      </section>
+
       <section class="install-section" id="install" aria-labelledby="install-title">
         <div class="shell">
           <div class="section-intro reveal">
-            <p class="section-index">04 / install</p>
+            <p class="section-index">05 / install</p>
             <div class="section-title">
               <h2 id="install-title">Install a native build. Answer the questions that affect your machine.</h2>
               <p>
@@ -1811,7 +2005,7 @@ POST /claude/v1/messages</code></pre>
                 </div>
                 <div>
                   <dt>terminal</dt>
-                  <dd><strong>Choose whether to add the <code>iogw</code> TUI.</strong> The optional companion is installed only when you want it.</dd>
+                  <dd><strong>Choose whether to add the <code>iogw</code> TUI.</strong> It opens the normal UI first; animated artwork is a separate optional download. <a href="/docs/terminal-ui/">Preview and install themes</a>.</dd>
                 </div>
                 <div>
                   <dt>network</dt>
@@ -1901,6 +2095,32 @@ POST /claude/v1/messages</code></pre>
           }
         });
       }
+
+      document.querySelectorAll("[data-terminal-gallery]").forEach((gallery) => {
+        const tabs = [...gallery.querySelectorAll('[role="tab"]')];
+        function selectTab(selected, focus = false) {
+          tabs.forEach((tab) => {
+            const active = tab === selected;
+            tab.setAttribute("aria-selected", String(active));
+            tab.tabIndex = active ? 0 : -1;
+            document.getElementById(tab.getAttribute("aria-controls")).hidden = !active;
+          });
+          if (focus) selected.focus();
+        }
+        tabs.forEach((tab, index) => {
+          tab.addEventListener("click", () => selectTab(tab));
+          tab.addEventListener("keydown", (event) => {
+            let next;
+            if (event.key === "ArrowRight") next = (index + 1) % tabs.length;
+            if (event.key === "ArrowLeft") next = (index - 1 + tabs.length) % tabs.length;
+            if (event.key === "Home") next = 0;
+            if (event.key === "End") next = tabs.length - 1;
+            if (next === undefined) return;
+            event.preventDefault();
+            selectTab(tabs[next], true);
+          });
+        });
+      });
 
       const copyStatus = document.getElementById("copy-status");
 
