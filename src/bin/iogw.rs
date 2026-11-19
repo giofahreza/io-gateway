@@ -523,9 +523,24 @@ impl OverviewSection {
 }
 
 enum ConfirmationAction {
-    DeleteAccount { file_name: String },
-    DeleteCustomModel { alias: String },
-    RevokeApiKey { id: String },
+    SaveClaudeResetPolicy {
+        body: Value,
+    },
+    ConsumeReset {
+        provider: String,
+        file_name: String,
+        credit_id: String,
+        program: String,
+    },
+    DeleteAccount {
+        file_name: String,
+    },
+    DeleteCustomModel {
+        alias: String,
+    },
+    RevokeApiKey {
+        id: String,
+    },
 }
 
 struct ConfirmationModal {
@@ -1380,6 +1395,16 @@ async fn run_tui_loop(
         }
         if app.show_account_details {
             match key.code {
+                KeyCode::Char('s') => {
+                    if let Err(error) = app.edit_claude_reset_policy(terminal) {
+                        app.message = error;
+                    }
+                }
+                KeyCode::Char('z') => {
+                    if let Err(error) = app.request_reset_confirmation(terminal) {
+                        app.message = error;
+                    }
+                }
                 KeyCode::Esc
                 | KeyCode::Enter
                 | KeyCode::Char('?')
@@ -1563,6 +1588,22 @@ async fn run_tui_loop(
                     && app.overview_section == OverviewSection::AccountUsage =>
             {
                 if let Err(error) = app.edit_selected_compatible_account(terminal) {
+                    app.message = error;
+                }
+            }
+            KeyCode::Char('s')
+                if app.tab == Tab::Overview
+                    && app.overview_section == OverviewSection::AccountUsage =>
+            {
+                if let Err(error) = app.edit_claude_reset_policy(terminal) {
+                    app.message = error;
+                }
+            }
+            KeyCode::Char('z')
+                if app.tab == Tab::Overview
+                    && app.overview_section == OverviewSection::AccountUsage =>
+            {
+                if let Err(error) = app.request_reset_confirmation(terminal) {
                     app.message = error;
                 }
             }
@@ -2811,6 +2852,115 @@ impl TuiApp {
         self.start_command(TuiCommand::SaveModel { body });
     }
 
+    fn request_reset_confirmation(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<(), String> {
+        let account = self.selected_account().ok_or("Select an account")?;
+        if !account.enabled
+            || account.file_name.is_empty()
+            || !["codex", "claude"].contains(&account.provider.as_str())
+        {
+            return Err("Select an enabled Codex or Claude account".into());
+        }
+        let values = account_snapshot_values(&self.data.snapshot, &account);
+        if values.iter().any(|v| {
+            matches!(
+                v.pointer("/last_reset_action/state")
+                    .and_then(Value::as_str),
+                Some("submitted" | "manual_review")
+            )
+        }) {
+            return Err("Review the previous Claude reset outcome before another reset".into());
+        }
+        let credits = selectable_reset_credits(&values, &account.provider);
+        if credits.is_empty() {
+            return Err("No concrete usable reset reported; refresh the account".into());
+        }
+        let notice = credits
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                format!(
+                    "{}: {} · {}",
+                    i + 1,
+                    string_at(c, &["title"]),
+                    string_at(c, &["description"])
+                )
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let choice =
+            prompt_in_terminal_with_notice(terminal, &notice, "Reset number (blank = cancel): ")?;
+        if choice.trim().is_empty() {
+            return Ok(());
+        }
+        let selected = choice
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|n| credits.get(n))
+            .ok_or("Choose a listed reset number")?;
+        self.show_account_details = false;
+        self.confirmation_modal = Some(ConfirmationModal {
+            title: "Use limit reset".into(),
+            message: format!("Use {} for {}? This spends a reset allowance. The gateway will check fresh eligibility first.", string_at(selected,&["title"]), account_display(&account)),
+            action: ConfirmationAction::ConsumeReset { provider: account.provider, file_name: account.file_name,
+                credit_id:string_at(selected,&["id"]), program:string_at(selected,&["program"]) },
+        });
+        Ok(())
+    }
+
+    fn edit_claude_reset_policy(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<(), String> {
+        let account = self.selected_account().ok_or("Select a Claude account")?;
+        if account.provider != "claude" {
+            return Err("Scheduling shortcut applies to Claude accounts".into());
+        }
+        let values = account_snapshot_values(&self.data.snapshot, &account);
+        let mut body = values
+            .iter()
+            .find_map(|v| v.get("reset_automation"))
+            .cloned()
+            .ok_or("Refresh account data to load Claude scheduling")?;
+        let enabled = prompt_in_terminal_with_notice(terminal, "Automatic resets can spend expiring reset allowances when a limit is reached. Blank cancels.", "Enable automatic resets? (yes/no, blank = cancel): ")?;
+        if enabled.trim().is_empty() {
+            return Ok(());
+        }
+        body["enabled"] = match enabled.trim().to_ascii_lowercase().as_str() {
+            "yes" | "y" => json!(true),
+            "no" | "n" => json!(false),
+            _ => return Err("Enter yes or no".into()),
+        };
+        for (key, label) in [
+            ("scan_interval_minutes", "Scan interval"),
+            ("expiry_window_minutes", "Upper expiry window"),
+            ("final_attempt_minutes", "Final check before expiry"),
+            (
+                "min_natural_reset_remaining_minutes",
+                "Avoid natural reset within",
+            ),
+        ] {
+            let current = body[key].as_i64().unwrap_or(0);
+            let input = prompt_in_terminal(terminal, &format!("{label} minutes [{current}]: "))?;
+            if !input.trim().is_empty() {
+                body[key] = json!(input
+                    .trim()
+                    .parse::<i64>()
+                    .map_err(|_| "Enter whole minutes")?);
+            }
+        }
+        self.show_account_details = false;
+        self.confirmation_modal=Some(ConfirmationModal{title:"Save Claude automatic resets".into(),message:format!("Save {} scheduling for {}? Enabled scheduling may spend expiring reset allowances.",if body["enabled"]==true{"enabled"}else{"disabled"},account_display(&account)),action:ConfirmationAction::SaveClaudeResetPolicy{body}});
+        Ok(())
+    }
+
     fn request_delete_confirmation(&mut self) {
         if self.tab == Tab::Keys {
             let Some(key) = self.selected_api_key() else {
@@ -2858,7 +3008,7 @@ impl TuiApp {
 
     fn cancel_confirmation(&mut self) {
         self.confirmation_modal = None;
-        self.message = "delete cancelled".to_string();
+        self.message = "action cancelled".to_string();
     }
 
     fn confirm_selection(&mut self) {
@@ -2866,6 +3016,20 @@ impl TuiApp {
             return;
         };
         match modal.action {
+            ConfirmationAction::SaveClaudeResetPolicy { body } => {
+                self.start_command(TuiCommand::SaveClaudeResetPolicy { body })
+            }
+            ConfirmationAction::ConsumeReset {
+                provider,
+                file_name,
+                credit_id,
+                program,
+            } => self.start_command(TuiCommand::ConsumeReset {
+                provider,
+                file_name,
+                credit_id,
+                program,
+            }),
             ConfirmationAction::DeleteAccount { file_name } => {
                 self.start_command(TuiCommand::DeleteAccount { file_name })
             }
@@ -3260,6 +3424,15 @@ fn focused_account_footer(app: &TuiApp, width: u16) -> Vec<String> {
         }
         fields.extend(app.animation.focused_limits(width));
         let values = account_snapshot_values(&app.data.snapshot, &account);
+        if ["codex", "claude"].contains(&account.provider.as_str()) {
+            if let Some(value) = values.iter().find(|v| v.get("credits").is_some()) {
+                fields.extend(
+                    provider_quota_summary::credit_fields(value)
+                        .into_iter()
+                        .map(|f| format!("{} {}", f.label, f.value)),
+                );
+            }
+        }
         if let Some(plan) = values
             .iter()
             .find_map(|value| first_string_recursive(value, &["plan_type", "account_type"]))
@@ -4875,6 +5048,14 @@ fn command_modal_rows(app: &TuiApp) -> Vec<(String, String)> {
                     ));
                     rows.push(("Enter".to_string(), "show account details".to_string()));
                     rows.push((
+                        "s".to_string(),
+                        "edit Claude automatic reset policy (confirmation required)".to_string(),
+                    ));
+                    rows.push((
+                        "z".to_string(),
+                        "select a Codex/Claude limit reset (confirmation required)".to_string(),
+                    ));
+                    rows.push((
                         "n".to_string(),
                         "add an account (choose provider)".to_string(),
                     ));
@@ -5068,13 +5249,46 @@ fn draw_account_details_modal(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             }
         }
     }
+    if ["codex", "claude"].contains(&account.provider.as_str()) {
+        lines.push(detail_section("Credits"));
+        let empty = json!({});
+        for field in provider_quota_summary::credit_fields(
+            snapshot_values
+                .iter()
+                .copied()
+                .find(|v| v.get("credits").is_some())
+                .unwrap_or(&empty),
+        ) {
+            lines.push(detail_line(&field.label, field.value));
+        }
+    }
+    if account.provider == "claude" {
+        for value in &snapshot_values {
+            if let Some(p) = value.get("reset_automation") {
+                lines.push(detail_section("Automatic resets"));
+                lines.push(detail_line(
+                    "Policy",
+                    if p["enabled"] == true {
+                        "Enabled"
+                    } else {
+                        "Disabled"
+                    },
+                ));
+                lines.push(detail_line("Schedule", format!("Every {} min; expiry window {} min; final check {} min; avoid natural reset within {} min", p["scan_interval_minutes"],p["expiry_window_minutes"],p["final_attempt_minutes"],p["min_natural_reset_remaining_minutes"])));
+                lines.push(detail_line(
+                    "Manage",
+                    "s: edit Claude automatic reset policy",
+                ));
+            }
+        }
+    }
     lines.push(detail_section("Available reset limit"));
     match reset_credits {
         Some((count, credits)) => {
             lines.push(detail_line(
                 "Available",
                 format!(
-                    "{count} reset credit{} (snapshot only)",
+                    "{count} reset credit{} (snapshot; fresh check before use)",
                     if count == 1 { "" } else { "s" },
                 ),
             ));
@@ -5083,6 +5297,24 @@ fn draw_account_details_modal(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             }
         }
         None => lines.push(detail_line("Available", "Not reported by this provider")),
+    }
+    if ["codex", "claude"].contains(&account.provider.as_str()) {
+        lines.push(detail_line(
+            "Manage",
+            "z: select a reset, then confirm; R: refresh from account list",
+        ));
+        for value in &snapshot_values {
+            if let Some(action) = value.get("last_reset_action") {
+                lines.push(detail_line(
+                    "Last reset",
+                    format!(
+                        "{} {}",
+                        string_at(action, &["state"]),
+                        string_at(action, &["updated_at"])
+                    ),
+                ));
+            }
+        }
     }
 
     lines.push(detail_section("Models"));
@@ -5767,6 +5999,13 @@ fn reset_credit_details(values: &[&Value]) -> Option<(u64, Vec<String>)> {
                         if let Some(expires) = expires.filter(|value| !value.trim().is_empty()) {
                             line.push_str(&format!("; expires {expires}"));
                         }
+                        if let Some(description) = credit.get("description").and_then(Value::as_str)
+                        {
+                            line.push_str(&format!("; {description}"));
+                        }
+                        if credit.get("usable_now") == Some(&Value::Bool(false)) {
+                            line.push_str("; currently unavailable");
+                        }
                         Some(line)
                     })
                     .collect::<Vec<_>>()
@@ -5775,6 +6014,25 @@ fn reset_credit_details(values: &[&Value]) -> Option<(u64, Vec<String>)> {
         return Some((count, credits));
     }
     None
+}
+
+fn selectable_reset_credits(values: &[&Value], provider: &str) -> Vec<Value> {
+    values
+        .iter()
+        .filter_map(|v| v.get("rate_limit_reset_credits"))
+        .filter(|s| number_at(s, &["available_count"]) > 0)
+        .filter_map(|s| s.get("credits").and_then(Value::as_array))
+        .flatten()
+        .filter(|c| {
+            !string_at(c, &["id"]).is_empty()
+                && c.get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("available")
+                    == "available"
+                && (provider != "claude" || c.get("usable_now") == Some(&Value::Bool(true)))
+        })
+        .cloned()
+        .collect()
 }
 
 fn snapshot_model_names(values: &[&Value]) -> Vec<String> {

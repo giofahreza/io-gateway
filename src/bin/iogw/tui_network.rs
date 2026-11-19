@@ -178,6 +178,15 @@ pub(super) enum TuiCommand {
         file_name: String,
         enabled: bool,
     },
+    SaveClaudeResetPolicy {
+        body: Value,
+    },
+    ConsumeReset {
+        provider: String,
+        file_name: String,
+        credit_id: String,
+        program: String,
+    },
     SaveModel {
         body: Value,
     },
@@ -305,6 +314,33 @@ impl TuiCommand {
                     .post_form(
                         "/credentials/toggle",
                         &[("file_name", file_name), ("enabled", enabled.to_string())],
+                    )
+                    .await
+            }
+            Self::SaveClaudeResetPolicy { body } => {
+                client
+                    .post_json("/admin/claude/reset-credit-automation", Some(body))
+                    .await
+            }
+            Self::ConsumeReset {
+                provider,
+                file_name,
+                credit_id,
+                program,
+            } => {
+                if !["codex", "claude"].contains(&provider.as_str()) {
+                    return Err("Only Codex and Claude expose reset controls"
+                        .to_string()
+                        .into());
+                }
+                let mut fields = vec![("file_name", file_name), ("credit_id", credit_id)];
+                if provider == "claude" {
+                    fields.push(("program", program));
+                }
+                client
+                    .post_form(
+                        &format!("/{provider}/rate-limit-reset-credit/consume"),
+                        &fields,
                     )
                     .await
             }

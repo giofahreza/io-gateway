@@ -13,7 +13,7 @@ use std::time::Duration;
 const REQUEST_TIMEOUT_SECS: u64 = 20;
 const USAGE_PATH: &str = "/api/oauth/usage";
 const OAUTH_USAGE_BETA: &str = "oauth-2025-04-20";
-const CLAUDE_CODE_USER_AGENT: &str = "claude-code/2.1.71";
+const CLAUDE_CODE_USER_AGENT: &str = super::CLAUDE_CODE_CLI_USER_AGENT;
 
 #[derive(Clone, Debug)]
 pub struct QuotaCacheEntry {
@@ -38,6 +38,8 @@ pub struct QuotaSummary {
     pub limits: Vec<RateLimitSummary>,
     pub models: Vec<ModelSummary>,
     pub rate_limit_headers: Vec<HeaderSummary>,
+    pub credits: Option<Value>,
+    pub rate_limit_reset_credits: Option<Value>,
     pub raw_usage: Value,
 }
 
@@ -112,6 +114,10 @@ pub async fn get_quota_summaries(state: &crate::AppState) -> Vec<Value> {
         };
 
         let mut payload = summary_json(account, &entry.summary);
+        payload["reset_automation"] = super::reset_automation::account_policy(&state.cfg, account);
+        if let Some(action) = super::resets::last_action(&state.cfg, account) {
+            payload["last_reset_action"] = action;
+        }
         if let Some(err) = entry.error {
             if let Some(obj) = payload.as_object_mut() {
                 obj.insert("error".to_string(), Value::String(err.clone()));
@@ -226,6 +232,8 @@ fn summary_json(account: &super::accounts::ClaudeAccount, summary: &QuotaSummary
         "limits": summary.limits,
         "models": summary.models,
         "rate_limit_headers": summary.rate_limit_headers,
+        "credits": summary.credits,
+        "rate_limit_reset_credits": summary.rate_limit_reset_credits,
         "raw_usage": summary.raw_usage,
     })
 }
@@ -286,14 +294,18 @@ async fn fetch_account_quota(
     }
 }
 
-async fn fetch_oauth_usage(
+pub(super) async fn fetch_oauth_usage(
     client: &reqwest::Client,
     account: &super::accounts::ClaudeAccount,
     access_token: &str,
 ) -> Result<Value, String> {
     let base = super::auth::api_base_url(account.api_base_url.as_deref());
     let resp = client
-        .get(format!("{}{}", base.trim_end_matches('/'), USAGE_PATH))
+        .get(format!(
+            "{}{}?cedar_ember=1&at_wall=1",
+            base.trim_end_matches('/'),
+            USAGE_PATH
+        ))
         .header("Authorization", format!("Bearer {}", access_token.trim()))
         .header("Accept", "application/json")
         .header("Content-Type", "application/json")
@@ -306,7 +318,7 @@ async fn fetch_oauth_usage(
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("Claude usage returned {}: {}", status, text));
+        return Err(format!("Claude usage returned {}", status));
     }
     serde_json::from_str(&text).map_err(|err| format!("Claude usage JSON parse failed: {}", err))
 }
@@ -350,6 +362,8 @@ fn summary_from_usage(account: &super::accounts::ClaudeAccount, raw: Value) -> Q
     if let Some(extra_usage) = extra_usage_limit(raw.get("extra_usage")) {
         summary.limits.push(extra_usage);
     }
+    summary.credits = usage_credits(&raw);
+    summary.rate_limit_reset_credits = super::resets::summarize(&raw);
     summary.raw_usage = raw;
     summary.is_available = true;
     summary.status_msg = if has_any_quota(&summary) {
@@ -359,6 +373,57 @@ fn summary_from_usage(account: &super::accounts::ClaudeAccount, raw: Value) -> Q
             .to_string()
     };
     summary
+}
+
+/// Keep monetary credits separate from a spend cap and from reset grants.
+/// Current Claude money objects carry integer minor units and an exponent.
+fn usage_credits(raw: &Value) -> Option<Value> {
+    let spend = raw.get("spend").filter(|v| v.is_object());
+    let extra = raw.get("extra_usage").filter(|v| v.is_object());
+    if spend.is_none() && extra.is_none() {
+        return None;
+    }
+    let balance = spend.and_then(|s| money(s.get("balance")));
+    let used = spend.and_then(|s| money(s.get("used")));
+    let limit = spend.and_then(|s| money(s.get("limit")));
+    let enabled = spend
+        .and_then(|s| s.get("enabled").and_then(Value::as_bool))
+        .or_else(|| extra.and_then(|e| e.get("is_enabled").and_then(Value::as_bool)));
+    Some(json!({
+        "enabled": enabled,
+        "balance": balance.as_ref().map(|m| &m.0),
+        "currency": balance.as_ref().or(used.as_ref()).or(limit.as_ref()).map(|m| &m.1),
+        "used": used.as_ref().map(|m| &m.0),
+        "monthly_limit": limit.as_ref().map(|m| &m.0),
+        "note": if balance.is_none() { "Prepaid balance not reported; a spend limit is not a credit balance." } else { "" }
+    }))
+}
+
+fn money(value: Option<&Value>) -> Option<(String, String)> {
+    let value = value?.as_object()?;
+    let amount = value.get("amount_minor")?.as_i64()?;
+    let exponent = value.get("exponent")?.as_u64()?;
+    if exponent > 9 {
+        return None;
+    }
+    let currency = value.get("currency")?.as_str()?;
+    if currency.len() != 3 || !currency.bytes().all(|b| b.is_ascii_uppercase()) {
+        return None;
+    }
+    let scale = 10_u64.pow(exponent as u32);
+    let abs = amount.unsigned_abs();
+    let sign = if amount < 0 { "-" } else { "" };
+    let text = if exponent == 0 {
+        amount.to_string()
+    } else {
+        format!(
+            "{sign}{}.{:0width$}",
+            abs / scale,
+            abs % scale,
+            width = exponent as usize
+        )
+    };
+    Some((text, currency.to_string()))
 }
 
 fn summary_from_headers(
@@ -581,6 +646,7 @@ fn extra_usage_limit(value: Option<&Value>) -> Option<RateLimitSummary> {
         .into_iter()
         .find_map(|key| extra.get(key).and_then(number_value));
     let used = [
+        "used_credits",
         "used",
         "usage",
         "current_usage",
@@ -856,6 +922,26 @@ fn has_any_quota(summary: &QuotaSummary) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monetary_credits_preserve_minor_units_and_do_not_invent_balance_from_cap() {
+        let raw = json!({"spend":{"enabled":false,"balance":null,"limit":{"amount_minor":10000,"currency":"USD","exponent":2},"used":{"amount_minor":125,"currency":"USD","exponent":2}}});
+        let credits = usage_credits(&raw).unwrap();
+        assert_eq!(credits["used"], "1.25");
+        assert_eq!(credits["monthly_limit"], "100.00");
+        assert!(credits["balance"].is_null());
+        assert_eq!(credits["enabled"], false);
+        assert_eq!(
+            money(Some(
+                &json!({"amount_minor":0,"currency":"JPY","exponent":0})
+            )),
+            Some(("0".into(), "JPY".into()))
+        );
+        assert!(money(Some(
+            &json!({"amount_minor":1,"currency":"USD","exponent":99})
+        ))
+        .is_none());
+    }
 
     #[test]
     fn oauth_usage_bucket_keeps_percent_scale() {

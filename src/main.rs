@@ -91,7 +91,7 @@ struct GatewayArgs {
     #[arg(long, value_name = "NEW_DIRECTORY")]
     backup_policy: Option<PathBuf>,
 }
-const MOBILE_QUOTA_SCALAR_KEYS: [&str; 25] = [
+const MOBILE_QUOTA_SCALAR_KEYS: [&str; 39] = [
     "label",
     "email",
     "login",
@@ -117,8 +117,22 @@ const MOBILE_QUOTA_SCALAR_KEYS: [&str; 25] = [
     "limit_text",
     "user_id",
     "team_id",
+    "balance",
+    "currency",
+    "has_credits",
+    "unlimited",
+    "enabled",
+    "monthly_limit",
+    "note",
+    "state",
+    "updated_at",
+    "account_key",
+    "scan_interval_minutes",
+    "expiry_window_minutes",
+    "final_attempt_minutes",
+    "min_natural_reset_remaining_minutes",
 ];
-const MOBILE_QUOTA_CONTAINER_KEYS: [&str; 12] = [
+const MOBILE_QUOTA_CONTAINER_KEYS: [&str; 15] = [
     "code_generation",
     "code_review",
     "five_hour",
@@ -131,8 +145,11 @@ const MOBILE_QUOTA_CONTAINER_KEYS: [&str; 12] = [
     "groups",
     "limits",
     "current_window",
+    "credits",
+    "last_reset_action",
+    "reset_automation",
 ];
-const MOBILE_RATE_LIMIT_RESET_CREDIT_SCALAR_KEYS: [&str; 7] = [
+const MOBILE_RATE_LIMIT_RESET_CREDIT_SCALAR_KEYS: [&str; 10] = [
     "id",
     "reset_type",
     "status",
@@ -140,6 +157,9 @@ const MOBILE_RATE_LIMIT_RESET_CREDIT_SCALAR_KEYS: [&str; 7] = [
     "expires_at",
     "title",
     "description",
+    "program",
+    "unavailable_reason",
+    "next_available_at",
 ];
 
 #[derive(Clone)]
@@ -2234,6 +2254,10 @@ async fn main() {
         .route("/admin/api-keys/access", any(admin_api_keys_access_route))
         .route("/admin/api-keys/revoke", any(admin_api_keys_revoke_route))
         .route(
+            "/admin/claude/reset-credit-automation",
+            any(admin_claude_reset_credit_automation_route),
+        )
+        .route(
             "/admin/codex/reset-credit-automation",
             any(admin_codex_reset_credit_automation_route),
         )
@@ -2250,6 +2274,10 @@ async fn main() {
         .route(
             "/codex/rate-limit-reset-credit/consume",
             post(codex_rate_limit_reset_consume_route),
+        )
+        .route(
+            "/claude/rate-limit-reset-credit/consume",
+            post(claude_rate_limit_reset_consume_route),
         )
         .route("/credentials/delete", any(delete_credential_route))
         .route("/credentials/toggle", any(toggle_credential_route))
@@ -2338,6 +2366,9 @@ async fn main() {
 
     let quota_refresh = tokio::spawn(background_quota_refresh(state.clone()));
     let maintenance = tokio::spawn(background_maintenance(state.clone()));
+    let claude_reset_worker = tokio::spawn(target::claude::reset_automation::background_worker(
+        state.clone(),
+    ));
     let reset_credit_worker = tokio::spawn(codex_reset_credit::background_worker(state.clone()));
 
     let addr: SocketAddr = state.cfg.listen.parse().expect("invalid listen address");
@@ -2359,6 +2390,7 @@ async fn main() {
     quota_refresh.abort();
     maintenance.abort();
     reset_credit_worker.abort();
+    claude_reset_worker.abort();
     let (flushed_tx, flushed_rx) = mpsc::sync_channel(0);
     if state
         .persistence_tx
@@ -5591,7 +5623,7 @@ async fn dashboard() -> impl IntoResponse {
           }, 0);
         }
         if (target === 'test-api') prepareTestApiPanel();
-        if (target === 'reset-credits') loadCodexResetCreditAutomation();
+        if (target === 'reset-credits') { loadCodexResetCreditAutomation(); loadClaudeResetAutomation(); }
       }
       async function loadNotificationSettings() {
         setText('notificationStatus', 'Loading notification settings...');
@@ -5896,6 +5928,46 @@ async fn dashboard() -> impl IntoResponse {
           throw new Error(label + ' must be a whole number between ' + minimum + ' and ' + maximum + '.');
         }
         return value;
+      }
+      var claudeResetScheduling = null;
+      function populateClaudeResetPolicy() {
+        var select = document.getElementById('claudeResetAccount');
+        var data = claudeResetScheduling;
+        if (!select || !data) return;
+        var p = (data.policies || []).find(p => p.account_key === select.value) || data.defaults;
+        document.getElementById('claudeResetEnabled').checked = !!p.enabled;
+        ['scan_interval_minutes','expiry_window_minutes','final_attempt_minutes','min_natural_reset_remaining_minutes'].forEach(key => { document.getElementById('claudeReset_' + key).value = p[key]; });
+        var status = (data.statuses || []).find(s => s.account_key === select.value);
+        setText('claudeResetStatus', status ? status.status : 'Disabled until you save an enabled policy.');
+        document.getElementById('claudeResetActions').innerHTML = (data.actions || []).filter(a => a.account_key === select.value).map(a => '<div class="reset-credit-item"><div class="reset-credit-main"><div class="reset-credit-title">' + escapeHtml(a.state) + '</div><div class="reset-credit-meta">' + escapeHtml(a.credit_id + ' · ' + a.source + ' · ' + a.updated_at) + '</div></div></div>').join('');
+      }
+      async function loadClaudeResetAutomation() {
+        try {
+          const res = await adminFetch('/admin/claude/reset-credit-automation');
+          const data = await res.json();
+          if (!res.ok || !data.ok) throw new Error(data.message || 'Could not load Claude scheduling');
+          claudeResetScheduling = data;
+          const select = document.getElementById('claudeResetAccount');
+          const previous = select.value;
+          const options = (data.accounts || []).slice();
+          (data.policies || []).forEach(p => { if (!options.some(a => a.account_key === p.account_key)) options.push({account_key:p.account_key,label:p.account_key + ' (unavailable)'}); });
+          select.innerHTML = options.map(a => '<option value="' + escapeHtml(a.account_key) + '">' + escapeHtml(a.label) + '</option>').join('');
+          if (options.some(a => a.account_key === previous)) select.value = previous;
+          document.getElementById('saveClaudeResetPolicy').disabled = !options.length;
+          populateClaudeResetPolicy();
+        } catch (error) { setText('claudeResetStatus', error.message); }
+      }
+      async function saveClaudeResetAutomation() {
+        const p = { account_key:document.getElementById('claudeResetAccount').value, enabled:document.getElementById('claudeResetEnabled').checked };
+        ['scan_interval_minutes','expiry_window_minutes','final_attempt_minutes','min_natural_reset_remaining_minutes'].forEach(key => { p[key] = Number(document.getElementById('claudeReset_' + key).value); });
+        if (p.enabled && !window.confirm('Enable automatic Claude resets for this account? The gateway may spend expiring reset allowances when you reach a limit.')) return;
+        try {
+          const res = await adminFetch('/admin/claude/reset-credit-automation', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});
+          const data = await res.json();
+          if (!res.ok || !data.ok) throw new Error(data.message || 'Could not save Claude scheduling');
+          await loadClaudeResetAutomation();
+          setText('claudeResetStatus', p.enabled ? 'Enabled. The next scheduling check runs within 30 seconds.' : 'Disabled. Unsubmitted scheduled actions cancelled.');
+        } catch (error) { setText('claudeResetStatus', error.message); }
       }
       async function loadCodexResetCreditAutomation() {
         setText('codexResetCreditAutomationStatus', 'Loading Codex reset-credit automation...');
@@ -7824,7 +7896,7 @@ async fn dashboard() -> impl IntoResponse {
         return bars ? '<div class="card-quota">' + bars + '</div>' : '';
       }
       function formatResetCreditExpiry(credit) {
-        if (!credit || !credit.expires_at) return 'No expiration';
+        if (!credit || !credit.expires_at) return 'Expiry not reported';
         var formatted = formatDashboardDateTime(credit.expires_at, credit.expires_at);
         return 'Expires at ' + formatted;
       }
@@ -7832,23 +7904,43 @@ async fn dashboard() -> impl IntoResponse {
         if (!credit) return 'Usage limit reset';
         return credit.title || credit.description || credit.id || 'Usage limit reset';
       }
-      function renderCodexResetCredits(a, quota) {
+      function renderUsageCredits(quota) {
+        var credits = quota && quota.credits || {};
+        var currency = credits.currency ? ' ' + credits.currency : '';
+        var balance = credits.unlimited === true ? 'Unlimited'
+          : credits.balance != null && credits.balance !== '' ? String(credits.balance) + currency
+          : credits.has_credits === false ? 'No credits available'
+          : credits.has_credits === true ? 'Available; balance not reported' : 'Not reported';
+        var rows = [['Available credits', balance]];
+        if (typeof credits.enabled === 'boolean') rows.push(['Usage credits', credits.enabled ? 'Enabled' : 'Disabled']);
+        if (credits.used != null) rows.push(['Credits used', String(credits.used) + currency]);
+        if (credits.monthly_limit != null) rows.push(['Credit spend limit', String(credits.monthly_limit) + currency]);
+        if (credits.note) rows.push(['Credit note', credits.note]);
+        return '<div class="quota-balance-block">' + rows.map(function(row) {
+          return '<div class="quota-status"><strong>' + escapeHtml(row[0]) + ':</strong> ' + escapeHtml(row[1]) + '</div>';
+        }).join('') + '</div>';
+      }
+      function renderCodexResetCredits(a, quota, provider) {
+        provider = provider || 'codex';
         var summary = quota && quota.rate_limit_reset_credits;
-        if (!summary) return '';
+        if (!summary) return provider === 'claude' ? '<div class="muted quota-status">Reset limits: not reported by Claude for this account.</div>' : '';
         var label = accountLabel(a);
         var fileArg = escapeHtml(jsString(a && a.file_name || ''));
         var labelArg = escapeHtml(jsString(label));
         var accountArg = escapeHtml(jsString(a && a.account_id || ''));
-        var key = accountDetailStateKey('codex', a, a && (a.file_name || a.label || a.account_id) || label);
+        var key = accountDetailStateKey(provider, a, a && (a.file_name || a.label || a.account_id) || label);
         var credits = Array.isArray(summary.credits) ? summary.credits.filter(function(credit) {
           var status = String(credit && credit.status || 'available').toLowerCase();
-          return credit && status === 'available';
+          return credit && (provider === 'claude' || status === 'available');
         }) : [];
         var count = Number(summary.available_count);
         if (!Number.isFinite(count)) count = credits.length;
-        count = Math.max(0, Math.max(count, credits.length));
+        count = Math.max(0, count);
         var html = '<details class="reset-credit-details muted"' + detailToggleAttrs('resetCredits', key) + '><summary>Available reset limit <span class="reset-credit-count">(' + count + ')</span></summary>';
-        if (count <= 0) {
+        var action = quota && quota.last_reset_action;
+        var blocked = action && (action.state === 'submitted' || action.state === 'manual_review');
+        if (action) html += '<div class="quota-status">Last reset: ' + escapeHtml(action.state) + ' · ' + escapeHtml(action.updated_at) + (blocked ? '. Review in Claude before another reset.' : '') + '</div>';
+        if (count <= 0 && !credits.length) {
           return html + '<div class="quota-status reset-credit-empty">No usage limit resets available</div></details>';
         }
         if (!credits.length) {
@@ -7861,6 +7953,11 @@ async fn dashboard() -> impl IntoResponse {
         html += credits.map(function(credit) {
           var title = resetCreditDisplayName(credit);
           var expiry = formatResetCreditExpiry(credit);
+          if (provider === 'claude') {
+            expiry = (credit.description || '') + ' · ' + expiry;
+            if (credit.next_available_at) expiry += ' · Next available ' + credit.next_available_at;
+            if (credit.usable_now !== true) expiry += ' · Currently unavailable' + (credit.unavailable_reason ? ': ' + credit.unavailable_reason : '');
+          }
           var id = String(credit.id || '');
           var idArg = escapeHtml(jsString(id));
           var idHtml = id
@@ -7869,15 +7966,16 @@ async fn dashboard() -> impl IntoResponse {
               + '<button type="button" class="mini-btn secondary-button" onclick="copyTextToClipboard(' + idArg + ', \'Reset credit ID copied\')">Copy ID</button>'
               + '</div>'
             : '<div class="reset-credit-meta">A concrete credit ID is required to redeem safely.</div>';
-          var redeemControl = id
-            ? '<button type="button" class="mini-btn secondary-button" onclick="redeemCodexReset(' + fileArg + ', ' + labelArg + ', ' + accountArg + ', ' + escapeHtml(jsString(id)) + ', ' + escapeHtml(jsString(title)) + ')">Reset limit</button>'
+          var canRedeem = count > 0 && id && a && a.enabled !== false && !blocked && (provider !== 'claude' || credit.usable_now === true);
+          var redeemControl = canRedeem
+            ? '<button type="button" class="mini-btn secondary-button" onclick="redeemUsageReset(' + fileArg + ', ' + labelArg + ', ' + accountArg + ', ' + escapeHtml(jsString(id)) + ', ' + escapeHtml(jsString(title)) + ', ' + escapeHtml(jsString(provider)) + ', ' + escapeHtml(jsString(credit.program || '')) + ')">Reset limit</button>'
             : '';
           return '<div class="reset-credit-item">'
             + '<div class="reset-credit-main"><div class="reset-credit-title">' + escapeHtml(title) + '</div><div class="reset-credit-meta">' + escapeHtml(expiry) + '</div>' + idHtml + '</div>'
             + redeemControl
             + '</div>';
         }).join('');
-        if (count > credits.length) {
+        if (provider !== 'claude' && count > credits.length) {
           html += '<div class="quota-status reset-credit-empty">+' + (count - credits.length) + ' more available reset credits are not listed by the upstream response.</div>';
         }
         return html + '</div></details>';
@@ -8216,6 +8314,7 @@ async fn dashboard() -> impl IntoResponse {
           + '<span class="stat-pill"><span class="stat-pill-value">' + (a.errors || 0) + '</span><span class="stat-pill-label">err</span></span>'
           + '</div>'
           + renderQuotaBars(quota, { provider: 'codex', key: key })
+          + renderUsageCredits(quota)
           + renderCodexResetCredits(a, quota)
           + renderAccountModels(a, quota, 'codex', key)
           + renderMetaDetails(connectionRows('codex', a, quota), 'Connection details', 'codex', a, key)
@@ -8547,6 +8646,8 @@ async fn dashboard() -> impl IntoResponse {
           + renderAccountHeader(a.label || a.email || a.organization_uuid || a.account_id || 'Claude', 'claude', a)
           + '<div class="stat-pills">' + usage + '</div>'
           + renderQuotaBars(quota, { provider: 'claude', key: a.file_name || a.label || a.organization_uuid || a.account_id || '' })
+          + renderUsageCredits(quota)
+          + renderCodexResetCredits(a, quota, 'claude')
           + renderAccountModels(a, quota, 'claude', a.file_name || a.label || a.organization_uuid || a.account_id || '')
           + renderMetaDetails(connectionRows('claude', a, quota), 'Connection details', 'claude', a, a.file_name || a.label || a.organization_uuid || a.account_id || '')
           + renderAttentionDetails('claude', a, a.file_name || a.label || a.organization_uuid || a.account_id || '')
@@ -10208,6 +10309,19 @@ async fn dashboard() -> impl IntoResponse {
             <div class="settings-block-title"><span>Recent coordinated actions</span></div>
             <div id="codexResetCreditAutomationActions" class="reset-credit-list"></div>
           </div>
+          <div class="settings-block">
+            <div class="settings-block-title"><span>Automatic Claude resets</span><label class="check-row" for="claudeResetEnabled"><input id="claudeResetEnabled" type="checkbox">Enabled for this account</label></div>
+            <div class="settings-help">Opt in per account. Only expiring reset allowances are scheduled. Fresh usage must show a reached limit, and the grant must clear that limit. Monetary credits are never spent by this scheduler.</div>
+            <div class="custom-model-form-row" style="margin-top:12px"><label for="claudeResetAccount">Claude account</label><select id="claudeResetAccount" class="test-api-model-input"></select></div>
+            <div class="api-key-limit-row" style="margin-top:10px"><label for="claudeReset_scan_interval_minutes">Scan interval (minutes)</label><input id="claudeReset_scan_interval_minutes" type="number" min="1" max="1440" step="1" inputmode="numeric" value="30"></div>
+            <div class="api-key-limit-row" style="margin-top:10px"><label for="claudeReset_expiry_window_minutes">Upper expiry window (minutes)</label><input id="claudeReset_expiry_window_minutes" type="number" min="30" max="10080" step="1" inputmode="numeric" value="60"></div>
+            <div class="api-key-limit-row" style="margin-top:10px"><label for="claudeReset_final_attempt_minutes">Final check (minutes before expiry)</label><input id="claudeReset_final_attempt_minutes" type="number" min="1" max="10079" step="1" inputmode="numeric" value="5"></div>
+            <div class="api-key-limit-row" style="margin-top:10px"><label for="claudeReset_min_natural_reset_remaining_minutes">Avoid natural resets within (minutes)</label><input id="claudeReset_min_natural_reset_remaining_minutes" type="number" min="0" max="10080" step="1" inputmode="numeric" value="10"></div>
+            <div class="settings-help">Select grants 30 minutes to the upper window before expiry. Deferred actions receive a final check before expiry. Unknown limits, nearby natural resets, and uncertain previous submissions prevent spending.</div>
+            <div class="modal-actions" style="margin-top:12px"><button type="button" id="saveClaudeResetPolicy">Save Claude automatic reset policy</button></div>
+            <div id="claudeResetStatus" class="muted" style="margin-top:10px" role="status"></div>
+            <div id="claudeResetActions" class="reset-credit-list"></div>
+          </div>
         </div>
         <div id="settingsNotificationsPanel" class="settings-panel" role="tabpanel" data-settings-panel="notifications" hidden>
           <div class="settings-block">
@@ -10384,6 +10498,8 @@ async fn dashboard() -> impl IntoResponse {
       document.getElementById('copyTestApiOutputBtn').addEventListener('click', copyTestApiOutput);
       document.getElementById('codexResetCreditAutomationAccountInput').addEventListener('change', renderCodexResetCreditAutomation);
       document.getElementById('saveCodexResetCreditAutomationBtn').addEventListener('click', saveCodexResetCreditAutomation);
+      document.getElementById('claudeResetAccount').addEventListener('change', populateClaudeResetPolicy);
+      document.getElementById('saveClaudeResetPolicy').addEventListener('click', saveClaudeResetAutomation);
       document.getElementById('notificationChannelInput').addEventListener('change', updateNotificationChannelUi);
       document.getElementById('saveNotificationSettingsBtn').addEventListener('click', saveNotificationSettings);
       document.getElementById('testNotificationBtn').addEventListener('click', sendTestNotification);
@@ -11204,24 +11320,29 @@ async fn dashboard() -> impl IntoResponse {
         }
       }
       function redeemCodexReset(fileName, label, accountId, creditId, creditTitle) {
+        return redeemUsageReset(fileName, label, accountId, creditId, creditTitle, 'codex', '');
+      }
+      function redeemUsageReset(fileName, label, accountId, creditId, creditTitle, provider, program) {
         var display = label || accountId || fileName || 'this Codex account';
         var resetLabel = creditTitle || 'usage limit reset';
         openCredentialActionConfirm({
           title: 'Redeem usage reset?',
-          message: 'Use ' + resetLabel + ' for ' + display + '?',
+          message: 'Use ' + resetLabel + ' for ' + display + '? This spends a reset allowance.',
           approveLabel: 'Redeem reset',
           run: function() {
-            return performCodexReset(fileName, label, accountId, creditId);
+            return performCodexReset(fileName, label, accountId, creditId, provider, program);
           }
         });
       }
-      async function performCodexReset(fileName, label, accountId, creditId) {
+      async function performCodexReset(fileName, label, accountId, creditId, provider, program) {
+        provider = provider || 'codex';
         var body = new URLSearchParams();
         if (fileName) body.set('file_name', fileName);
-        if (label) body.set('label', label);
-        if (accountId) body.set('account_id', accountId);
+        if (label && provider === 'codex') body.set('label', label);
+        if (accountId && provider === 'codex') body.set('account_id', accountId);
         if (creditId) body.set('credit_id', creditId);
-        const res = await adminFetch('/codex/rate-limit-reset-credit/consume', {
+        if (provider === 'claude') body.set('program', program);
+        const res = await adminFetch('/' + provider + '/rate-limit-reset-credit/consume', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/x-www-form-urlencoded'
@@ -11233,7 +11354,7 @@ async fn dashboard() -> impl IntoResponse {
         var tone = data.ok === false || data.outcome === 'no_credit' ? 'error' : '';
         notify(data.message || 'Reset request completed', tone);
         invalidateDashboardSnapshot();
-        refreshQuota();
+        if (provider === 'claude') refreshClaudeQuota(); else refreshQuota();
       }
       function renderDashboardSnapshot() {
         if (dashboardSnapshot && dashboardSnapshot.account_routing) {
@@ -11809,6 +11930,40 @@ async fn admin_api_keys_revoke_route(
 /// reset-credit redemption.  This is deliberately an administrator-only
 /// surface: a reset credit is owned by the upstream ChatGPT account rather
 /// than by the caller that happens to observe it in a quota response.
+async fn admin_claude_reset_credit_automation_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    method: Method,
+    body: Bytes,
+) -> Response {
+    if let Some(response) = require_admin_session_json(&state, &headers) {
+        return response;
+    }
+    if method == Method::POST {
+        let update = serde_json::from_slice::<target::claude::reset_automation::Policy>(&body);
+        let result = update
+            .map_err(|_| "Invalid Claude reset scheduling JSON".to_string())
+            .and_then(|p| target::claude::reset_automation::save(&state, &p));
+        if let Err(message) = result {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"ok":false,"message":message})),
+            )
+                .into_response();
+        }
+    } else if method != Method::GET {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    match target::claude::reset_automation::snapshot(&state) {
+        Ok(v) => Json(v).into_response(),
+        Err(message) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"ok":false,"message":message})),
+        )
+            .into_response(),
+    }
+}
+
 async fn admin_codex_reset_credit_automation_route(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -13321,6 +13476,27 @@ async fn codex_rate_limit_reset_consume_route(
             "message": err
         }))
         .into_response(),
+    }
+}
+
+async fn claude_rate_limit_reset_consume_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<target::claude::resets::ConsumeForm>,
+) -> Response {
+    if let Some(response) = require_admin_session_json(&state, &headers) {
+        return response;
+    }
+    match target::claude::resets::consume(&state, form).await {
+        Ok(value) => {
+            refresh_quota_snapshots_now(&state, Some("cld"), None).await;
+            axum::Json(value).into_response()
+        }
+        Err(message) => (
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({"ok":false,"message":message})),
+        )
+            .into_response(),
     }
 }
 
@@ -15224,6 +15400,11 @@ fn compact_mobile_rate_limit_reset_credit(value: &serde_json::Value) -> Option<s
 
     for key in MOBILE_RATE_LIMIT_RESET_CREDIT_SCALAR_KEYS {
         if let Some(value) = source.get(key).filter(|value| value.is_string()) {
+            compact.insert(key.to_string(), value.clone());
+        }
+    }
+    for key in ["usable_now", "remaining"] {
+        if let Some(value) = source.get(key).filter(|v| v.is_boolean() || v.is_u64()) {
             compact.insert(key.to_string(), value.clone());
         }
     }

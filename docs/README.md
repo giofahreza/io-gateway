@@ -7,6 +7,7 @@ The [website](https://gateway.giofahreza.com) and [documentation site](https://g
 - [Terminal UI: previews, installation, and animated themes](https://gateway.giofahreza.com/docs/terminal-ui/) - install `iogw` with or without optional Café, Office, and Station packs; connect to a remote gateway and learn the shared controls.
 - [Operator Guide](operator-guide.md) - setup, configuration, provider login, routing, API surface, deployment, testing, and troubleshooting.
 - [Codex reset-credit automation](codex-reset-credit-automation.md) - safely preserve and redeem expiring Codex rate-limit reset credits through managed local Codex App Server profiles with required ChatGPT-email bindings.
+- [Account credits and limit resets](account-credits-and-resets.md) - Codex and Claude credit balances, reset controls and opt-in Claude scheduling in the web UI, TUI, and io-workbench, plus recovery behavior.
 
 Runtime docs are also exposed by the app:
 

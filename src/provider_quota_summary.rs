@@ -10,6 +10,53 @@ pub struct Field {
     pub value: String,
 }
 
+/// Credit balance is not a percentage, spend budget, or limit-reset grant.
+pub fn credit_fields(account: &Value) -> Vec<Field> {
+    let mut out = Vec::new();
+    let credits = &account["credits"];
+    let currency = credits["currency"].as_str().unwrap_or("");
+    let amount = |v: &Value| {
+        text(v).map(|value| {
+            if currency.is_empty() {
+                value
+            } else {
+                format!("{value} {currency}")
+            }
+        })
+    };
+    let balance = if credits["unlimited"] == true {
+        "Unlimited".into()
+    } else if let Some(value) = amount(&credits["balance"]) {
+        value
+    } else if credits["has_credits"] == false {
+        "No credits available".into()
+    } else if credits["has_credits"] == true {
+        "Available; balance not reported".into()
+    } else {
+        "Not reported".into()
+    };
+    push(&mut out, "Available credits", balance);
+    if let Some(enabled) = credits["enabled"].as_bool() {
+        push(
+            &mut out,
+            "Usage credits",
+            if enabled { "Enabled" } else { "Disabled" }.into(),
+        );
+    }
+    for (key, label) in [
+        ("used", "Credits used"),
+        ("monthly_limit", "Credit spend limit"),
+    ] {
+        if let Some(value) = amount(&credits[key]) {
+            push(&mut out, label, value);
+        }
+    }
+    if let Some(note) = credits.get("note").and_then(text) {
+        push(&mut out, "Credit note", note);
+    }
+    out
+}
+
 fn text(value: &Value) -> Option<String> {
     let value = match value {
         Value::String(value) => value.clone(),
@@ -245,6 +292,27 @@ pub fn with_summaries(mut quota: Value) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn credit_display_distinguishes_unknown_zero_disabled_and_unlimited() {
+        assert_eq!(credit_fields(&json!({}))[0].value, "Not reported");
+        assert_eq!(
+            credit_fields(&json!({"credits":{"balance":"0"}}))[0].value,
+            "0"
+        );
+        assert_eq!(
+            credit_fields(&json!({"credits":{"unlimited":true}}))[0].value,
+            "Unlimited"
+        );
+        let fields = credit_fields(
+            &json!({"credits":{"balance":"2.50","currency":"USD","enabled":false,"access_token":"never display"}}),
+        );
+        assert_eq!(fields[0].value, "2.50 USD");
+        assert_eq!(fields[1].value, "Disabled");
+        assert!(!serde_json::to_string(&fields)
+            .unwrap()
+            .contains("never display"));
+    }
 
     #[test]
     fn all_provider_shapes_preserve_reported_values_without_credentials() {
