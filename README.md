@@ -1,6 +1,6 @@
 # IO Gateway
 
-One local gateway for Codex CLI, Claude Code, and OpenAI-compatible clients. Connect multiple AI accounts, share traffic across them, and manage everything from a dashboard or terminal.
+One local gateway for Codex CLI, Claude Code, and OpenAI-compatible clients. Connect built-in providers or custom OpenAI-compatible and Anthropic-compatible APIs, share traffic across accounts, and manage everything from a web dashboard or terminal.
 
 [Website](https://gateway.giofahreza.com) · [Documentation](https://gateway.giofahreza.com/docs/) · [Releases](https://github.com/giofahreza/io-gateway/releases)
 
@@ -26,10 +26,39 @@ Actual TUI captures with demo accounts. Click an image for full size. The normal
 ## Highlights
 
 - One API for OpenAI Responses, Chat Completions, and Anthropic Messages.
-- Ten providers: Codex, Claude, Gemini, Antigravity, Qwen, DeepSeek, MiniMax, Grok, GitHub Copilot, and GLM.
+- Ten built-in providers, plus tested compatible services including Qwen Coding Plan and NVIDIA.
+- Add, view, edit, enable, disable, and delete custom OpenAI-compatible and Anthropic-compatible APIs from the web UI or TUI.
 - Multi-account load balancing, priority routing, failover, and custom model aliases.
 - Account quotas, usage history, scoped API keys, and notifications.
 - Keyboard-driven terminal management with optional animated cat themes.
+
+## Supported providers
+
+| Built-in provider | Model prefix |
+| --- | --- |
+| OpenAI Codex | `cod:` |
+| Anthropic Claude | `cld:` |
+| Google Gemini | `gem:` |
+| Antigravity | `agw:` |
+| Qwen | `qwn:` |
+| DeepSeek | `dsk:` |
+| MiniMax | `min:` |
+| Grok | `grk:` |
+| GitHub Copilot | `cop:` |
+| GLM / Z.AI | `glm:` |
+
+Connect additional services with the **Compatible API** account type:
+
+| Service or API | Connection |
+| --- | --- |
+| Qwen Coding Plan (tested) | OpenAI-compatible and Anthropic-compatible APIs |
+| NVIDIA (tested) | OpenAI-compatible API |
+| Custom OpenAI-Compatible API | Your base URL, API key, and Chat Completions model IDs |
+| Custom Anthropic-Compatible API | Your base URL, API key, and Messages model IDs |
+
+Compatible accounts use `cmp:<upstream-model-id>`, for example `cmp:qwen3.7-plus`. Configure either format or both in one account. Fetch models when the service supports discovery, or enter model IDs manually. Use `ctm:` aliases to route across providers and compatible accounts.
+
+[Compatible API setup for the web UI and TUI →](docs/compatible-apis.md)
 
 ## Install
 
@@ -75,7 +104,7 @@ The [website](https://gateway.giofahreza.com) has previews and the complete user
 
 - [Accounts and provider login](https://gateway.giofahreza.com/docs/provider-accounts/)
 - [Routing and models](https://gateway.giofahreza.com/docs/routing-and-models/) · [Custom models](https://gateway.giofahreza.com/docs/custom-models/)
-- [API keys](https://gateway.giofahreza.com/docs/api-keys/) · [Usage and quotas](https://gateway.giofahreza.com/docs/usage-and-quota/)
+- [Compatible APIs](docs/compatible-apis.md) · [API keys](https://gateway.giofahreza.com/docs/api-keys/) · [Usage and quotas](https://gateway.giofahreza.com/docs/usage-and-quota/)
 - [Deployment](https://gateway.giofahreza.com/docs/deployment/) · [Troubleshooting](https://gateway.giofahreza.com/docs/troubleshooting/)
 
 A running gateway also serves Swagger at `/docs/` and OpenAPI at `/api-docs/openapi.json`.

@@ -12,7 +12,7 @@
     >
     <meta
       name="description"
-      content="A self-hosted Rust gateway that keeps AI provider credentials private while giving clients one local endpoint."
+      content="One self-hosted gateway for Codex, Claude, Gemini, Qwen, NVIDIA, and more. Connect custom OpenAI-compatible and Anthropic-compatible APIs from the web UI or TUI."
     >
     <title>IO Gateway — local routing for AI accounts</title>
     <link rel="manifest" href="/manifest.webmanifest">
@@ -951,6 +951,78 @@
         color: var(--blue-soft);
       }
 
+      .provider-directory {
+        margin-top: clamp(48px, 7vw, 88px);
+        padding-top: 32px;
+        border-top: 1px solid var(--line-strong);
+        scroll-margin-top: 90px;
+      }
+
+      .provider-directory > p {
+        max-width: 700px;
+        margin: 16px 0 28px;
+        color: var(--muted);
+        font-size: 0.93rem;
+        line-height: 1.66;
+      }
+
+      .provider-columns {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: clamp(32px, 6vw, 80px);
+      }
+
+      .provider-columns h4 {
+        margin: 0 0 14px;
+        color: var(--blue-soft);
+        font-family: var(--font-data);
+        font-size: 0.75rem;
+        font-weight: 500;
+      }
+
+      .provider-list {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0 24px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .provider-list li {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 4px 12px;
+        padding: 15px 0;
+        border-top: 1px solid var(--line);
+        color: var(--paper);
+        font-size: 0.86rem;
+      }
+
+      .provider-list code {
+        color: var(--blue-soft);
+        font-size: 0.78rem;
+      }
+
+      .compatible-services > div {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 6px;
+        padding: 15px 0;
+      }
+
+      .compatible-services dt {
+        color: var(--paper);
+        font-family: inherit;
+      }
+
+      .provider-directory .endpoint-note a {
+        color: var(--blue-soft);
+        text-decoration: underline;
+        text-underline-offset: 3px;
+      }
+
       .code-sheet {
         overflow: hidden;
         border: 1px solid var(--line-strong);
@@ -1313,6 +1385,7 @@
         .hero-grid,
         .flow-layout,
         .compatibility-layout,
+        .provider-columns,
         .install-layout {
           grid-template-columns: minmax(0, 1fr);
         }
@@ -1532,7 +1605,7 @@
           <nav class="primary-nav" aria-label="Primary navigation">
             <a href="#flow">How it works</a>
             <a href="#controls">Controls</a>
-            <a href="#compatibility">Endpoints</a>
+            <a href="#providers">Providers</a>
             <a href="#terminal">Terminal</a>
             <a href="#install">Install</a>
             <a href="/docs/">Docs</a>
@@ -1549,7 +1622,7 @@
               <div class="menu-panel">
                 <a href="#flow">How it works</a>
                 <a href="#controls">Controls</a>
-                <a href="#compatibility">Endpoints</a>
+                <a href="#providers">Providers</a>
                 <a href="#terminal">Terminal</a>
                 <a href="#install">Install</a>
                 <a href="/docs/">Docs</a>
@@ -1580,7 +1653,7 @@
             <div class="hero-notes" role="list" aria-label="Key properties">
               <span role="listitem">localhost by default</span>
               <span role="listitem">native desktop releases</span>
-              <span role="listitem">10 provider families + custom aliases</span>
+              <span role="listitem">10 built-in providers + compatible APIs</span>
               <span role="listitem">real account state in the dashboard</span>
             </div>
           </div>
@@ -1861,11 +1934,8 @@
                 </div>
               </dl>
               <p class="endpoint-note">
-                Current provider families are <code>cod:</code> Codex, <code>cld:</code> Claude,
-                <code>gem:</code> Gemini, <code>agw:</code> Antigravity, <code>qwn:</code> Qwen,
-                <code>dsk:</code> DeepSeek, <code>min:</code> MiniMax, <code>grk:</code> Grok,
-                <code>cop:</code> GitHub Copilot, and <code>glm:</code> GLM / Z.AI.
-                Use <code>ctm:</code> for operator-defined aliases across those targets.
+                Choose built-in providers or connect your own OpenAI-compatible and
+                Anthropic-compatible APIs. Use <code>ctm:</code> aliases across both.
               </p>
             </div>
 
@@ -1882,6 +1952,58 @@ POST /v1/responses
 POST /codex/responses
 POST /claude/v1/messages</code></pre>
             </aside>
+          </div>
+
+          <div class="provider-directory reveal" id="providers" aria-labelledby="providers-title">
+            <h3 id="providers-title">Supported providers</h3>
+            <p>
+              Bring your existing accounts and API keys. Add, view, edit, enable, disable,
+              and delete compatible API accounts from the web UI or the <code>iogw</code> TUI.
+            </p>
+            <div class="provider-columns">
+              <div>
+                <h4>10 built-in providers</h4>
+                <ul class="provider-list" aria-label="Built-in providers and model prefixes">
+                  <li><span>OpenAI Codex</span> <code>cod:</code></li>
+                  <li><span>Anthropic Claude</span> <code>cld:</code></li>
+                  <li><span>Google Gemini</span> <code>gem:</code></li>
+                  <li><span>Antigravity</span> <code>agw:</code></li>
+                  <li><span>Qwen</span> <code>qwn:</code></li>
+                  <li><span>DeepSeek</span> <code>dsk:</code></li>
+                  <li><span>MiniMax</span> <code>min:</code></li>
+                  <li><span>Grok</span> <code>grk:</code></li>
+                  <li><span>GitHub Copilot</span> <code>cop:</code></li>
+                  <li><span>GLM / Z.AI</span> <code>glm:</code></li>
+                </ul>
+              </div>
+              <div>
+                <h4>Compatible APIs · <code>cmp:</code></h4>
+                <dl class="endpoint-table compatible-services">
+                  <div>
+                    <dt>Qwen Coding Plan</dt>
+                    <dd>Tested with OpenAI-compatible and Anthropic-compatible APIs.</dd>
+                  </div>
+                  <div>
+                    <dt>NVIDIA</dt>
+                    <dd>Tested through its OpenAI-compatible API.</dd>
+                  </div>
+                  <div>
+                    <dt>Custom OpenAI-Compatible API</dt>
+                    <dd>Connect a Chat Completions endpoint with your base URL, API key, and model IDs.</dd>
+                  </div>
+                  <div>
+                    <dt>Custom Anthropic-Compatible API</dt>
+                    <dd>Connect a Messages endpoint, or configure both formats in one account.</dd>
+                  </div>
+                </dl>
+              </div>
+            </div>
+            <p class="endpoint-note">
+              Compatible models use <code>cmp:&lt;upstream-model-id&gt;</code>, such as
+              <code>cmp:qwen3.7-plus</code>. Fetch models when the service supports discovery,
+              or enter IDs manually.
+              <a href="https://github.com/giofahreza/io-gateway/blob/master/docs/compatible-apis.md">Set up a compatible API →</a>
+            </p>
           </div>
         </div>
       </section>
