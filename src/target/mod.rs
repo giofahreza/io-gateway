@@ -1,6 +1,7 @@
 pub mod antigravity;
 pub mod claude;
 pub mod codex;
+pub mod compatible;
 pub mod copilot;
 pub mod deepseek;
 pub mod gemini;

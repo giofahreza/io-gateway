@@ -461,6 +461,7 @@ fn account_credentials_path(provider: &str) -> Result<&'static str, RequestError
         "deepseek" => Ok("/login/deepseek/start"),
         "minimax" => Ok("/login/minimax/start"),
         "glm" => Ok("/login/glm/start"),
+        "compatible" => Ok("/compatible/save"),
         "copilot" => Ok("/login/copilot/start"),
         "claude" => Ok("/login/claude/start"),
         _ => Err(format!("unsupported account provider: {provider}").into()),

@@ -634,7 +634,7 @@ fn merge_beta_headers(incoming: Option<&str>, extra: Option<&str>) -> Option<Str
     (!values.is_empty()).then(|| values.join(","))
 }
 
-fn responses_to_anthropic_messages(
+pub(crate) fn responses_to_anthropic_messages(
     raw: &Value,
     model: &str,
     stream: bool,
@@ -1420,7 +1420,7 @@ fn normalize_stop_sequences(value: &Value) -> Value {
     }
 }
 
-fn anthropic_message_to_response(message: &Value, model: &str) -> Value {
+pub(crate) fn anthropic_message_to_response(message: &Value, model: &str) -> Value {
     let mut output = Vec::new();
     let mut text_parts = Vec::new();
     for block in message
@@ -1504,7 +1504,7 @@ fn anthropic_message_to_response(message: &Value, model: &str) -> Value {
     })
 }
 
-fn responses_sse(response: Value) -> axum::response::Response {
+pub(crate) fn responses_sse(response: Value) -> axum::response::Response {
     let mut events = String::new();
     events.push_str(&format!(
         "event: response.created\ndata: {}\n\n",

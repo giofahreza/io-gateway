@@ -97,6 +97,7 @@ fn target_from_provider_prefix(provider: &str) -> Option<TargetModel> {
         "cop" => Some(TargetModel::Copilot),
         "cld" => Some(TargetModel::Claude),
         "glm" => Some(TargetModel::Glm),
+        "cmp" => Some(TargetModel::Compatible),
         "cod" => Some(TargetModel::Codex),
         "ctm" => Some(TargetModel::Custom),
         _ => None,

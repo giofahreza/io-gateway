@@ -13,6 +13,7 @@ pub enum Provider {
     Copilot,
     Claude,
     Glm,
+    Compatible,
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -99,6 +100,8 @@ pub struct StatsStore {
     pub claude: HashMap<String, StoredAccountUsage>,
     #[serde(default)]
     pub glm: HashMap<String, StoredAccountUsage>,
+    #[serde(default)]
+    pub compatible: HashMap<String, StoredAccountUsage>,
 }
 
 impl Default for StatsStore {
@@ -126,6 +129,7 @@ impl Default for StatsStore {
             copilot: HashMap::new(),
             claude: HashMap::new(),
             glm: HashMap::new(),
+            compatible: HashMap::new(),
         }
     }
 }
@@ -143,6 +147,7 @@ impl StatsStore {
             Provider::Copilot => self.copilot.get(key),
             Provider::Claude => self.claude.get(key),
             Provider::Glm => self.glm.get(key),
+            Provider::Compatible => self.compatible.get(key),
         }
     }
 
@@ -162,6 +167,7 @@ impl StatsStore {
             Provider::Copilot => self.copilot.entry(key).or_default(),
             Provider::Claude => self.claude.entry(key).or_default(),
             Provider::Glm => self.glm.entry(key).or_default(),
+            Provider::Compatible => self.compatible.entry(key).or_default(),
         }
     }
 }

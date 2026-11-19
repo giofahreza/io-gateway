@@ -605,7 +605,7 @@ pub async fn chat_completions(
         .into_response()
 }
 
-pub(super) async fn stream_chat_completions(
+pub(crate) async fn stream_chat_completions(
     state: &crate::AppState,
     api_key: &str,
     base_url: &str,
@@ -738,7 +738,7 @@ pub(super) async fn stream_chat_completions(
         .into_response())
 }
 
-async fn stream_chat_completions_passthrough(
+pub(crate) async fn stream_chat_completions_passthrough(
     state: &crate::AppState,
     context: &crate::UsageContext,
     resp: reqwest::Response,
@@ -857,7 +857,7 @@ fn models_to_openai_json(value: &Value) -> Result<Vec<u8>, String> {
     .map_err(|e| e.to_string())
 }
 
-pub(super) fn build_chat_completions_payload(raw: &Value, model: &str) -> Result<Value, String> {
+pub(crate) fn build_chat_completions_payload(raw: &Value, model: &str) -> Result<Value, String> {
     let mut out = json!({
         "model": model,
         "stream": false,
@@ -1670,7 +1670,7 @@ fn response_item_id(item: &Value) -> String {
         .unwrap_or_else(|| format!("item_{}", Uuid::new_v4().simple()))
 }
 
-pub(super) fn chat_completion_to_responses(chat: &Value, model: &str) -> Value {
+pub(crate) fn chat_completion_to_responses(chat: &Value, model: &str) -> Value {
     let id = chat
         .get("id")
         .and_then(|v| v.as_str())

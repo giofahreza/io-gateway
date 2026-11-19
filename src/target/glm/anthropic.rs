@@ -386,7 +386,7 @@ async fn api_usage_messages_via_chat_completions(
     Ok((StatusCode::OK, [("Content-Type", "application/json")], body).into_response())
 }
 
-async fn stream_messages(
+pub(crate) async fn stream_messages(
     state: crate::AppState,
     context: crate::UsageContext,
     resp: reqwest::Response,
@@ -488,7 +488,10 @@ fn anthropic_error(
     (status, [("Content-Type", "application/json")], body).into_response()
 }
 
-fn anthropic_messages_to_chat_completions(payload: &Value, model: &str) -> Result<Value, String> {
+pub(crate) fn anthropic_messages_to_chat_completions(
+    payload: &Value,
+    model: &str,
+) -> Result<Value, String> {
     let messages = payload
         .get("messages")
         .and_then(|value| value.as_array())
@@ -771,7 +774,7 @@ fn translate_anthropic_thinking(value: Option<&Value>) -> Value {
     }
 }
 
-fn responses_to_anthropic_message(response: &Value, client_model: &str) -> Value {
+pub(crate) fn responses_to_anthropic_message(response: &Value, client_model: &str) -> Value {
     let content = response_to_anthropic_content(response);
     let has_tool = content
         .iter()
@@ -835,7 +838,7 @@ fn response_to_anthropic_content(response: &Value) -> Vec<Value> {
     content
 }
 
-fn anthropic_stream_response(message: &Value) -> axum::response::Response {
+pub(crate) fn anthropic_stream_response(message: &Value) -> axum::response::Response {
     let events = anthropic_sse_events(message);
     let stream = async_stream::stream! {
         for event in events {

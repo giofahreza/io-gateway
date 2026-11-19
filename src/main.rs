@@ -76,8 +76,8 @@ const API_KEY_BUDGET_STALE_RESERVATION_AGE: Duration = Duration::from_secs(35 * 
 const API_KEY_BUDGET_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const API_KEY_BUDGET_SWEEP_BATCH_SIZE: usize = 256;
 const CONFIG_PATH_ENV: &str = "IO_GATEWAY_CONFIG";
-const MODEL_PROVIDER_PREFIXES: [&str; 10] = [
-    "cod", "agw", "gem", "qwn", "dsk", "grk", "min", "cop", "cld", "glm",
+const MODEL_PROVIDER_PREFIXES: [&str; 11] = [
+    "cod", "agw", "gem", "qwn", "dsk", "grk", "min", "cop", "cld", "glm", "cmp",
 ];
 
 #[derive(Debug, Parser)]
@@ -156,6 +156,7 @@ struct AppState {
     copilot_rr: Arc<Mutex<usize>>,
     claude_rr: Arc<Mutex<usize>>,
     glm_rr: Arc<Mutex<usize>>,
+    compatible_rr: Arc<Mutex<usize>>,
     custom_model_rr: Arc<Mutex<HashMap<String, usize>>>,
     client: reqwest::Client,
     tokens: Arc<Mutex<Vec<UpstreamToken>>>,
@@ -169,6 +170,7 @@ struct AppState {
     copilot_accounts: Arc<Mutex<Vec<target::copilot::accounts::CopilotAccount>>>,
     claude_accounts: Arc<Mutex<Vec<target::claude::accounts::ClaudeAccount>>>,
     glm_accounts: Arc<Mutex<Vec<target::glm::accounts::GlmAccount>>>,
+    compatible_accounts: Arc<Mutex<Vec<target::compatible::accounts::CompatibleAccount>>>,
     custom_models: Arc<Mutex<Vec<custom_models::CustomModel>>>,
     stats: Arc<Mutex<UsageStats>>,
     persisted_stats: Arc<Mutex<StatsStore>>,
@@ -1846,6 +1848,7 @@ struct UsageStats {
     copilot_accounts: Vec<AccountUsage>,
     claude_accounts: Vec<AccountUsage>,
     glm_accounts: Vec<AccountUsage>,
+    compatible_accounts: Vec<AccountUsage>,
     total_requests: u64,
     total_errors: u64,
     total_prompt_total: u64,
@@ -2066,6 +2069,7 @@ async fn main() {
     let copilot_accounts = target::copilot::accounts::load_accounts(&cfg, &disabled);
     let claude_accounts = target::claude::accounts::load_accounts(&cfg, &disabled);
     let glm_accounts = target::glm::accounts::load_accounts(&cfg, &disabled);
+    let compatible_accounts = target::compatible::accounts::load_accounts(&cfg, &disabled);
     let custom_models = custom_models::load(&cfg);
     let persisted_stats = Arc::new(Mutex::new(stats_store::load(&cfg)));
     let admin_sessions = admin_auth::load_sessions(&admin_session_path(&cfg));
@@ -2103,6 +2107,7 @@ async fn main() {
         &copilot_accounts,
         &claude_accounts,
         &glm_accounts,
+        &compatible_accounts,
         &persisted_stats.lock().unwrap(),
     );
     let quota_cache = vec![None; tokens.len()];
@@ -2147,6 +2152,7 @@ async fn main() {
         copilot_rr: Arc::new(Mutex::new(0)),
         claude_rr: Arc::new(Mutex::new(0)),
         glm_rr: Arc::new(Mutex::new(0)),
+        compatible_rr: Arc::new(Mutex::new(0)),
         custom_model_rr: Arc::new(Mutex::new(HashMap::new())),
         client,
         tokens: Arc::new(Mutex::new(tokens)),
@@ -2160,6 +2166,7 @@ async fn main() {
         copilot_accounts: Arc::new(Mutex::new(copilot_accounts)),
         claude_accounts: Arc::new(Mutex::new(claude_accounts)),
         glm_accounts: Arc::new(Mutex::new(glm_accounts)),
+        compatible_accounts: Arc::new(Mutex::new(compatible_accounts)),
         custom_models: Arc::new(Mutex::new(custom_models)),
         stats: Arc::new(Mutex::new(stats)),
         persisted_stats,
@@ -2205,6 +2212,15 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", any(health))
+        .route(
+            "/assets/compatible.js",
+            axum::routing::get(|| async {
+                (
+                    [("content-type", "text/javascript; charset=utf-8")],
+                    include_str!("target/compatible/dashboard.js"),
+                )
+            }),
+        )
         .route("/ready", any(ready))
         .route("/favicon.ico", any(favicon_route))
         .route("/", any(dashboard_root))
@@ -2273,6 +2289,26 @@ async fn main() {
         .route("/login/claude/start", any(claude_login_start_route))
         .route("/login/claude/submit", any(claude_login_submit_route))
         .route("/glm/accounts.json", any(glm_accounts_route))
+        .route(
+            "/compatible/accounts.json",
+            any(target::compatible::admin::accounts),
+        )
+        .route(
+            "/compatible/save",
+            axum::routing::post(target::compatible::admin::save),
+        )
+        .route(
+            "/login/compatible/start",
+            axum::routing::post(target::compatible::admin::save),
+        )
+        .route(
+            "/compatible/discover",
+            axum::routing::post(target::compatible::admin::discover),
+        )
+        .route(
+            "/compatible/quota.json",
+            any(target::compatible::admin::accounts),
+        )
         .route("/glm/quota.json", any(glm_quota_json_route))
         .route("/login/glm/start", any(glm_login_start_route))
         .route("/custom-models.json", any(custom_models_json_route))
@@ -2419,6 +2455,12 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
             .any(|account| account.enabled)
         || state
             .glm_accounts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|account| account.enabled)
+        || state
+            .compatible_accounts
             .lock()
             .unwrap()
             .iter()
@@ -4986,6 +5028,7 @@ async fn dashboard() -> impl IntoResponse {
               <button type="button" class="provider-menu-item" role="menuitem" data-provider="copilot">GitHub Copilot</button>
               <button type="button" class="provider-menu-item" role="menuitem" data-provider="claude">Claude</button>
               <button type="button" class="provider-menu-item" role="menuitem" data-provider="glm">GLM (Z.AI)</button>
+              <button type="button" class="provider-menu-item" role="menuitem" data-provider="compatible">Compatible API (OpenAI / Anthropic)</button>
               <button type="button" class="provider-menu-item" role="menuitem" data-provider="custom-model">Custom model</button>
             </div>
           </div>
@@ -5166,6 +5209,10 @@ async fn dashboard() -> impl IntoResponse {
         </div>
         <div id="glmCards" class="provider-cards"></div>
       </section>
+      <section class="provider-section" data-provider-section="compatible" aria-labelledby="compatibleProviderTitle">
+        <div class="provider-badge"><span class="provider-badge-main"><span id="compatibleProviderTitle">Compatible APIs</span><span class="provider-badge-count" id="compatibleBadgeCount">0 accounts</span></span><button type="button" class="mini-btn" onclick="openCompatibleAccount()">+ Add</button></div>
+        <div id="compatibleCards" class="provider-cards"></div>
+      </section>
       </div>
     </main>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
@@ -5179,6 +5226,7 @@ async fn dashboard() -> impl IntoResponse {
         </div>
       </div>
     </div>
+    <script src="/assets/compatible.js"></script>
     <script>
       let adminAuthEnabled = false;
       let adminAuthenticated = false;
@@ -5223,7 +5271,8 @@ async fn dashboard() -> impl IntoResponse {
         'grok',
         'copilot',
         'claude',
-        'glm'
+        'glm',
+        'compatible'
       ];
       const PROVIDER_ROW_CARD_WIDTH = 390;
       const dashboardDateFormatter = new Intl.DateTimeFormat('en-US', {
@@ -5275,6 +5324,7 @@ async fn dashboard() -> impl IntoResponse {
           grok: [],
           copilot: [],
           claude: [],
+          compatible: [],
           glm: []
         },
         customModels: [],
@@ -5299,6 +5349,7 @@ async fn dashboard() -> impl IntoResponse {
           grok: new Map(),
           copilot: new Map(),
           claude: new Map(),
+          compatible: new Map(),
           glm: new Map()
         }
       };
@@ -5320,6 +5371,8 @@ async fn dashboard() -> impl IntoResponse {
         copilot: 'GitHub Copilot',
         cld: 'Claude',
         claude: 'Claude',
+        compatible: 'Compatible API',
+        cmp: 'Compatible API',
         glm: 'GLM (Z.AI)',
         ctm: 'Custom'
       };
@@ -6803,6 +6856,7 @@ async fn dashboard() -> impl IntoResponse {
         if (value === 'cop' || value === 'copilot') return 'copilot';
         if (value === 'cld' || value === 'claude') return 'claude';
         if (value === 'glm') return 'glm';
+        if (value === 'cmp' || value === 'compatible') return 'compatible';
         return value;
       }
       function priorityAccountKey(provider, a) {
@@ -6862,6 +6916,7 @@ async fn dashboard() -> impl IntoResponse {
           if (a.file_name) return 'claude:file:' + a.file_name;
           return 'claude:label:' + (a.label || '');
         }
+        if (provider === 'compatible') return 'compatible:account_id:' + a.account_id;
         if (provider === 'glm') {
           if (a.account_id) return 'glm:account_id:' + a.account_id;
           if (a.file_name) return 'glm:file:' + a.file_name;
@@ -7276,6 +7331,10 @@ async fn dashboard() -> impl IntoResponse {
         }, 0);
       }
       function closeModal(id, keepBackgroundInactive) {
+        if (id === 'compatibleModal') {
+          const key = document.getElementById('compatibleKey');
+          if (key) key.value = '';
+        }
         const modal = document.getElementById(id);
         if (!modal) return;
         modal.style.display = 'none';
@@ -7344,6 +7403,7 @@ async fn dashboard() -> impl IntoResponse {
           '/claude/accounts.json': providers.claude,
           '/claude/quota.json': quotas.claude,
           '/glm/accounts.json': providers.glm,
+          '/compatible/accounts.json': providers.compatible,
           '/glm/quota.json': quotas.glm,
           '/admin/account-routing': dashboardSnapshot.account_routing
         };
@@ -8688,6 +8748,7 @@ async fn dashboard() -> impl IntoResponse {
         { prefix: 'min', label: 'MiniMax', placeholder: 'MiniMax-M3' },
         { prefix: 'cop', label: 'GitHub Copilot', placeholder: 'gpt-5.1' },
         { prefix: 'cld', label: 'Claude', placeholder: 'claude-sonnet-4-5' },
+        { prefix: 'cmp', label: 'Compatible API', placeholder: 'qwen3.7-plus' },
         { prefix: 'glm', label: 'GLM (Z.AI)', placeholder: 'glm-4.6' },
         { prefix: 'cod', label: 'Codex', placeholder: 'gpt-5' }
       ];
@@ -8701,6 +8762,7 @@ async fn dashboard() -> impl IntoResponse {
         min: 'min', minimax: 'min',
         cop: 'cop', copilot: 'cop', 'github-copilot': 'cop', github_copilot: 'cop',
         cld: 'cld', claude: 'cld', anthropic: 'cld',
+        cmp: 'cmp', compatible: 'cmp',
         glm: 'glm', zai: 'glm', 'z-ai': 'glm',
         cod: 'cod', codex: 'cod',
         ctm: 'ctm', custom: 'ctm'
@@ -10295,6 +10357,7 @@ async fn dashboard() -> impl IntoResponse {
           else if (provider === 'copilot') openModal('addCopilotModal');
           else if (provider === 'claude') openModal('addClaudeModal');
           else if (provider === 'glm') openModal('addGlmModal');
+          else if (provider === 'compatible') openCompatibleAccount();
           else if (provider === 'custom-model') openCustomModelModal();
         });
       });
@@ -11188,6 +11251,7 @@ async fn dashboard() -> impl IntoResponse {
         refreshCopilotQuota();
         refreshClaudeQuota();
         refreshGlmQuota();
+        refreshCompatibleAccounts();
       }
       async function startDashboard() {
         await refreshDashboardSnapshot(true);
@@ -11258,7 +11322,7 @@ async fn dashboard() -> impl IntoResponse {
       updateOverview();
       bootstrapAdmin();
     </script>
-  </body>
+</body>
 </html>
 "###;
     (
@@ -12228,7 +12292,8 @@ async fn dashboard_snapshot_route(State(state): State<AppState>, headers: Header
             "grok": grok,
             "copilot": copilot,
             "claude": claude,
-            "glm": glm
+            "glm": glm,
+            "compatible": target::compatible::admin::snapshot(&state)
         },
         "quotas": {
             "codex": quota("codex"),
@@ -13392,6 +13457,7 @@ fn model_catalog_provider_display_label(provider: Option<&str>) -> &'static str 
         Some("cop") => "GitHub Copilot",
         Some("cld") => "Claude",
         Some("glm") => "GLM (Z.AI)",
+        Some("cmp") => "Compatible API",
         Some(_) => "selected provider",
         None => "all providers",
     }
@@ -13949,6 +14015,17 @@ fn notification_account_options(state: &AppState) -> Vec<notifications::Notifica
             enabled: account.enabled,
         });
     }
+    for account in state.compatible_accounts.lock().unwrap().clone() {
+        out.push(notifications::NotificationAccountOption {
+            provider: "compatible".to_string(),
+            provider_label: "Compatible API".to_string(),
+            key: compatible_stats_key(&account),
+            label: account.label.clone(),
+            account_id: account.account_id.clone(),
+            credential_file: account.file_name.clone(),
+            enabled: account.enabled,
+        });
+    }
 
     out.sort_by(|a, b| {
         a.provider
@@ -14031,6 +14108,7 @@ fn normalize_routing_provider(provider: &str) -> Option<&'static str> {
         "cop" | "copilot" => Some("copilot"),
         "cld" | "claude" => Some("claude"),
         "glm" => Some("glm"),
+        "cmp" | "compatible" => Some("compatible"),
         _ => None,
     }
 }
@@ -14153,6 +14231,15 @@ fn enabled_routing_account_keys(state: &AppState) -> HashMap<&'static str, HashS
         .filter(|account| account.enabled)
     {
         push("glm", glm_stats_key(account));
+    }
+    for account in state
+        .compatible_accounts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|account| account.enabled)
+    {
+        push("compatible", compatible_stats_key(account));
     }
 
     out
@@ -14919,6 +15006,11 @@ fn usage_summary_json(state: &AppState) -> serde_json::Value {
         .into_iter()
         .map(|(key, usage)| serde_json::json!({ "key": key, "usage": usage }))
         .collect::<Vec<_>>();
+    let mut compatible = persisted
+        .compatible
+        .into_iter()
+        .map(|(key, usage)| serde_json::json!({ "key": key, "usage": usage }))
+        .collect::<Vec<_>>();
     codex.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
     antigravity.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
     gemini.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
@@ -14929,6 +15021,7 @@ fn usage_summary_json(state: &AppState) -> serde_json::Value {
     copilot.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
     claude.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
     glm.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
+    compatible.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
     serde_json::json!({
         "totals": {
             "requests": persisted.total_requests,
@@ -14953,7 +15046,8 @@ fn usage_summary_json(state: &AppState) -> serde_json::Value {
             "minimax": minimax,
             "copilot": copilot,
             "claude": claude,
-            "glm": glm
+            "glm": glm,
+            "compatible": compatible
         }
     })
 }
@@ -15692,6 +15786,12 @@ fn policy_prompt_metrics_for_routed_request(
         .map(|value| prompt_metrics_from_request_value(&value))
         .unwrap_or_default();
     match routed.target {
+        TargetModel::Compatible => target::compatible::api::policy_metrics(
+            state,
+            &routed.upstream_path,
+            &routed.upstream_body,
+        )
+        .unwrap_or(raw),
         TargetModel::Claude => {
             target::claude::api::policy_prompt_metrics(&routed.upstream_path, &routed.upstream_body)
                 .unwrap_or(raw)
@@ -16738,6 +16838,15 @@ async fn proxy(
                     .into_response(),
             };
         }
+        TargetModel::Compatible => {
+            return target::compatible::api::dispatch(
+                state,
+                headers,
+                &routed.upstream_path,
+                routed.upstream_body,
+            )
+            .await;
+        }
         TargetModel::Codex => {}
         TargetModel::Custom | TargetModel::CodexModels | TargetModel::UnifiedV1Models => {
             unreachable!("special targets return before provider dispatch")
@@ -16758,6 +16867,7 @@ async fn proxy(
         | TargetModel::Copilot
         | TargetModel::Claude
         | TargetModel::Glm
+        | TargetModel::Compatible
         | TargetModel::Custom
         | TargetModel::CodexModels
         | TargetModel::UnifiedV1Models => unreachable!("non-codex targets return earlier"),
@@ -18462,6 +18572,17 @@ fn best_provider_score_for_model_account(
                 |idx| glm_account_selection_score(state, &accounts[idx]),
             )
         }
+        TargetModel::Compatible => {
+            let accounts = state.compatible_accounts.lock().unwrap().clone();
+            best_score_for_len(
+                accounts.len(),
+                |idx| {
+                    accounts[idx].enabled
+                        && compatible_account_matches(&accounts[idx], account_filter)
+                },
+                |idx| compatible_account_selection_score(state, &accounts[idx]),
+            )
+        }
         TargetModel::Custom | TargetModel::CodexModels | TargetModel::UnifiedV1Models => {
             AccountSelectionScore {
                 quota_pressure: Some(f64::INFINITY),
@@ -18581,6 +18702,17 @@ fn best_provider_score_for_model_except_account(
                 |idx| glm_account_selection_score(state, &accounts[idx]),
             )
         }
+        TargetModel::Compatible => {
+            let accounts = state.compatible_accounts.lock().unwrap().clone();
+            best_score_for_len(
+                accounts.len(),
+                |idx| {
+                    accounts[idx].enabled
+                        && !compatible_account_matches(&accounts[idx], account_filter)
+                },
+                |idx| compatible_account_selection_score(state, &accounts[idx]),
+            )
+        }
         TargetModel::Custom | TargetModel::CodexModels | TargetModel::UnifiedV1Models => {
             AccountSelectionScore {
                 quota_pressure: Some(f64::INFINITY),
@@ -18673,6 +18805,14 @@ fn best_provider_score_for_model(state: &AppState, model: &str) -> AccountSelect
                 |idx| glm_account_selection_score(state, &accounts[idx]),
             )
         }
+        TargetModel::Compatible => {
+            let accounts = state.compatible_accounts.lock().unwrap().clone();
+            best_score_for_len(
+                accounts.len(),
+                |idx| accounts[idx].enabled,
+                |idx| compatible_account_selection_score(state, &accounts[idx]),
+            )
+        }
         TargetModel::Custom | TargetModel::CodexModels | TargetModel::UnifiedV1Models => {
             AccountSelectionScore {
                 quota_pressure: Some(f64::INFINITY),
@@ -18736,7 +18876,7 @@ fn is_stable_api_key_account_selector(provider: &str, selector: &str) -> bool {
         "minimax" => matches!(kind, "account_id" | "file"),
         "copilot" => matches!(kind, "account_id" | "login" | "file"),
         "claude" => matches!(kind, "organization" | "account_id" | "email" | "file"),
-        "glm" => matches!(kind, "account_id" | "file"),
+        "glm" | "compatible" => matches!(kind, "account_id" | "file"),
         _ => false,
     }
 }
@@ -18806,6 +18946,17 @@ fn glm_account_matches_api_key_account(
     selector: &str,
 ) -> bool {
     api_key_canonical_account_selector_matches("glm", &glm_stats_key(account), selector)
+}
+
+fn compatible_account_matches_api_key_account(
+    account: &target::compatible::accounts::CompatibleAccount,
+    selector: &str,
+) -> bool {
+    api_key_canonical_account_selector_matches(
+        "compatible",
+        &compatible_stats_key(account),
+        selector,
+    )
 }
 
 fn codex_token_matches_account(token: &UpstreamToken, filter: &str) -> bool {
@@ -18952,6 +19103,21 @@ fn glm_account_matches(account: &target::glm::accounts::GlmAccount, filter: &str
     )
 }
 
+fn compatible_account_matches(
+    account: &target::compatible::accounts::CompatibleAccount,
+    filter: &str,
+) -> bool {
+    account_filter_matches(
+        filter,
+        [
+            compatible_stats_key(account),
+            account.account_id.clone(),
+            account.label.clone(),
+            account.file_name.clone().unwrap_or_default(),
+        ],
+    )
+}
+
 fn target_provider_access_key(target: TargetModel) -> Option<&'static str> {
     match target {
         TargetModel::Codex | TargetModel::CodexModels => Some("codex"),
@@ -18964,6 +19130,7 @@ fn target_provider_access_key(target: TargetModel) -> Option<&'static str> {
         TargetModel::Copilot => Some("copilot"),
         TargetModel::Claude => Some("claude"),
         TargetModel::Glm => Some("glm"),
+        TargetModel::Compatible => Some("compatible"),
         TargetModel::Custom | TargetModel::UnifiedV1Models => None,
     }
 }
@@ -20305,6 +20472,20 @@ fn api_key_account_prompt_limit_response_for_target(
                 },
             )
         }
+        TargetModel::Compatible => {
+            let accounts = state.compatible_accounts.lock().unwrap();
+            api_key_account_prompt_limit_blocked(
+                &accounts,
+                access,
+                provider,
+                estimated_tokens,
+                |account, filter| compatible_account_matches_api_key_account(account, filter),
+                |account| {
+                    account.enabled
+                        && router_account_eligible(state, provider, &compatible_stats_key(account))
+                },
+            )
+        }
         TargetModel::CodexModels | TargetModel::Custom | TargetModel::UnifiedV1Models => None,
     }?;
 
@@ -20604,6 +20785,27 @@ fn scoped_state_for_api_key_request(
                 .collect(),
         ));
     }
+    if all_providers || target == Some(TargetModel::Compatible) {
+        scoped.compatible_accounts = Arc::new(Mutex::new(
+            state
+                .compatible_accounts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|account| {
+                    api_key_rule_allows_account(access, "compatible", |filter| {
+                        compatible_account_matches_api_key_account(account, filter)
+                    }) && api_key_account_prompt_limit_allows(
+                        access,
+                        "compatible",
+                        |filter| compatible_account_matches_api_key_account(account, filter),
+                        estimated_prompt_tokens,
+                    )
+                })
+                .cloned()
+                .collect(),
+        ));
+    }
     scoped
 }
 
@@ -20619,6 +20821,7 @@ fn target_has_configured_accounts(state: &AppState, target: TargetModel) -> bool
         TargetModel::Copilot => !state.copilot_accounts.lock().unwrap().is_empty(),
         TargetModel::Claude => !state.claude_accounts.lock().unwrap().is_empty(),
         TargetModel::Glm => !state.glm_accounts.lock().unwrap().is_empty(),
+        TargetModel::Compatible => !state.compatible_accounts.lock().unwrap().is_empty(),
         TargetModel::Custom | TargetModel::CodexModels | TargetModel::UnifiedV1Models => false,
     }
 }
@@ -20638,6 +20841,7 @@ fn target_has_enabled_account(state: &AppState, target: TargetModel) -> bool {
         TargetModel::Copilot => has_enabled_copilot_account(state),
         TargetModel::Claude => has_enabled_claude_account(state),
         TargetModel::Glm => has_enabled_glm_account(state),
+        TargetModel::Compatible => has_enabled_compatible_account(state),
         TargetModel::Custom | TargetModel::CodexModels | TargetModel::UnifiedV1Models => false,
     }
 }
@@ -20693,6 +20897,21 @@ fn target_has_dispatchable_account(state: &AppState, target: TargetModel) -> boo
         TargetModel::Glm => state.glm_accounts.lock().unwrap().iter().any(|account| {
             account.enabled && router_account_eligible(state, "glm", &glm_stats_key(account))
         }),
+        TargetModel::Compatible => {
+            state
+                .compatible_accounts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|account| {
+                    account.enabled
+                        && router_account_eligible(
+                            state,
+                            "compatible",
+                            &compatible_stats_key(account),
+                        )
+                })
+        }
         TargetModel::Custom | TargetModel::CodexModels | TargetModel::UnifiedV1Models => false,
     }
 }
@@ -20934,6 +21153,28 @@ fn scoped_state_for_custom_target_account(
             scoped.glm_accounts = Arc::new(Mutex::new(filtered));
             scoped.glm_rr = Arc::new(Mutex::new(0));
         }
+        TargetModel::Compatible => {
+            let accounts = state.compatible_accounts.lock().unwrap().clone();
+            let filtered = accounts
+                .into_iter()
+                .filter(|account| {
+                    account.enabled
+                        && custom_account_condition_matches(
+                            compatible_account_matches(account, account_filter),
+                            condition,
+                        )
+                })
+                .collect::<Vec<_>>();
+            if filtered.is_empty() {
+                return Err(custom_account_condition_error(
+                    "Compatible API",
+                    account_filter,
+                    condition,
+                ));
+            }
+            scoped.compatible_accounts = Arc::new(Mutex::new(filtered));
+            scoped.compatible_rr = Arc::new(Mutex::new(0));
+        }
         TargetModel::Custom | TargetModel::CodexModels | TargetModel::UnifiedV1Models => {}
     }
     Ok(scoped)
@@ -21097,6 +21338,9 @@ async fn dispatch_custom_target(
                 .await
                 .into_response(),
         },
+        TargetModel::Compatible => {
+            target::compatible::api::dispatch(state, headers, upstream_path, body).await
+        }
         TargetModel::Custom | TargetModel::CodexModels | TargetModel::UnifiedV1Models => {
             source_error_response(
                 source_api,
@@ -21681,6 +21925,7 @@ fn model_catalog_prefix_to_access_provider(prefix: &str) -> Option<&'static str>
         "cop" => Some("copilot"),
         "cld" => Some("claude"),
         "glm" => Some("glm"),
+        "cmp" | "compatible" => Some("compatible"),
         _ => None,
     }
 }
@@ -21711,6 +21956,7 @@ fn preferred_model_provider_prefix(model_id: &str) -> &'static str {
         TargetModel::Copilot => "cop",
         TargetModel::Claude => "cld",
         TargetModel::Glm => "glm",
+        TargetModel::Compatible => "cmp",
         TargetModel::Custom => "ctm",
         TargetModel::Codex | TargetModel::CodexModels | TargetModel::UnifiedV1Models => "cod",
     }
@@ -21728,6 +21974,7 @@ fn normalize_model_catalog_provider(provider: &str) -> Option<&'static str> {
         "cop" | "copilot" | "github-copilot" => Some("cop"),
         "cld" | "claude" | "anthropic" => Some("cld"),
         "glm" | "zai" | "z-ai" => Some("glm"),
+        "cmp" | "compatible" => Some("cmp"),
         _ => None,
     }
 }
@@ -22049,6 +22296,7 @@ async fn refresh_provider_models_by_prefix(
             )
             .await
         }
+        "cmp" => target::compatible::accounts::model_entries(state),
         _ => Vec::new(),
     };
     (prefix.to_string(), models)
@@ -22288,7 +22536,18 @@ fn split_provider_prefixed_model_id(model: &str) -> Option<(&str, &str)> {
 fn is_supported_provider_prefix(prefix: &str) -> bool {
     matches!(
         prefix.to_ascii_lowercase().as_str(),
-        "agw" | "gem" | "qwn" | "dsk" | "grk" | "min" | "cop" | "cld" | "glm" | "cod" | "ctm"
+        "agw"
+            | "gem"
+            | "qwn"
+            | "dsk"
+            | "grk"
+            | "min"
+            | "cop"
+            | "cld"
+            | "glm"
+            | "cmp"
+            | "cod"
+            | "ctm"
     )
 }
 
@@ -22760,6 +23019,15 @@ fn has_enabled_glm_account(state: &AppState) -> bool {
         .any(|account| account.enabled)
 }
 
+fn has_enabled_compatible_account(state: &AppState) -> bool {
+    state
+        .compatible_accounts
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|account| account.enabled)
+}
+
 fn append_unique_models(
     output: &mut Vec<serde_json::Value>,
     seen: &mut HashSet<String>,
@@ -23118,6 +23386,7 @@ fn build_usage_stats(
     copilot_accounts: &[target::copilot::accounts::CopilotAccount],
     claude_accounts: &[target::claude::accounts::ClaudeAccount],
     glm_accounts: &[target::glm::accounts::GlmAccount],
+    compatible_accounts: &[target::compatible::accounts::CompatibleAccount],
     persisted_stats: &StatsStore,
 ) -> UsageStats {
     let codex_accounts = tokens
@@ -23424,6 +23693,36 @@ fn build_usage_stats(
         })
         .collect();
 
+    let compatible_accounts = compatible_accounts
+        .iter()
+        .map(|account| {
+            let key = compatible_stats_key(account);
+            let stored = persisted_stats
+                .account_usage(Provider::Compatible, &key)
+                .cloned()
+                .unwrap_or_default();
+            AccountUsage {
+                key,
+                label: account.label.clone(),
+                account_id: account.account_id.clone(),
+                requests: stored.requests,
+                errors: stored.errors,
+                prompt_total: stored.prompt_total,
+                prompt_error_total: stored.prompt_error_total,
+                input_tokens: stored.input_tokens,
+                output_tokens: stored.output_tokens,
+                total_tokens: stored.total_tokens,
+                cache_tokens: stored.cache_tokens,
+                reasoning_tokens: stored.reasoning_tokens,
+                first_seen_at: stored.first_seen_at,
+                last_seen_at: stored.last_seen_at,
+                last_success_at: stored.last_success_at,
+                last_error_at: stored.last_error_at,
+                last_error_message: stored.last_error_message,
+            }
+        })
+        .collect();
+
     UsageStats {
         codex_accounts,
         agw_accounts,
@@ -23435,6 +23734,7 @@ fn build_usage_stats(
         copilot_accounts,
         claude_accounts,
         glm_accounts,
+        compatible_accounts,
         total_requests: persisted_stats.total_requests,
         total_errors: persisted_stats.total_errors,
         total_prompt_total: persisted_stats.total_prompt_total,
@@ -23460,6 +23760,7 @@ pub(crate) fn sync_usage_stats(state: &AppState) {
     let copilot_accounts = state.copilot_accounts.lock().unwrap().clone();
     let claude_accounts = state.claude_accounts.lock().unwrap().clone();
     let glm_accounts = state.glm_accounts.lock().unwrap().clone();
+    let compatible_accounts = state.compatible_accounts.lock().unwrap().clone();
     let persisted_stats = state.persisted_stats.lock().unwrap().clone();
     let mut stats = state.stats.lock().unwrap();
     *stats = build_usage_stats(
@@ -23473,6 +23774,7 @@ pub(crate) fn sync_usage_stats(state: &AppState) {
         &copilot_accounts,
         &claude_accounts,
         &glm_accounts,
+        &compatible_accounts,
         &persisted_stats,
     );
 }
@@ -23746,6 +24048,22 @@ pub(crate) fn glm_stats_key(account: &target::glm::accounts::GlmAccount) -> Stri
     format!("glm:label:{}", account.label)
 }
 
+pub(crate) fn compatible_stats_key(
+    account: &target::compatible::accounts::CompatibleAccount,
+) -> String {
+    if !account.account_id.trim().is_empty() {
+        return format!("compatible:account_id:{}", account.account_id);
+    }
+    if let Some(file_name) = account
+        .file_name
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return format!("compatible:file:{}", file_name);
+    }
+    format!("compatible:label:{}", account.label)
+}
+
 const ACCOUNT_SELECTION_QUOTA_EPSILON: f64 = 0.01;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -23903,6 +24221,7 @@ fn provider_name(provider: Provider) -> &'static str {
         Provider::Copilot => "copilot",
         Provider::Claude => "claude",
         Provider::Glm => "glm",
+        Provider::Compatible => "compatible",
     }
 }
 
@@ -24253,6 +24572,11 @@ pub(crate) fn router_clear_credential_file_cooldown(state: &AppState, file_name:
             clear_router_account_runtime(state, "glm", &glm_stats_key(account));
         }
     }
+    for account in state.compatible_accounts.lock().unwrap().iter() {
+        if account.file_name.as_deref() == Some(file_name) {
+            clear_router_account_runtime(state, "compatible", &compatible_stats_key(account));
+        }
+    }
 }
 
 fn contains_http_status(message: &str, status: u16) -> bool {
@@ -24432,6 +24756,18 @@ pub(crate) fn glm_account_selection_score(
     account: &target::glm::accounts::GlmAccount,
 ) -> AccountSelectionScore {
     usage_backed_selection_score(state, Provider::Glm, glm_stats_key(account), None)
+}
+
+pub(crate) fn compatible_account_selection_score(
+    state: &AppState,
+    account: &target::compatible::accounts::CompatibleAccount,
+) -> AccountSelectionScore {
+    usage_backed_selection_score(
+        state,
+        Provider::Compatible,
+        compatible_stats_key(account),
+        None,
+    )
 }
 
 fn codex_quota_pressure(summary: &target::codex::quota::QuotaSummary) -> Option<f64> {
@@ -24835,6 +25171,25 @@ pub(crate) fn glm_usage_context(
         provider: Provider::Glm,
         provider_name: "glm",
         key: glm_stats_key(account),
+        label: account.label.clone(),
+        account_id: account.account_id.clone(),
+        credential_file: account.file_name.clone(),
+        model,
+        request_path: request_path.into(),
+        prompt,
+    }
+}
+
+pub(crate) fn compatible_usage_context(
+    account: &target::compatible::accounts::CompatibleAccount,
+    model: Option<String>,
+    request_path: impl Into<String>,
+    prompt: PromptMetrics,
+) -> UsageContext {
+    UsageContext {
+        provider: Provider::Compatible,
+        provider_name: "compatible",
+        key: compatible_stats_key(account),
         label: account.label.clone(),
         account_id: account.account_id.clone(),
         credential_file: account.file_name.clone(),
@@ -25270,6 +25625,8 @@ fn provider_from_history_name(name: &str) -> Option<Provider> {
         Some(Provider::Copilot)
     } else if name.eq_ignore_ascii_case("claude") {
         Some(Provider::Claude)
+    } else if name.eq_ignore_ascii_case("compatible") {
+        Some(Provider::Compatible)
     } else if name.eq_ignore_ascii_case("glm") {
         Some(Provider::Glm)
     } else {
@@ -25484,6 +25841,7 @@ fn stats_accounts_mut(stats: &mut UsageStats, provider: Provider) -> &mut Vec<Ac
         Provider::Copilot => &mut stats.copilot_accounts,
         Provider::Claude => &mut stats.claude_accounts,
         Provider::Glm => &mut stats.glm_accounts,
+        Provider::Compatible => &mut stats.compatible_accounts,
     }
 }
 
@@ -26350,6 +26708,20 @@ fn codex_provider_model_metadata(
             true,
             true,
         ));
+    }
+    let scoped =
+        scoped_state_for_api_key_access(state.clone(), access, Some(TargetModel::Compatible));
+    for model in target::compatible::accounts::model_entries(&scoped) {
+        if let Some(id) = model["id"].as_str() {
+            models.push(codex_provider_model(
+                id,
+                id,
+                "Model served by a configured compatible API.",
+                128_000,
+                false,
+                true,
+            ));
+        }
     }
     for model in state
         .custom_models

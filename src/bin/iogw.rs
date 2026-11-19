@@ -69,6 +69,11 @@ const BTOP_USED_END: Color = Color::Rgb(0xff, 0x47, 0x69);
 
 const PROVIDERS: &[ProviderSpec] = &[
     ProviderSpec {
+        key: "compatible",
+        label: "Compatible API",
+        quota_path: "/compatible/quota.json",
+    },
+    ProviderSpec {
         key: "codex",
         label: "Codex",
         quota_path: "/quota.json",
@@ -1553,6 +1558,14 @@ async fn run_tui_loop(
             KeyCode::Char('w') | KeyCode::Char(' ') if app.tab == Tab::Notifications => {
                 app.toggle_selected_notification_account();
             }
+            KeyCode::Char('i')
+                if app.tab == Tab::Overview
+                    && app.overview_section == OverviewSection::AccountUsage =>
+            {
+                if let Err(error) = app.edit_selected_compatible_account(terminal) {
+                    app.message = error;
+                }
+            }
             KeyCode::Char('e') if app.tab == Tab::Keys => {
                 if let Err(error) = app.edit_selected_api_key(terminal) {
                     app.message = error;
@@ -1756,6 +1769,88 @@ impl TuiApp {
         }
     }
 
+    fn edit_selected_compatible_account(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<(), String> {
+        if self.network.command_pending() {
+            return Err("an action is already in progress".into());
+        }
+        if self.needs_login() || !self.network.has_data(Section::Session) {
+            return Err("admin login required: press o".into());
+        }
+        let account = self
+            .selected_account()
+            .ok_or("Select a compatible account first")?;
+        if account.provider != "compatible" {
+            return Err("The API editor is available for compatible accounts".into());
+        }
+        let existing = snapshot_account_for_account(&self.data.snapshot, &account)
+            .cloned()
+            .ok_or("Refresh account details before editing")?;
+        self.edit_compatible_account(terminal, Some(existing))
+    }
+
+    fn edit_compatible_account(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        existing: Option<Value>,
+    ) -> Result<(), String> {
+        let old = existing.as_ref().unwrap_or(&Value::Null);
+        let label = prompt_compatible_field(terminal, "Name", &string_at(old, &["label"]), false)?;
+        let base_url = prompt_compatible_field(
+            terminal,
+            "OpenAI base URL (include /v1 if required)",
+            &string_at(old, &["base_url"]),
+            true,
+        )?;
+        let anthropic_base_url = prompt_compatible_field(
+            terminal,
+            "Anthropic base URL",
+            &string_at(old, &["anthropic_base_url"]),
+            true,
+        )?;
+        if base_url.is_empty() && anthropic_base_url.is_empty() {
+            return Err("Enter at least one API base URL".into());
+        }
+        let api_key = prompt_secret_in_terminal(
+            terminal,
+            if existing.is_some() {
+                "API key (blank = keep saved key): "
+            } else {
+                "API key: "
+            },
+        )?;
+        let model_default = old["models"]
+            .as_array()
+            .map(|v| {
+                v.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        let model_input = prompt_compatible_field(
+            terminal,
+            "Upstream model IDs (comma separated, no cmp: prefix)",
+            &model_default,
+            false,
+        )?;
+        let models: Vec<_> = model_input
+            .split(',')
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .collect();
+        if label.is_empty() || models.is_empty() || existing.is_none() && api_key.is_empty() {
+            return Err("Name, key, and at least one model are required".into());
+        }
+        self.start_command(TuiCommand::SaveAccountCredentials {provider:"compatible".into(),body:json!({
+            "file_name":old["file_name"],"label":label,"base_url":base_url,"anthropic_base_url":anthropic_base_url,
+            "api_key":api_key,"models":models
+        })});
+        Ok(())
+    }
+
     fn begin_add_account(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -1778,6 +1873,7 @@ impl TuiApp {
                     account_type: None,
                 });
             }
+            "compatible" => self.edit_compatible_account(terminal, None)?,
             "claude" => self.begin_claude_account(terminal)?,
             "copilot" => self.begin_copilot_account(terminal)?,
             "qwen" => {
@@ -3054,7 +3150,7 @@ fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp) {
         } else {
             let section_hint = match app.overview_section {
                 OverviewSection::AccountUsage => format!(
-                    "a quota: {} | n add account | e/d enable/disable | x delete",
+                    "a quota: {} | n add account | i edit API | e/d enable/disable | x delete",
                     app.limit_display_mode.label()
                 ),
                 OverviewSection::CustomModels => "e/d enable/disable | x delete".to_string(),
@@ -4786,6 +4882,10 @@ fn command_modal_rows(app: &TuiApp) -> Vec<(String, String)> {
                         "a".to_string(),
                         format!("toggle quota view ({})", app.limit_display_mode.label()),
                     ));
+                    rows.push((
+                        "i".to_string(),
+                        "edit compatible API name, URLs, key, and models".to_string(),
+                    ));
                     rows.push(("e".to_string(), "enable selected account".to_string()));
                     rows.push(("d".to_string(), "disable selected account".to_string()));
                     rows.push(("p".to_string(), "hide selected provider".to_string()));
@@ -4956,6 +5056,18 @@ fn draw_account_details_modal(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         }
     }
 
+    if account.provider == "compatible" {
+        for value in &snapshot_values {
+            for (field, label) in [
+                ("base_url", "OpenAI base URL"),
+                ("anthropic_base_url", "Anthropic base URL"),
+            ] {
+                if let Some(url) = value.get(field).and_then(Value::as_str) {
+                    lines.push(detail_line(label, url.to_string()));
+                }
+            }
+        }
+    }
     lines.push(detail_section("Available reset limit"));
     match reset_credits {
         Some((count, credits)) => {
@@ -5214,7 +5326,7 @@ fn prompt_account_provider(
 ) -> Result<String, String> {
     let value = prompt_in_terminal(
         terminal,
-        "Provider [1=Codex, 2=Antigravity, 3=Gemini, 4=Qwen, 5=DeepSeek, 6=MiniMax, 7=Grok, 8=Copilot, 9=Claude, 10=GLM]: ",
+        "Provider [1=Codex, 2=Antigravity, 3=Gemini, 4=Qwen, 5=DeepSeek, 6=MiniMax, 7=Grok, 8=Copilot, 9=Claude, 10=GLM, 11=Compatible API]: ",
     )?;
     let normalized = value.trim().to_ascii_lowercase();
     let provider = match normalized.as_str() {
@@ -5228,9 +5340,71 @@ fn prompt_account_provider(
         "8" | "copilot" | "github" => "copilot",
         "9" | "claude" | "anthropic" => "claude",
         "10" | "glm" | "zai" | "z.ai" => "glm",
+        "11" | "compatible" | "cmp" | "openai" | "anthropic-compatible" => "compatible",
         _ => return Err("unknown provider; choose a listed number or provider name".to_string()),
     };
     Ok(provider.to_string())
+}
+
+fn prompt_compatible_field(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    label: &str,
+    current: &str,
+    removable: bool,
+) -> Result<String, String> {
+    let suffix = if removable { "; - clears" } else { "" };
+    let prompt = if current.is_empty() {
+        format!("{label} (blank = none): ")
+    } else {
+        format!("{label} [{current}] (blank = keep{suffix}): ")
+    };
+    let value = prompt_in_terminal(terminal, &prompt)?.trim().to_string();
+    Ok(if value.is_empty() {
+        current.to_string()
+    } else if removable && value == "-" {
+        String::new()
+    } else {
+        value
+    })
+}
+
+fn prompt_secret_in_terminal(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    prompt: &str,
+) -> Result<String, String> {
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show)
+        .map_err(|e| e.to_string())?;
+    let result = (|| {
+        let mut output = io::stdout();
+        write!(output, "\r\n{prompt}").map_err(|e| e.to_string())?;
+        output.flush().map_err(|e| e.to_string())?;
+        let mut value = String::new();
+        loop {
+            match event::read().map_err(|e| e.to_string())? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Enter => break,
+                    KeyCode::Esc => return Err("API key entry cancelled".to_string()),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Err("API key entry cancelled".to_string())
+                    }
+                    KeyCode::Char(ch) => {
+                        value.push(ch);
+                    }
+                    KeyCode::Backspace => {
+                        value.pop();
+                    }
+                    _ => {}
+                },
+                Event::Paste(text) => value.push_str(&text),
+                _ => {}
+            }
+        }
+        Ok(value.trim().to_string())
+    })();
+    execute!(terminal.backend_mut(), EnterAlternateScreen, cursor::Hide)
+        .map_err(|e| e.to_string())?;
+    terminal.clear().map_err(|e| e.to_string())?;
+    result
 }
 
 fn prompt_optional(
@@ -8289,6 +8463,7 @@ fn normalize_usage_provider(provider: &str) -> String {
         "cop" | "copilot" | "github-copilot" => "copilot",
         "cld" | "claude" | "anthropic" => "claude",
         "glm" | "zai" | "z-ai" => "glm",
+        "cmp" | "compatible" => "compatible",
         other => other,
     }
     .to_string()
@@ -8306,6 +8481,7 @@ fn normalize_refresh_provider(provider: &str) -> Option<&'static str> {
         "cop" | "copilot" | "github-copilot" => Some("cop"),
         "cld" | "claude" | "anthropic" => Some("cld"),
         "glm" | "zai" | "z-ai" => Some("glm"),
+        "cmp" | "compatible" => Some("cmp"),
         _ => None,
     }
 }

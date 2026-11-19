@@ -182,6 +182,7 @@ fn canonical_target_provider_prefix(prefix: &str) -> Option<&'static str> {
         "cop" | "copilot" | "github-copilot" | "github_copilot" => Some("cop"),
         "cld" | "claude" | "anthropic" => Some("cld"),
         "glm" | "zai" | "z-ai" => Some("glm"),
+        "cmp" | "compatible" => Some("cmp"),
         "cod" | "codex" => Some("cod"),
         "ctm" | "custom" => Some("ctm"),
         _ => None,

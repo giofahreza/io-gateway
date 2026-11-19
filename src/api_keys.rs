@@ -488,6 +488,7 @@ fn normalize_provider(provider: &str) -> Option<&'static str> {
         "cop" | "copilot" | "github-copilot" => Some("copilot"),
         "cld" | "claude" | "anthropic" => Some("claude"),
         "glm" | "zai" | "z-ai" => Some("glm"),
+        "cmp" | "compatible" => Some("compatible"),
         _ => None,
     }
 }

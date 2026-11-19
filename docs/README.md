@@ -12,3 +12,5 @@ Runtime docs are also exposed by the app:
 
 - Swagger UI: `/docs/`
 - OpenAPI JSON: `/api-docs/openapi.json`
+
+- [Compatible APIs](compatible-apis.md) — add and manage services that accept OpenAI Chat Completions or Anthropic Messages.

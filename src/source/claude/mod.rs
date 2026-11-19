@@ -55,9 +55,11 @@ pub fn route_to_target(
                 response_mode: ResponseMode::Passthrough,
             });
         }
-        if crate::source::v1::provider::target_from_request_body(&body) == Some(TargetModel::Glm) {
+        if crate::source::v1::provider::target_from_request_body(&body)
+            .is_some_and(|target| matches!(target, TargetModel::Glm | TargetModel::Compatible))
+        {
             return Ok(RoutedRequest {
-                target: TargetModel::Glm,
+                target: crate::source::v1::provider::target_from_request_body(&body).unwrap(),
                 upstream_path: "anthropic/v1/messages".to_string(),
                 upstream_query: uri.query().map(|value| value.to_string()),
                 upstream_body: crate::source::v1::provider::strip_provider_prefix_from_body(body),
@@ -115,9 +117,11 @@ pub fn route_to_target(
                 body,
             ));
         }
-        if crate::source::v1::provider::target_from_request_body(&body) == Some(TargetModel::Glm) {
+        if crate::source::v1::provider::target_from_request_body(&body)
+            .is_some_and(|target| matches!(target, TargetModel::Glm | TargetModel::Compatible))
+        {
             return Ok(crate::source::v1::provider::convert(
-                TargetModel::Glm,
+                crate::source::v1::provider::target_from_request_body(&body).unwrap(),
                 upstream_path,
                 uri,
                 body,

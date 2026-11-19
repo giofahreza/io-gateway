@@ -19,6 +19,7 @@ pub enum TargetModel {
     Copilot,
     Claude,
     Glm,
+    Compatible,
     Custom,
     CodexModels,
     UnifiedV1Models,
