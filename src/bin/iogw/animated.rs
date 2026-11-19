@@ -785,6 +785,20 @@ impl Animation {
                 .into_iter()
                 .map(|(label, used, reset)| ((label, used), reset))
                 .unzip();
+            let credits = ["codex", "claude"]
+                .contains(&account.provider.as_str())
+                .then(|| {
+                    let values = account_snapshot_values(&data.snapshot, account);
+                    let value = values
+                        .into_iter()
+                        .find(|value| value.get("credits").is_some())
+                        .unwrap_or(&Value::Null);
+                    super::provider_quota_summary::credit_fields(value)
+                        .into_iter()
+                        .find(|field| field.label == "Available credits")
+                        .map(|field| clean(&field.value))
+                        .unwrap_or_else(|| "Not reported".into())
+                });
             let email = account_snapshot_values(&data.snapshot, account)
                 .into_iter()
                 .filter(|value| super::snapshot_value_matches_account(value, account))
@@ -812,6 +826,7 @@ impl Animation {
                 requests: account.requests,
                 limits,
                 resets,
+                credits,
                 recent_until: record.1,
                 models: None,
                 model_selected: 0,
@@ -874,6 +889,7 @@ struct SceneAccount {
     requests: u64,
     limits: Vec<(String, Option<f64>)>,
     resets: Vec<Option<i64>>,
+    credits: Option<String>,
     models: Option<Vec<(String, bool)>>,
     model_selected: usize,
 }
@@ -1125,6 +1141,7 @@ impl SceneAccount {
             requests: 0,
             limits: Vec::new(),
             resets: Vec::new(),
+            credits: None,
             models: Some(Vec::new()),
             model_selected: 0,
         }
@@ -1148,6 +1165,17 @@ impl SceneAccount {
             return models.len().clamp(1, 4);
         }
         self.limits.len().max(1).min(if all_limits { 4 } else { 2 })
+            + usize::from(all_limits && self.credits.is_some())
+    }
+
+    fn credit_line(&self, width: u16) -> String {
+        clipped(
+            &format!(
+                "Credits {}",
+                self.credits.as_deref().unwrap_or("Not reported")
+            ),
+            width,
+        )
     }
 
     fn limit_line(&self, index: usize, width: u16, hidden: usize) -> String {
@@ -1203,7 +1231,8 @@ impl SceneAccount {
                 .unwrap_or(24)
                 .clamp(26, 46)) as u16;
         }
-        let rows = self.quota_rows(all_limits);
+        let show_credits = all_limits && self.credits.is_some();
+        let rows = self.quota_rows(all_limits) - usize::from(show_credits);
         let hidden = self.limits.len().saturating_sub(rows);
         let usage_width = (0..rows)
             .map(|index| {
@@ -1213,6 +1242,11 @@ impl SceneAccount {
             .max()
             .unwrap_or(0);
         (usage_width
+            .max(if show_credits {
+                Line::from(self.credit_line(512)).width()
+            } else {
+                0
+            })
             .max(Line::from(self.heading()).width())
             .max(Line::from(self.identity()).width())
             .max(17)
@@ -1723,7 +1757,7 @@ impl SceneLayout {
         } else {
             body.height.saturating_sub(10)
         };
-        let card_height = (limits.clamp(1, 4) as u16 + 4)
+        let card_height = (limits.clamp(1, 5) as u16 + 4)
             .min(available.max(4))
             .min(body.height);
         let rows = if theme == Theme::Office {
@@ -2058,9 +2092,13 @@ fn render_scene(
         let slots = account
             .quota_rows(all_limits)
             .min(inner.height.saturating_sub(2) as usize);
-        for index in (0..slots).filter(|_| account.models.is_none()) {
-            let hidden = if index + 1 == slots {
-                account.limits.len().saturating_sub(slots)
+        // Keep the balance visible even when the scene only has room for a
+        // short quota summary. Overflow still counts quota windows only.
+        let show_credits = all_limits && account.credits.is_some() && slots > 0;
+        let limit_slots = slots - usize::from(show_credits);
+        for index in (0..limit_slots).filter(|_| account.models.is_none()) {
+            let hidden = if index + 1 == limit_slots {
+                account.limits.len().saturating_sub(limit_slots)
             } else {
                 0
             };
@@ -2077,6 +2115,9 @@ fn render_scene(
                 }),
                 true,
             ));
+        }
+        if show_credits && account.models.is_none() {
+            lines.push((account.credit_line(inner.width), pack.color('e'), true));
         }
         for (row, (text, color, bold)) in lines.into_iter().enumerate().take(inner.height as usize)
         {
@@ -4694,6 +4735,13 @@ mod tests {
     #[test]
     fn wall_tv_and_model_bubbles_fit_without_colliding_with_quota_bubbles() {
         let mut cats = sample_accounts(25);
+        for cat in &mut cats {
+            cat.credits = Some("8.25".into());
+            cat.limits.extend([
+                ("Review 5h".into(), Some(12.0)),
+                ("Review Weekly".into(), Some(8.0)),
+            ]);
+        }
         let mut models = SceneAccount::models_cat();
         models.models = Some((0..9).map(|i| (format!("custom-{i}"), true)).collect());
         models.model_selected = 8;
@@ -4899,6 +4947,7 @@ mod tests {
     fn cafe_rack_is_mounted_above_bubbles_at_all_supported_sizes() {
         let mut accounts = sample_accounts(25);
         for account in &mut accounts {
+            account.credits = Some("8.25".into());
             account.limits.extend([
                 ("Review 5h".into(), Some(12.0)),
                 ("Review Weekly".into(), Some(8.0)),
@@ -5141,6 +5190,7 @@ mod tests {
                     Some(chrono::Utc::now().timestamp() + 4980),
                     Some(chrono::Utc::now().timestamp() + 93600),
                 ],
+                credits: None,
                 recent_until: Some(Instant::now() + Duration::from_secs(10)),
                 models: None,
                 model_selected: 0,
@@ -5651,6 +5701,122 @@ mod tests {
     }
 
     #[test]
+    fn credits_use_the_matching_account_balance_without_changing_quota_usage() {
+        use super::super::{quota_rows_from_provider, AccountRow};
+        for (provider, credits, expected) in [
+            (
+                "codex",
+                json!({"balance":"60482.4406550000"}),
+                "60482.4406550000",
+            ),
+            ("codex", json!({"balance":"0"}), "0"),
+            ("codex", json!({"unlimited":true}), "Unlimited"),
+            (
+                "codex",
+                json!({"has_credits":false}),
+                "No credits available",
+            ),
+            (
+                "claude",
+                json!({"balance":"12.50","currency":"USD"}),
+                "12.50 USD",
+            ),
+            (
+                "claude",
+                json!({"enabled":false,"monthly_limit":"100","used":"10"}),
+                "Not reported",
+            ),
+            ("claude", Value::Null, "Not reported"),
+        ] {
+            let mut selected = if provider == "codex" {
+                json!({"code_generation":{"five_hour":{"used_percent":30}}})
+            } else {
+                json!({"five_hour":{"used_percent":30}})
+            };
+            selected["key"] = json!("selected-account");
+            selected["label"] = json!("Selected fixture");
+            selected["credits"] = credits.clone();
+            selected["rate_limit_reset_credits"] = json!({"available_count":5});
+            let quota = json!({"accounts":[
+                {"key":"other-account", "label":"Other fixture", "credits":{"balance":"999"}},
+                selected
+            ]});
+            let data = GatewayData {
+                accounts: vec![AccountRow {
+                    provider: provider.into(),
+                    key: "selected-account".into(),
+                    label: "Selected fixture".into(),
+                    enabled: true,
+                    ..Default::default()
+                }],
+                quotas: quota_rows_from_provider(provider, &quota),
+                // Account metadata precedes the quota object in snapshot values.
+                snapshot: json!({"accounts":[{"provider":provider,"key":"selected-account"}],
+                    "quotas":{provider:quota}}),
+                ..Default::default()
+            };
+            let mut animation = Animation::new();
+            animation.pack = Some(Pack::parse(SOURCE).unwrap());
+            animation.observe(&data);
+            let account = &animation.scene[0];
+            assert_eq!(
+                account.credits.as_deref(),
+                Some(expected),
+                "{provider}: {credits}"
+            );
+            assert_eq!(account.used, Some(30.0));
+            assert_eq!(account.limits.len(), 1, "{provider}: {:?}", account.limits);
+            assert_eq!(account.quota_rows(false), 1);
+            assert_eq!(account.quota_rows(true), 2);
+        }
+    }
+
+    #[test]
+    fn all_limits_shows_both_account_credits_in_every_theme_and_compact_layout() {
+        let mut accounts = sample_accounts(2);
+        accounts[0].credits = Some("8.25".into());
+        accounts[1].credits = Some("12.50 USD".into());
+        // Many quota windows must not push the balance out of a short bubble.
+        for account in &mut accounts {
+            account
+                .limits
+                .extend((0..8).map(|i| (format!("Extra {i}"), Some(10.0))));
+        }
+        for theme in Theme::ALL {
+            let pack = Pack::parse(theme_source(theme)).unwrap();
+            for (width, height) in [(80, 24), (180, 42), (300, 90)] {
+                let buffer =
+                    image_accounts(width, height, "CONNECTED", 700, &pack, &accounts, true);
+                let screen = text(&buffer);
+                for expected in ["Credits 8.25", "Credits 12.50 USD"] {
+                    assert!(
+                        screen.contains(expected),
+                        "{theme:?} {width}x{height}: missing {expected}\n{screen}"
+                    );
+                }
+                assert!(screen.contains("+"), "quota overflow remains marked");
+                let normal =
+                    image_accounts(width, height, "CONNECTED", 700, &pack, &accounts, false);
+                assert!(!text(&normal).contains("Credits"));
+                let layout = SceneLayout::for_accounts(
+                    buffer.area,
+                    theme,
+                    &accounts.iter().collect::<Vec<_>>(),
+                    true,
+                );
+                for (index, account) in accounts.iter().enumerate() {
+                    let (bubble, _) = speech_bubble(&layout, index, account, theme, 700, true);
+                    assert!(bubble.x >= layout.body.x && bubble.right() <= layout.body.right());
+                    assert!(bubble.y >= layout.body.y && bubble.bottom() <= layout.body.bottom());
+                }
+            }
+            for (width, height) in [(1, 1), (20, 8), (38, 18)] {
+                image_accounts(width, height, "CONNECTED", 700, &pack, &accounts, true);
+            }
+        }
+    }
+
+    #[test]
     fn bubbles_fit_content_and_put_provider_status_above_email() {
         let mut accounts = sample_accounts(3);
         accounts[1].email = "a-very-long-account-address-for-responsive-layout@example.com".into();
@@ -5737,6 +5903,7 @@ mod tests {
             models: None,
             model_selected: 0,
             resets: vec![],
+            credits: None,
             limits: (0..10)
                 .map(|index| (format!("Window {index}"), Some(index as f64)))
                 .collect(),
@@ -5986,6 +6153,7 @@ mod tests {
                 requests: 0,
                 limits: vec![],
                 resets: vec![],
+                credits: None,
                 models: None,
                 model_selected: 0,
             })
