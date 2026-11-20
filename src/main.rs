@@ -5046,7 +5046,7 @@ async fn dashboard() -> impl IntoResponse {
         --surface: #0d1526;
         --surface-alt: #141e33;
         --surface-raised: #0a1120;
-        --border: #25365a;
+        --border: #071226;
         --text: #e8eefc;
         --muted: #8795b1;
         --button-bg: #2f7bf6;
@@ -10238,7 +10238,7 @@ async fn dashboard() -> impl IntoResponse {
                     color: getComputedStyle(document.documentElement).getPropertyValue('--muted').trim() || '#94a3b8'
                   },
                   border: { display: false, dash: [4, 4] },
-                  grid: { color: (getComputedStyle(document.documentElement).getPropertyValue('--border').trim() || '#1c2840') + '99' }
+                  grid: { color: (getComputedStyle(document.documentElement).getPropertyValue('--muted').trim() || '#8795b1') + '26' }
                 }
               }
             }
