@@ -6502,7 +6502,11 @@ async fn dashboard() -> impl IntoResponse {
         var entries = testApiModelEntries();
         list.innerHTML = entries.map(function(entry) {
           var providerLabel = providerLabels[entry.provider] || entry.provider || 'Model';
-          var label = providerLabel + (entry.label && entry.label !== entry.id ? ' - ' + entry.label : '');
+          // Always name the model: when the catalog gives no separate display name, use the ID without its
+          // provider prefix, so browsers that show the label instead of the value still list model names.
+          var separator = entry.id.indexOf(':');
+          var modelName = entry.label && entry.label !== entry.id ? entry.label : (separator >= 0 ? entry.id.slice(separator + 1) : entry.id);
+          var label = providerLabel + ' - ' + modelName;
           return '<option value="' + escapeHtml(entry.id) + '" label="' + escapeHtml(label) + '"></option>';
         }).join('');
         if (!input.value.trim() && entries.length) {
