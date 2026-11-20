@@ -52,6 +52,11 @@ assert.ok(!html.includes('<dl'));
 context.renderQwenProviderCards();
 assert.match(elements.get('qwenCards').innerHTML,/12.50 USD/);
 assert.equal(elements.get('qwenBadgeCount').textContent,'2 accounts');
+quota={...quota,credits:{balance:'0',cash_balance:'0.00',credit_limit:'0',currency:'USD'}};
+await context.refreshCompatibleAccounts();
+const zeroHtml=elements.get('qwenCards').innerHTML;
+assert.ok(zeroHtml.includes('0 USD'),'the main balance shows even at zero');
+assert.ok(!zeroHtml.includes('cash balance')&&!zeroHtml.includes('credit limit'),'zero secondary amounts are hidden');
 console.log('Qwen grouping, Chat coexistence, custom separation, balance-only updates, zero, cash and credit limits passed.');
 
 const start=main.indexOf('      function renderQuotaBars(');

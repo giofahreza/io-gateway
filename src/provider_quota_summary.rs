@@ -40,11 +40,15 @@ pub fn credit_fields(account: &Value) -> Vec<Field> {
         "Not reported".into()
     };
     push(&mut out, "Available credits", balance);
+    // Secondary amounts are noise at zero; the main balance above always shows.
     for (key, label) in [
         ("cash_balance", "Cash balance"),
         ("credit_limit", "Credit limit"),
     ] {
-        if let Some(value) = amount(&credits[key]) {
+        let is_zero = text(&credits[key])
+            .and_then(|value| value.parse::<f64>().ok())
+            .is_some_and(|value| value == 0.0);
+        if let Some(value) = amount(&credits[key]).filter(|_| !is_zero) {
             push(&mut out, label, value);
         }
     }
@@ -331,6 +335,21 @@ mod tests {
         assert!(!serde_json::to_string(&fields)
             .unwrap()
             .contains("never display"));
+    }
+
+    #[test]
+    fn zero_cash_balance_and_credit_limit_are_hidden_but_the_main_balance_stays() {
+        let fields = credit_fields(
+            &json!({"credits":{"balance":"0","cash_balance":"0.00","credit_limit":0,"currency":"USD"}}),
+        );
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].label, "Available credits");
+        assert_eq!(fields[0].value, "0 USD");
+        let fields = credit_fields(
+            &json!({"credits":{"balance":"12.50","cash_balance":"2.50","credit_limit":"10","currency":"USD"}}),
+        );
+        assert_eq!(fields[1].value, "2.50 USD");
+        assert_eq!(fields[2].value, "10 USD");
     }
 
     #[test]

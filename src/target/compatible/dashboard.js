@@ -346,8 +346,9 @@ function buildCompatibleCard(account) {
     const rows = connectionRows('compatible', shown, quota).concat([
       renderMetaLine('service', account.service_label, false),
       renderMetaLine('quota connection', connectionLabel, false),
-      renderMetaLine('cash balance', credits.cash_balance != null ? credits.cash_balance + currency : '', false),
-      renderMetaLine('credit limit', credits.credit_limit != null ? credits.credit_limit + currency : '', false),
+      // Secondary amounts are noise at zero; the main balance above always shows.
+      renderMetaLine('cash balance', credits.cash_balance != null && Number(credits.cash_balance) !== 0 ? credits.cash_balance + currency : '', false),
+      renderMetaLine('credit limit', credits.credit_limit != null && Number(credits.credit_limit) !== 0 ? credits.credit_limit + currency : '', false),
       renderLongMetaLine('credit note', credits.note)
     ]).filter(Boolean);
     return '<div class="card">' + renderAccountHeader(account.label, 'compatible', account)
