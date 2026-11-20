@@ -785,20 +785,21 @@ impl Animation {
                 .into_iter()
                 .map(|(label, used, reset)| ((label, used), reset))
                 .unzip();
-            let credits = ["codex", "claude"]
-                .contains(&account.provider.as_str())
-                .then(|| {
-                    let values = account_snapshot_values(&data.snapshot, account);
-                    let value = values
-                        .into_iter()
-                        .find(|value| value.get("credits").is_some())
-                        .unwrap_or(&Value::Null);
-                    super::provider_quota_summary::credit_fields(value)
-                        .into_iter()
-                        .find(|field| field.label == "Available credits")
-                        .map(|field| clean(&field.value))
-                        .unwrap_or_else(|| "Not reported".into())
-                });
+            let values = account_snapshot_values(&data.snapshot, account);
+            let credit_value = values
+                .iter()
+                .copied()
+                .find(|value| value.get("credits").is_some());
+            let credits = (["codex", "claude"].contains(&account.provider.as_str())
+                || credit_value.is_some())
+            .then(|| {
+                let value = credit_value.unwrap_or(&Value::Null);
+                super::provider_quota_summary::credit_fields(value)
+                    .into_iter()
+                    .find(|field| field.label == "Available credits")
+                    .map(|field| clean(&field.value))
+                    .unwrap_or_else(|| "Not reported".into())
+            });
             let email = account_snapshot_values(&data.snapshot, account)
                 .into_iter()
                 .filter(|value| super::snapshot_value_matches_account(value, account))
@@ -818,8 +819,15 @@ impl Animation {
                 used,
                 email,
                 name: clean(&account.label).trim().to_owned(),
-                provider: clean(provider_label(&account.provider)),
-                icon: provider_icon(&account.provider),
+                provider: values
+                    .iter()
+                    .find_map(|value| match value["service"].as_str() {
+                        Some("qwen_token_plan") => Some("Qwen Token Plan".to_string()),
+                        Some("qwen_payg") => Some("Qwen Pay-as-you-go".to_string()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| clean(provider_label(&account.provider))),
+                icon: provider_icon(super::account_display_provider(account)),
                 quota: quota
                     .map(|quota| compact_quota_label(&account.provider, &quota.limit_label))
                     .unwrap_or_default(),
@@ -5727,6 +5735,11 @@ mod tests {
                 "Not reported",
             ),
             ("claude", Value::Null, "Not reported"),
+            (
+                "compatible",
+                json!({"balance":"12.50","currency":"USD"}),
+                "12.50 USD",
+            ),
         ] {
             let mut selected = if provider == "codex" {
                 json!({"code_generation":{"five_hour":{"used_percent":30}}})

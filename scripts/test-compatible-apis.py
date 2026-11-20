@@ -121,9 +121,15 @@ def request(base, path, body=None, key=None, form=None):
 
 
 @contextlib.contextmanager
-def gateway(binary, auth_enabled=False):
+def gateway(binary, auth_enabled=False, initial_accounts=None):
     with tempfile.TemporaryDirectory(prefix='iogw-compatible-') as directory:
         directory = Path(directory)
+        if initial_accounts:
+            (directory / 'auths').mkdir()
+            for name, account in initial_accounts.items():
+                path = directory / 'auths' / name
+                path.write_text(json.dumps(account))
+                path.chmod(0o600)
         base = f'http://127.0.0.1:{free_port()}'
         config = {'listen': base.removeprefix('http://'), 'tokens': [], 'proxy_api_key': GATEWAY_KEY,
                   'upstream_base': 'http://127.0.0.1:1', 'auth_dir': str(directory / 'auths'),

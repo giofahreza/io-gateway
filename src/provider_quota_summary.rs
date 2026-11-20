@@ -27,7 +27,11 @@ pub fn credit_fields(account: &Value) -> Vec<Field> {
     let balance = if credits["unlimited"] == true {
         "Unlimited".into()
     } else if let Some(value) = amount(&credits["balance"]) {
-        value
+        if credits["estimated"] == true {
+            format!("≈ {value}")
+        } else {
+            value
+        }
     } else if credits["has_credits"] == false {
         "No credits available".into()
     } else if credits["has_credits"] == true {
@@ -36,6 +40,14 @@ pub fn credit_fields(account: &Value) -> Vec<Field> {
         "Not reported".into()
     };
     push(&mut out, "Available credits", balance);
+    for (key, label) in [
+        ("cash_balance", "Cash balance"),
+        ("credit_limit", "Credit limit"),
+    ] {
+        if let Some(value) = amount(&credits[key]) {
+            push(&mut out, label, value);
+        }
+    }
     if let Some(enabled) = credits["enabled"].as_bool() {
         push(
             &mut out,
@@ -85,6 +97,9 @@ fn push(out: &mut Vec<Field>, label: &str, value: String) {
 /// Human-readable fields, not an aggregate across unrelated quota windows.
 pub fn summarize(account: &Value) -> Vec<Field> {
     let mut out = Vec::new();
+    if account.get("credits").is_some() {
+        out.extend(credit_fields(account));
+    }
     for (key, label) in [
         ("plan_type", "Plan"),
         ("tier_name", "Tier"),
@@ -309,6 +324,10 @@ mod tests {
         );
         assert_eq!(fields[0].value, "2.50 USD");
         assert_eq!(fields[1].value, "Disabled");
+        assert_eq!(
+            credit_fields(&json!({"credits":{"balance":36000,"estimated":true}}))[0].value,
+            "≈ 36000"
+        );
         assert!(!serde_json::to_string(&fields)
             .unwrap()
             .contains("never display"));

@@ -116,6 +116,11 @@ pub(super) struct CommandOutcome {
 }
 
 pub(super) enum AccountLoginPrompt {
+    QwenCloud {
+        login_id: String,
+        verification_url: String,
+        interval: u64,
+    },
     Browser {
         provider: String,
         url: String,
@@ -147,6 +152,14 @@ pub(super) enum NetworkEvent {
 }
 
 pub(super) enum TuiCommand {
+    CheckQwenCloudLogin {
+        login_id: String,
+        verification_url: String,
+        interval: u64,
+    },
+    CancelQwenCloudLogin {
+        login_id: String,
+    },
     Login {
         otp: String,
         api_key: Option<String>,
@@ -222,6 +235,45 @@ impl TuiCommand {
         );
         let creates_api_key = matches!(self, Self::CreateApiKey { .. });
         let response = match self {
+            Self::CheckQwenCloudLogin {
+                login_id,
+                verification_url,
+                interval,
+            } => {
+                tokio::time::sleep(Duration::from_secs(interval.clamp(5, 60))).await;
+                let response = client
+                    .post_json(
+                        "/compatible/qwen/status",
+                        Some(json!({"login_id":login_id})),
+                    )
+                    .await?;
+                ensure_success(&response)?;
+                if response.body["status"] == "connected" {
+                    let _ = client.get("/compatible/quota.json").await;
+                    Ok(response)
+                } else {
+                    return Ok(CommandOutcome {
+                        message: "Waiting for Qwen Cloud authorization. Optional to show quota."
+                            .into(),
+                        client: None,
+                        refresh: false,
+                        reveal: None,
+                        account_login: Some(AccountLoginPrompt::QwenCloud {
+                            login_id,
+                            verification_url,
+                            interval: response.body["interval"].as_u64().unwrap_or(5),
+                        }),
+                    });
+                }
+            }
+            Self::CancelQwenCloudLogin { login_id } => {
+                client
+                    .post_json(
+                        "/compatible/qwen/cancel",
+                        Some(json!({"login_id":login_id})),
+                    )
+                    .await
+            }
             Self::Login { otp, api_key } => client.login(&otp, api_key.as_deref()).await,
             Self::StartAccountLogin {
                 provider,
@@ -306,8 +358,58 @@ impl TuiCommand {
                 Ok(response)
             }
             Self::SaveAccountCredentials { provider, body } => {
+                let quota_action = body["quota_action"].as_str().unwrap_or("").to_string();
                 let path = account_credentials_path(&provider)?;
-                Ok(client.post_json(path, Some(body)).await?)
+                let response = client.post_json(path, Some(body)).await?;
+                if provider == "compatible" && response.status.is_success() {
+                    ensure_success(&response)?;
+                    let file_name = response.body["file_name"]
+                        .as_str()
+                        .ok_or_else(|| "No saved account was returned".to_string())?;
+                    if quota_action == "connect" {
+                        let login = client
+                            .post_json(
+                                "/compatible/qwen/connect",
+                                Some(json!({"file_name":file_name})),
+                            )
+                            .await?;
+                        ensure_success(&login)?;
+                        let login_id = login.body["login_id"]
+                            .as_str()
+                            .ok_or_else(|| "No Qwen Cloud sign-in was returned".to_string())?
+                            .to_string();
+                        let verification_url = login.body["verification_url"]
+                            .as_str()
+                            .ok_or_else(|| "No Qwen Cloud sign-in URL was returned".to_string())?
+                            .to_string();
+                        let url = url::Url::parse(&verification_url)
+                            .map_err(|_| "Invalid Qwen Cloud sign-in URL".to_string())?;
+                        if url.scheme() != "https"
+                            || !url.host_str().is_some_and(|host| {
+                                host == "qwencloud.com" || host.ends_with(".qwencloud.com")
+                            })
+                        {
+                            return Err("Invalid Qwen Cloud sign-in URL".to_string().into());
+                        }
+                        return Ok(CommandOutcome { message:"API account saved. Connect Qwen Cloud account — Optional to show quota.".into(),
+                            client:None, refresh:true, reveal:None,
+                            account_login:Some(AccountLoginPrompt::QwenCloud {login_id, verification_url,
+                                interval:login.body["interval"].as_u64().unwrap_or(5)}) });
+                    }
+                    if quota_action == "disconnect" {
+                        let disconnected = client
+                            .post_json(
+                                "/compatible/qwen/disconnect",
+                                Some(json!({"file_name":file_name})),
+                            )
+                            .await?;
+                        ensure_success(&disconnected)?;
+                    }
+                    // Populate the shared snapshot after adding/editing a Qwen
+                    // account so its quota state appears immediately in the TUI.
+                    let _ = client.get("/compatible/quota.json").await;
+                }
+                Ok(response)
             }
             Self::ToggleAccount { file_name, enabled } => {
                 client
@@ -1586,6 +1688,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn qwen_cloud_connect_saves_before_login_and_disconnect_keeps_the_api_account() {
+        let mock = MockGateway::new().await;
+        mock.reply(
+            "/compatible/save",
+            StatusCode::OK,
+            json!({"ok":true,"file_name":"plan.json"}),
+            None,
+        );
+        mock.reply("/compatible/qwen/connect", StatusCode::OK,
+            json!({"ok":true,"login_id":"login-1","verification_url":"https://account.qwencloud.com/device?code=synthetic","interval":5}), None);
+        mock.reply(
+            "/compatible/qwen/disconnect",
+            StatusCode::OK,
+            json!({"ok":true,"message":"Qwen Cloud disconnected. API access is still available."}),
+            None,
+        );
+        mock.reply(
+            "/compatible/quota.json",
+            StatusCode::OK,
+            json!({"accounts":[]}),
+            None,
+        );
+        let mut app = mock.app();
+        drive(&mut app, |app| app.network.has_data(Section::Session)).await;
+        app.start_command(TuiCommand::SaveAccountCredentials { provider:"compatible".into(),
+            body:json!({"service":"qwen_token_plan","api_key":"synthetic-key","quota_action":"connect"}) });
+        drive(&mut app, |app| app.pending_account_login.is_some()).await;
+        match app.pending_account_login.take().unwrap() {
+            AccountLoginPrompt::QwenCloud {
+                login_id,
+                verification_url,
+                interval,
+            } => {
+                assert_eq!(login_id, "login-1");
+                assert!(verification_url.starts_with("https://account.qwencloud.com/"));
+                assert_eq!(interval, 5);
+            }
+            _ => panic!("expected Qwen Cloud sign-in"),
+        }
+        assert_eq!(mock.count("/compatible/save"), 1);
+        app.start_command(TuiCommand::SaveAccountCredentials {
+            provider: "compatible".into(),
+            body: json!({"file_name":"plan.json","quota_action":"disconnect"}),
+        });
+        drive(&mut app, |app| !app.network.command_pending()).await;
+        assert_eq!(mock.count("/compatible/qwen/disconnect"), 1);
+        assert_eq!(mock.count("/credentials/delete"), 0);
+        let requests = mock.state.requests.lock().unwrap();
+        let (_, _, body, _) = requests
+            .iter()
+            .find(|(_, path, _, _)| path == "/compatible/qwen/connect")
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(body).unwrap(),
+            json!({"file_name":"plan.json"})
+        );
+    }
+
+    #[tokio::test]
     async fn browser_account_add_keeps_provider_state_for_callback_submission() {
         let mock = MockGateway::new().await;
         mock.reply(
@@ -1621,7 +1782,9 @@ mod tests {
                 assert_eq!(organization_uuid.as_deref(), Some("org-1"));
                 assert_eq!(base_url.as_deref(), Some("https://api.anthropic.com"));
             }
-            AccountLoginPrompt::CopilotDevice { .. } => panic!("expected browser login"),
+            AccountLoginPrompt::CopilotDevice { .. } | AccountLoginPrompt::QwenCloud { .. } => {
+                panic!("expected browser login")
+            }
         }
     }
 

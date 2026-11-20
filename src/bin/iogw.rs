@@ -354,6 +354,7 @@ struct ProviderSpec {
 #[derive(Clone, Default)]
 struct AccountRow {
     provider: String,
+    display_provider: String,
     provider_label: String,
     key: String,
     label: String,
@@ -1829,26 +1830,66 @@ impl TuiApp {
         let existing = snapshot_account_for_account(&self.data.snapshot, &account)
             .cloned()
             .ok_or("Refresh account details before editing")?;
-        self.edit_compatible_account(terminal, Some(existing))
+        self.edit_compatible_account(terminal, Some(existing), None)
     }
 
     fn edit_compatible_account(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
         existing: Option<Value>,
+        preset: Option<&str>,
     ) -> Result<(), String> {
         let old = existing.as_ref().unwrap_or(&Value::Null);
-        let label = prompt_compatible_field(terminal, "Name", &string_at(old, &["label"]), false)?;
+        let service_default = preset.unwrap_or_else(|| old["service"].as_str().unwrap_or("custom"));
+        let service_input = prompt_compatible_field(
+            terminal,
+            "Provider: 1=Custom, 2=Qwen Cloud Token Plan, 3=Qwen Cloud Pay-as-you-go",
+            service_default,
+            false,
+        )?;
+        let (service, service_label, host) = match service_input.as_str() {
+            "1" | "custom" => ("custom", "", ""),
+            "2" | "qwen_token_plan" => ("qwen_token_plan", "Qwen Cloud Token Plan", "token-plan"),
+            "3" | "qwen_payg" => ("qwen_payg", "Qwen Cloud Pay-as-you-go", "ap-southeast-1"),
+            _ => return Err("Choose a listed provider".into()),
+        };
+        let label_default = string_at(old, &["label"]);
+        let label = prompt_compatible_field(
+            terminal,
+            "Name",
+            if label_default.is_empty() {
+                service_label
+            } else {
+                &label_default
+            },
+            false,
+        )?;
+        let url_default = |field: &str, suffix: &str| {
+            old[field]
+                .as_str()
+                .filter(|value| {
+                    !value.trim().is_empty()
+                        && (service == "custom" || old["service"].as_str() == Some(service))
+                })
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    if host.is_empty() {
+                        String::new()
+                    } else {
+                        format!("https://{host}.maas.qwencloudapi.com/{suffix}")
+                    }
+                })
+        };
         let base_url = prompt_compatible_field(
             terminal,
             "OpenAI base URL (include /v1 if required)",
-            &string_at(old, &["base_url"]),
+            &url_default("base_url", "compatible-mode/v1"),
             true,
         )?;
         let anthropic_base_url = prompt_compatible_field(
             terminal,
             "Anthropic base URL",
-            &string_at(old, &["anthropic_base_url"]),
+            &url_default("anthropic_base_url", "apps/anthropic"),
             true,
         )?;
         if base_url.is_empty() && anthropic_base_url.is_empty() {
@@ -1870,7 +1911,13 @@ impl TuiApp {
                     .collect::<Vec<_>>()
                     .join(", ")
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                if service == "qwen_token_plan" {
+                    "auto".into()
+                } else {
+                    String::new()
+                }
+            });
         let model_input = prompt_compatible_field(
             terminal,
             "Upstream model IDs (comma separated, no cmp: prefix)",
@@ -1885,9 +1932,28 @@ impl TuiApp {
         if label.is_empty() || models.is_empty() || existing.is_none() && api_key.is_empty() {
             return Err("Name, key, and at least one model are required".into());
         }
+        let quota_action = if service != "custom" {
+            let connection = &old["quota_connection"];
+            let connected = connection["status"].as_str().unwrap_or("disconnected");
+            let email = connection["email"].as_str().unwrap_or("");
+            let choice = prompt_in_terminal_with_notice(terminal,
+                &format!("Qwen Cloud account: {connected} {email}\nOptional to show quota. Your API key works without connecting.\nSign in to the account that owns this API key."),
+                "Connect Qwen Cloud account? [c=connect/reconnect, d=disconnect, Enter=keep]: ")?;
+            match choice.trim() {
+                "c" | "connect" => "connect",
+                "d" | "disconnect" => "disconnect",
+                "" => "",
+                _ => return Err(
+                    "Choose c to connect, d to disconnect, or Enter to keep the current connection"
+                        .into(),
+                ),
+            }
+        } else {
+            ""
+        };
         self.start_command(TuiCommand::SaveAccountCredentials {provider:"compatible".into(),body:json!({
             "file_name":old["file_name"],"label":label,"base_url":base_url,"anthropic_base_url":anthropic_base_url,
-            "api_key":api_key,"models":models
+            "api_key":api_key,"models":models,"service":service,"quota_action":quota_action
         })});
         Ok(())
     }
@@ -1914,7 +1980,10 @@ impl TuiApp {
                     account_type: None,
                 });
             }
-            "compatible" => self.edit_compatible_account(terminal, None)?,
+            "compatible" => self.edit_compatible_account(terminal, None, None)?,
+            "qwen_token_plan" | "qwen_payg" => {
+                self.edit_compatible_account(terminal, None, Some(&provider))?
+            }
             "claude" => self.begin_claude_account(terminal)?,
             "copilot" => self.begin_copilot_account(terminal)?,
             "qwen" => {
@@ -2076,6 +2145,25 @@ impl TuiApp {
             return Ok(());
         };
         match pending {
+            AccountLoginPrompt::QwenCloud {
+                login_id,
+                verification_url,
+                interval,
+            } => {
+                open_account_login_url(&verification_url);
+                let input = prompt_in_terminal_with_notice(terminal,
+                    &format!("Connect Qwen Cloud account — Optional to show quota\nOpen this URL and approve access for the account that owns your API key:\n{verification_url}"),
+                    "Press Enter after approval to check (q = cancel): ")?;
+                if input.trim().eq_ignore_ascii_case("q") {
+                    self.start_command(TuiCommand::CancelQwenCloudLogin { login_id });
+                } else {
+                    self.start_command(TuiCommand::CheckQwenCloudLogin {
+                        login_id,
+                        verification_url,
+                        interval,
+                    });
+                }
+            }
             AccountLoginPrompt::Browser {
                 provider,
                 url,
@@ -3424,7 +3512,9 @@ fn focused_account_footer(app: &TuiApp, width: u16) -> Vec<String> {
         }
         fields.extend(app.animation.focused_limits(width));
         let values = account_snapshot_values(&app.data.snapshot, &account);
-        if ["codex", "claude"].contains(&account.provider.as_str()) {
+        if ["codex", "claude"].contains(&account.provider.as_str())
+            || values.iter().any(|v| v.get("credits").is_some())
+        {
             if let Some(value) = values.iter().find(|v| v.get("credits").is_some()) {
                 fields.extend(
                     provider_quota_summary::credit_fields(value)
@@ -5249,7 +5339,9 @@ fn draw_account_details_modal(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             }
         }
     }
-    if ["codex", "claude"].contains(&account.provider.as_str()) {
+    if ["codex", "claude"].contains(&account.provider.as_str())
+        || snapshot_values.iter().any(|v| v.get("credits").is_some())
+    {
         lines.push(detail_section("Credits"));
         let empty = json!({});
         for field in provider_quota_summary::credit_fields(
@@ -5558,7 +5650,7 @@ fn prompt_account_provider(
 ) -> Result<String, String> {
     let value = prompt_in_terminal(
         terminal,
-        "Provider [1=Codex, 2=Antigravity, 3=Gemini, 4=Qwen, 5=DeepSeek, 6=MiniMax, 7=Grok, 8=Copilot, 9=Claude, 10=GLM, 11=Compatible API]: ",
+        "Provider [1=Codex, 2=Antigravity, 3=Gemini, 4=Qwen Chat, 5=DeepSeek, 6=MiniMax, 7=Grok, 8=Copilot, 9=Claude, 10=GLM, 11=Compatible API, 12=Qwen Token Plan, 13=Qwen Pay-as-you-go]: ",
     )?;
     let normalized = value.trim().to_ascii_lowercase();
     let provider = match normalized.as_str() {
@@ -5573,6 +5665,8 @@ fn prompt_account_provider(
         "9" | "claude" | "anthropic" => "claude",
         "10" | "glm" | "zai" | "z.ai" => "glm",
         "11" | "compatible" | "cmp" | "openai" | "anthropic-compatible" => "compatible",
+        "12" | "qwen_token_plan" | "qwen-token-plan" => "qwen_token_plan",
+        "13" | "qwen_payg" | "qwen-payg" => "qwen_payg",
         _ => return Err("unknown provider; choose a listed number or provider name".to_string()),
     };
     Ok(provider.to_string())
@@ -5755,6 +5849,7 @@ fn account_rows(summary: &Value, routing: &Value) -> Vec<AccountRow> {
             let provider_priority = priority.get(&provider).cloned().unwrap_or_default();
             rows.push(AccountRow {
                 provider: provider.clone(),
+                display_provider: String::new(),
                 provider_label: string_at(account, &["provider_label"])
                     .if_empty(provider_label(&provider).to_string()),
                 key: key.clone(),
@@ -5810,8 +5905,26 @@ fn account_rows(summary: &Value, routing: &Value) -> Vec<AccountRow> {
 
 fn apply_account_runtime_status(accounts: &mut [AccountRow], snapshot: &Value) {
     for account in accounts {
-        let runtime =
-            snapshot_account_for_account(snapshot, account).and_then(|value| value.get("runtime"));
+        let source = snapshot_account_for_account(snapshot, account);
+        account.display_provider = source
+            .and_then(|value| value.get("display_provider").and_then(Value::as_str))
+            .unwrap_or_else(|| {
+                if source.is_some_and(|value| {
+                    matches!(
+                        value["service"].as_str(),
+                        Some("qwen_token_plan" | "qwen_payg")
+                    )
+                }) {
+                    "qwen"
+                } else {
+                    &account.provider
+                }
+            })
+            .to_string();
+        if let Some(label) = source.and_then(|value| value["service_label"].as_str()) {
+            account.provider_label = label.to_string();
+        }
+        let runtime = source.and_then(|value| value.get("runtime"));
         account.cooldown = runtime
             .and_then(|value| value.get("status"))
             .and_then(Value::as_str)
@@ -7181,6 +7294,14 @@ fn usage_account_filter_key(account: &AccountRow) -> String {
         .unwrap_or_else(|| account_display(account))
 }
 
+fn account_display_provider(account: &AccountRow) -> &str {
+    if account.display_provider.is_empty() {
+        &account.provider
+    } else {
+        &account.display_provider
+    }
+}
+
 struct AccountQuotaUsageGroup {
     provider: String,
     accounts: Vec<AccountQuotaUsageRow>,
@@ -7243,9 +7364,9 @@ fn overview_account_usage_account_groups(app: &TuiApp) -> Vec<OverviewAccountUsa
     let mut groups = Vec::new();
     let mut group_indexes = HashMap::<String, usize>::new();
     for (account_index, account) in app.data.accounts.iter().enumerate() {
-        let provider = account.provider.clone();
+        let provider = account_display_provider(account).to_string();
         let quota_rows = quota_by_provider
-            .get(&provider)
+            .get(&account.provider)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         let group_index = *group_indexes.entry(provider.clone()).or_insert_with(|| {
@@ -7342,7 +7463,7 @@ fn provider_order_for_app(app: &TuiApp) -> Vec<String> {
         .data
         .accounts
         .iter()
-        .map(|account| account.provider.clone())
+        .map(|account| account_display_provider(account).to_string())
         .collect::<Vec<_>>();
     let known_keys = known.iter().cloned().collect::<HashSet<_>>();
     let mut seen = HashSet::new();
@@ -7363,7 +7484,7 @@ fn account_order_for_provider(app: &TuiApp, provider: &str) -> Vec<String> {
         .data
         .accounts
         .iter()
-        .filter(|account| account.provider == provider)
+        .filter(|account| account_display_provider(account) == provider)
         .map(usage_account_filter_key)
         .collect::<Vec<_>>();
     let known_keys = known.iter().cloned().collect::<HashSet<_>>();
@@ -7420,7 +7541,7 @@ fn overview_account_usage_limit_groups(app: &TuiApp) -> Vec<OverviewAccountUsage
     let mut group_indexes = HashMap::<String, usize>::new();
 
     for (account_index, account) in app.data.accounts.iter().enumerate() {
-        let provider = account.provider.clone();
+        let provider = account_display_provider(account).to_string();
         let group_index = *group_indexes.entry(provider.clone()).or_insert_with(|| {
             let index = groups.len();
             groups.push(OverviewAccountUsageGroup {
@@ -7436,7 +7557,7 @@ fn overview_account_usage_limit_groups(app: &TuiApp) -> Vec<OverviewAccountUsage
             .iter()
             .filter(|quota| {
                 quota.overview
-                    && quota.provider == provider
+                    && quota.provider == account.provider
                     && quota_matches_account(quota, account)
             })
             .peekable();
@@ -9001,6 +9122,81 @@ impl EmptyStringExt for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qwen_cloud_groups_with_qwen_and_keeps_compatible_quota_and_action_identity() {
+        let mut app =
+            TuiApp::new(GatewayClient::new("http://127.0.0.1:1".into()).unwrap()).unwrap();
+        app.hidden_usage_accounts.clear();
+        app.hidden_usage_providers.clear();
+        app.data.accounts = vec![
+            AccountRow {
+                provider: "compatible".into(),
+                key: "plan.json".into(),
+                file_name: "plan.json".into(),
+                label: "Plan".into(),
+                ..Default::default()
+            },
+            AccountRow {
+                provider: "qwen".into(),
+                key: "chat.json".into(),
+                file_name: "chat.json".into(),
+                label: "Chat".into(),
+                ..Default::default()
+            },
+            AccountRow {
+                provider: "compatible".into(),
+                key: "custom.json".into(),
+                file_name: "custom.json".into(),
+                label: "Custom".into(),
+                ..Default::default()
+            },
+        ];
+        app.data.snapshot = json!({"providers":{"compatible":{"accounts":[
+            {"file_name":"plan.json","service":"qwen_token_plan","display_provider":"qwen","service_label":"Qwen Cloud Token Plan"},
+            {"file_name":"custom.json","service":"custom","display_provider":"compatible"}
+        ]}},"quotas":{"compatible":{"accounts":[{"file_name":"plan.json","limits":[{"label":"Monthly","used_percent":25}]}]}}});
+        apply_account_runtime_status(&mut app.data.accounts, &app.data.snapshot);
+        app.data.quotas = vec![QuotaRow {
+            provider: "compatible".into(),
+            account_key: "plan.json".into(),
+            limit_label: "Monthly".into(),
+            used_percent_value: Some(25.0),
+            overview: true,
+            ..Default::default()
+        }];
+        assert_eq!(app.data.accounts[0].provider, "compatible");
+        assert_eq!(app.data.accounts[0].provider_label, "Qwen Cloud Token Plan");
+        for mode in [
+            LimitDisplayMode::OnePerAccount,
+            LimitDisplayMode::AllPerAccount,
+        ] {
+            app.limit_display_mode = mode;
+            let groups = overview_account_usage_groups(&app);
+            let qwen = groups.iter().find(|g| g.provider == "qwen").unwrap();
+            assert_eq!(qwen.accounts.len(), 2);
+            assert_eq!(
+                qwen.accounts
+                    .iter()
+                    .find(|a| a.account_label == "Plan")
+                    .unwrap()
+                    .percent,
+                Some(25.0)
+            );
+            assert_eq!(
+                groups
+                    .iter()
+                    .find(|g| g.provider == "compatible")
+                    .unwrap()
+                    .accounts
+                    .len(),
+                1
+            );
+        }
+        assert_eq!(account_order_for_provider(&app, "qwen").len(), 2);
+        app.hidden_usage_providers.insert("qwen".into());
+        assert_eq!(overview_account_usage_groups(&app).len(), 1);
+    }
 
     #[test]
     fn account_runtime_snapshot_marks_cooldown_without_overriding_disabled() {

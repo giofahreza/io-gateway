@@ -40,7 +40,7 @@ Actual TUI captures with demo accounts. Click an image for full size. The normal
 | Anthropic Claude | `cld:` |
 | Google Gemini | `gem:` |
 | Antigravity | `agw:` |
-| Qwen | `qwn:` |
+| Qwen Chat | `qwn:` |
 | DeepSeek | `dsk:` |
 | MiniMax | `min:` |
 | Grok | `grk:` |
@@ -51,12 +51,15 @@ Connect additional services with the **Compatible API** account type:
 
 | Service or API | Connection |
 | --- | --- |
-| Qwen Coding Plan (tested) | OpenAI-compatible and Anthropic-compatible APIs |
+| Qwen Cloud Token Plan (tested) | OpenAI-compatible and Anthropic-compatible APIs; console credits and quota windows |
+| Qwen Cloud Pay-as-you-go | OpenAI-compatible and Anthropic-compatible APIs; console account balance and credit limit |
 | NVIDIA (tested) | OpenAI-compatible API |
 | Custom OpenAI-Compatible API | Your base URL, API key, and Chat Completions model IDs |
 | Custom Anthropic-Compatible API | Your base URL, API key, and Messages model IDs |
 
 Compatible accounts use `cmp:<upstream-model-id>`, for example `cmp:qwen3.7-plus`. Configure either format or both in one account. Fetch models when the service supports discovery, or enter model IDs manually. Use `ctm:` aliases to route across providers and compatible accounts.
+
+Select **Qwen Cloud Token Plan** or **Qwen Cloud Pay-as-you-go** in the web account menu, or options **12/13** in the TUI account picker. The editor fills the matching endpoints. In the web UI, choose **Connect Qwen Cloud account** in the Token Plan or Pay-as-you-go add/edit window. In the TUI, choose **c** when editing a Qwen account. **Optional to show quota**: the API key works without connecting. Sign in to the account that owns the key; reconnect when the management login expires. A console Cookie remains available as an advanced alternative. Existing Qwen Cloud compatible accounts retain their IDs and `cmp:` routing. See [Qwen Cloud setup](docs/compatible-apis.md#qwen-cloud-token-plan-and-pay-as-you-go).
 
 [Compatible API setup for the web UI and TUI →](docs/compatible-apis.md)
 

@@ -311,6 +311,7 @@ mod tests {
                 claude_accounts: Arc::new(Mutex::new(Vec::new())),
                 glm_accounts: Arc::new(Mutex::new(Vec::new())),
                 compatible_accounts: Arc::new(Mutex::new(Vec::new())),
+                qwen_cloud_pending: Arc::new(Mutex::new(HashMap::new())),
                 custom_models: Arc::new(Mutex::new(Vec::new())),
                 stats: Arc::new(Mutex::new(crate::UsageStats::default())),
                 persisted_stats: Arc::new(Mutex::new(crate::stats_store::StatsStore::default())),

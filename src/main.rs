@@ -191,6 +191,7 @@ struct AppState {
     claude_accounts: Arc<Mutex<Vec<target::claude::accounts::ClaudeAccount>>>,
     glm_accounts: Arc<Mutex<Vec<target::glm::accounts::GlmAccount>>>,
     compatible_accounts: Arc<Mutex<Vec<target::compatible::accounts::CompatibleAccount>>>,
+    qwen_cloud_pending: Arc<Mutex<HashMap<String, target::compatible::cloud_auth::PendingLogin>>>,
     custom_models: Arc<Mutex<Vec<custom_models::CustomModel>>>,
     stats: Arc<Mutex<UsageStats>>,
     persisted_stats: Arc<Mutex<StatsStore>>,
@@ -2187,6 +2188,7 @@ async fn main() {
         claude_accounts: Arc::new(Mutex::new(claude_accounts)),
         glm_accounts: Arc::new(Mutex::new(glm_accounts)),
         compatible_accounts: Arc::new(Mutex::new(compatible_accounts)),
+        qwen_cloud_pending: Arc::new(Mutex::new(HashMap::new())),
         custom_models: Arc::new(Mutex::new(custom_models)),
         stats: Arc::new(Mutex::new(stats)),
         persisted_stats,
@@ -2236,7 +2238,10 @@ async fn main() {
             "/assets/compatible.js",
             axum::routing::get(|| async {
                 (
-                    [("content-type", "text/javascript; charset=utf-8")],
+                    [
+                        ("content-type", "text/javascript; charset=utf-8"),
+                        ("cache-control", "no-store"),
+                    ],
                     include_str!("target/compatible/dashboard.js"),
                 )
             }),
@@ -2335,7 +2340,23 @@ async fn main() {
         )
         .route(
             "/compatible/quota.json",
-            any(target::compatible::admin::accounts),
+            any(target::compatible::quota::route),
+        )
+        .route(
+            "/compatible/qwen/connect",
+            axum::routing::post(target::compatible::cloud_auth::start),
+        )
+        .route(
+            "/compatible/qwen/status",
+            axum::routing::post(target::compatible::cloud_auth::status),
+        )
+        .route(
+            "/compatible/qwen/disconnect",
+            axum::routing::post(target::compatible::cloud_auth::disconnect),
+        )
+        .route(
+            "/compatible/qwen/cancel",
+            axum::routing::post(target::compatible::cloud_auth::cancel),
         )
         .route("/glm/quota.json", any(glm_quota_json_route))
         .route("/login/glm/start", any(glm_login_start_route))
@@ -2511,7 +2532,7 @@ async fn background_quota_refresh(state: AppState) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
     loop {
         interval.tick().await;
-        let (codex, antigravity, gemini, qwen, deepseek, minimax, copilot, claude, glm) = tokio::join!(
+        let (codex, antigravity, gemini, qwen, deepseek, minimax, copilot, claude, glm, compatible) = tokio::join!(
             target::codex::quota::get_quota_summaries(&state),
             target::antigravity::quota::get_quota_summaries(&state),
             target::gemini::quota::get_quota_summaries(&state),
@@ -2521,6 +2542,7 @@ async fn background_quota_refresh(state: AppState) {
             target::copilot::admin::quota_accounts(&state),
             target::claude::quota::get_quota_summaries(&state),
             target::glm::quota::get_quota_summaries(&state),
+            target::compatible::quota::get_quota_summaries(&state),
         );
         {
             let mut snapshots = state.quota_snapshots.lock().unwrap();
@@ -2533,6 +2555,7 @@ async fn background_quota_refresh(state: AppState) {
             snapshots.insert("copilot".to_string(), copilot.clone());
             snapshots.insert("claude".to_string(), claude.clone());
             snapshots.insert("glm".to_string(), glm.clone());
+            snapshots.insert("compatible".to_string(), compatible.clone());
         }
         let now = now_rfc3339();
         let options = notification_account_options(&state);
@@ -2546,6 +2569,7 @@ async fn background_quota_refresh(state: AppState) {
             ("copilot", "GitHub Copilot", copilot),
             ("claude", "Claude", claude),
             ("glm", "GLM", glm),
+            ("compatible", "Compatible API", compatible),
         ] {
             notifications::notify_model_quota_transitions(
                 &state,
@@ -2712,6 +2736,12 @@ async fn refresh_quota_snapshot_for_provider(
             label: "GLM",
             accounts: target::glm::quota::get_quota_summaries(state).await,
         },
+        "cmp" => QuotaRefreshOutcome {
+            snapshot_key: "compatible",
+            notify_provider: "compatible",
+            label: "Compatible API",
+            accounts: target::compatible::quota::get_quota_summaries(state).await,
+        },
         // Grok quota is populated from real request headers. Do not issue
         // paid probes from manual or background dashboard refresh.
         "grk" => return None,
@@ -2730,6 +2760,9 @@ fn invalidate_quota_cache_for_provider(
         .unwrap_or_else(|| MODEL_PROVIDER_PREFIXES.to_vec());
     for provider in providers {
         match provider {
+            "cmp" => {
+                state.quota_snapshots.lock().unwrap().remove("compatible");
+            }
             "cod" => {
                 let mut cache = state.quota_cache.lock().unwrap();
                 if let Some(file_name) = file_name {
@@ -2774,6 +2807,11 @@ async fn background_maintenance(state: AppState) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
     loop {
         interval.tick().await;
+        state
+            .qwen_cloud_pending
+            .lock()
+            .unwrap()
+            .retain(|_, pending| pending.expires_at > std::time::Instant::now());
         state
             .oauth_pending
             .lock()
@@ -5002,6 +5040,286 @@ async fn dashboard() -> impl IntoResponse {
           bottom: 12px;
         }
       }
+      /* Visual refresh: tokens and component skins only; layout is unchanged. */
+      :root {
+        --bg: #070c18;
+        --surface: #0d1526;
+        --surface-alt: #141e33;
+        --surface-raised: #0a1120;
+        --border: #1a212e;
+        --text: #e8eefc;
+        --muted: #8795b1;
+        --button-bg: #2f7bf6;
+        --button-hover: #4b8ef8;
+        --secondary-bg: #101a2e;
+        --secondary-hover: #18243d;
+        --accent-cyan: #38bdf8;
+        --accent-violet: #8b5cf6;
+        --accent-green: #22c55e;
+        --accent-amber: #f59e0b;
+        --radius: 14px;
+        --shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset, 0 12px 32px rgba(2, 6, 18, 0.45);
+      }
+      :root[data-theme="light"] {
+        --bg: #f2f5fb;
+        --surface: #ffffff;
+        --surface-alt: #eef2f9;
+        --surface-raised: #f7f9fd;
+        --border: #e3e8f0;
+        --muted: #5f6b82;
+        --button-bg: #2563eb;
+        --button-hover: #1d4ed8;
+        --shadow: 0 1px 2px rgba(15, 23, 42, 0.05), 0 8px 24px rgba(15, 23, 42, 0.07);
+      }
+      body {
+        background:
+          radial-gradient(900px 420px at 18% -8%, rgba(56, 189, 248, 0.09), transparent 70%),
+          radial-gradient(900px 420px at 88% -12%, rgba(139, 92, 246, 0.08), transparent 70%),
+          var(--bg);
+        background-attachment: fixed;
+        -webkit-font-smoothing: antialiased;
+      }
+      :root[data-theme="light"] body { background: var(--bg); }
+      .page-shell { --shell-pad: 24px; }
+      button { border-radius: 10px; font-weight: 600; transition: background 0.15s, border-color 0.15s, box-shadow 0.15s; }
+      input, textarea, select { border-radius: 10px; background: var(--surface-raised); }
+      input:focus-visible, textarea:focus-visible, select:focus-visible {
+        outline: none;
+        border-color: color-mix(in srgb, var(--accent-cyan) 50%, var(--border));
+        box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.1);
+      }
+      .secondary-button, .mini-btn { font-weight: 600; }
+      .secondary-button:hover, .mini-btn:hover { border-color: rgba(135, 149, 177, 0.28); }
+
+      /* Header bar */
+      .page-header {
+        align-items: center;
+        margin: calc(var(--shell-pad) * -1) calc(var(--shell-pad) * -1) 20px;
+        padding: 14px var(--shell-pad);
+        border-bottom: 1px solid var(--border);
+        background: color-mix(in srgb, var(--surface-raised) 82%, transparent);
+        backdrop-filter: blur(10px);
+        /* backdrop-filter makes a stacking context; lift it so the Add account menu overlays the cards below. */
+        position: relative;
+        z-index: 60;
+      }
+      .page-header h1 {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        font-size: 20px;
+        font-weight: 700;
+      }
+      .page-header h1::before {
+        content: "";
+        width: 22px;
+        height: 22px;
+        flex: none;
+        border-radius: 6px;
+        transform: rotate(45deg) scale(0.82);
+        border: 2px solid color-mix(in srgb, var(--accent-cyan) 60%, transparent);
+        background: linear-gradient(135deg, rgba(56, 189, 248, 0.25), rgba(139, 92, 246, 0.25));
+        box-shadow: 0 0 10px rgba(56, 189, 248, 0.18);
+      }
+      .page-subtitle { margin-top: 2px; margin-left: 38px; font-size: 12px; }
+      /* Dropdown menus */
+      @keyframes menu-in {
+        from { opacity: 0; transform: translateY(-4px) scale(0.98); }
+        to { opacity: 1; transform: none; }
+      }
+      .provider-menu,
+      .account-action-menu {
+        padding: 6px;
+        border-radius: 14px;
+        background: var(--surface);
+        box-shadow: 0 18px 44px rgba(2, 6, 18, 0.5);
+        transform-origin: top right;
+        animation: menu-in 0.14s ease-out;
+      }
+      :root[data-theme="light"] .provider-menu,
+      :root[data-theme="light"] .account-action-menu { box-shadow: 0 14px 36px rgba(15, 23, 42, 0.14); }
+      .provider-menu {
+        top: calc(100% + 8px);
+        min-width: 340px;
+        max-height: min(calc(100vh - 110px), 640px);
+        overflow-y: auto;
+        overscroll-behavior: contain;
+      }
+      .provider-menu-title {
+        display: block;
+        padding: 8px 10px 6px;
+        border-bottom: 0;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+      }
+      .provider-menu-item {
+        --dot: var(--muted);
+        position: relative;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        min-height: 36px;
+        padding: 7px 10px;
+        border: 0;
+        border-radius: 9px;
+        font-size: 13.5px;
+        font-weight: 500;
+      }
+      .provider-menu-item::before {
+        content: "";
+        flex: none;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--dot);
+        box-shadow: 0 0 0 3px color-mix(in srgb, var(--dot) 14%, transparent);
+      }
+      .provider-menu-item:hover,
+      .provider-menu-item:focus-visible {
+        outline: none;
+        background: color-mix(in srgb, var(--text) 7%, transparent);
+      }
+      .provider-menu-item[data-provider="codex"] { --dot: #10a37f; }
+      .provider-menu-item[data-provider="antigravity"] { --dot: #4285f4; }
+      .provider-menu-item[data-provider="gemini"] { --dot: #7b9cff; }
+      .provider-menu-item[data-provider^="qwen"] { --dot: #8b6cff; }
+      .provider-menu-item[data-provider="deepseek"] { --dot: #4d6bfe; }
+      .provider-menu-item[data-provider="minimax"] { --dot: #f0567a; }
+      .provider-menu-item[data-provider="grok"] { --dot: #c5cad6; }
+      .provider-menu-item[data-provider="copilot"] { --dot: #a371f7; }
+      .provider-menu-item[data-provider="claude"] { --dot: #d97757; }
+      .provider-menu-item[data-provider="glm"] { --dot: #2f6bff; }
+      .provider-menu-item[data-provider="custom-model"] { --dot: var(--accent-amber); margin-top: 9px; }
+      .provider-menu-item[data-provider="custom-model"]::after {
+        content: "";
+        position: absolute;
+        top: -5px;
+        left: 6px;
+        right: 6px;
+        height: 1px;
+        background: var(--border);
+      }
+      .account-action-menu { top: calc(100% + 8px); min-width: 190px; }
+      .account-action-menu .mini-btn {
+        min-height: 36px;
+        padding: 8px 10px;
+        border: 0;
+        border-radius: 9px;
+        font-size: 13px;
+        font-weight: 500;
+      }
+      .account-action-menu .mini-btn:hover,
+      .account-action-menu .mini-btn:focus-visible {
+        outline: none;
+        background: color-mix(in srgb, var(--text) 7%, transparent);
+      }
+      .account-action-menu .mini-btn.danger:hover,
+      .account-action-menu .mini-btn.danger:focus-visible {
+        background: rgba(239, 68, 68, 0.14);
+        color: #f87171;
+      }
+
+      /* Overview cards */
+      .overview-grid { gap: 16px; margin: 20px 0; }
+      .overview-card {
+        --accent: var(--accent-cyan);
+        position: relative;
+        overflow: hidden;
+        padding: 20px 22px;
+        border-radius: var(--radius);
+        background:
+          linear-gradient(180deg, transparent 50%, color-mix(in srgb, var(--accent) 6%, transparent)),
+          var(--surface);
+      }
+      .overview-card:nth-child(2) { --accent: var(--accent-green); }
+      .overview-card:nth-child(3) { --accent: var(--accent-violet); }
+      .overview-card:nth-child(4) { --accent: var(--accent-amber); }
+      .overview-card::after {
+        position: absolute;
+        top: 16px;
+        right: 18px;
+        display: grid;
+        place-items: center;
+        width: 32px;
+        height: 32px;
+        border-radius: 9px;
+        border: 1px solid color-mix(in srgb, var(--accent) 16%, transparent);
+        background: color-mix(in srgb, var(--accent) 12%, transparent);
+        color: var(--accent);
+        font-size: 15px;
+        font-weight: 700;
+        content: "\21C5";
+      }
+      .overview-card:nth-child(2)::after { content: "!"; }
+      .overview-card:nth-child(3)::after { content: "\25CE"; }
+      .overview-card:nth-child(4)::after { content: "\25B3"; }
+      .overview-label { font-size: 13px; }
+      .overview-value {
+        margin-top: 14px;
+        font-size: 34px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        font-variant-numeric: tabular-nums;
+      }
+      .overview-note { margin-top: 10px; }
+
+      /* Chart panel */
+      .chart-section {
+        margin: 20px 0;
+        padding: 20px 22px;
+        border-radius: var(--radius);
+      }
+      .chart-title-row h2 { font-size: 17px; font-weight: 600; }
+      .chart-section[open] .chart-header { margin-bottom: 14px; }
+      .chart-field select, .chart-field input { min-height: 34px; padding: 6px 10px; }
+      .chart-legend { gap: 14px; }
+      .chart-legend-dot { width: 8px; height: 8px; border-radius: 50%; }
+      .chart-wrap { height: 300px; }
+
+      /* Custom models + provider panels */
+      .custom-model-section { margin: 20px 0; }
+      .custom-model-header h2 { font-size: 17px; font-weight: 600; }
+      .providers-grid { gap: 20px; }
+      .provider-badge {
+        padding: 12px 16px;
+        border-radius: var(--radius);
+        background: var(--surface);
+        box-shadow: var(--shadow);
+        font-weight: 600;
+      }
+      .provider-badge-count {
+        padding: 3px 10px;
+        border: 1px solid var(--border);
+        font-weight: 500;
+      }
+
+      /* Account cards */
+      .card {
+        padding: 16px 18px;
+        border-radius: var(--radius);
+        transition: border-color 0.2s, box-shadow 0.2s;
+      }
+      .card:hover { border-color: color-mix(in srgb, var(--muted) 30%, var(--border)); }
+      .account-state { font-weight: 600; padding: 3px 10px; }
+      .account-state.enabled { background: rgba(34, 197, 94, 0.1); border-color: rgba(34, 197, 94, 0.2); }
+      .account-state.cooldown { background: rgba(245, 158, 11, 0.1); border-color: rgba(245, 158, 11, 0.24); }
+      .account-state.disabled { background: rgba(239, 68, 68, 0.1); border-color: rgba(239, 68, 68, 0.22); }
+      .quota-bar { height: 24px; border-radius: 999px; background: var(--surface-raised); }
+      .quota-bar-fill { border-radius: 999px; }
+      .model-chip { border-radius: 8px; }
+
+      /* Dialogs and toast */
+      .modal { backdrop-filter: blur(4px); }
+      .modal-card { padding: 22px; border-radius: 16px; }
+      .toast { border-radius: 12px; padding: 12px 16px; }
+      @media (max-width: 768px) {
+        .page-shell { --shell-pad: 12px; }
+        .page-header h1 { font-size: 18px; }
+        .overview-card { padding: 16px; }
+        .overview-value { font-size: 28px; }
+        .chart-wrap { height: 240px; }
+      }
     </style>
     <script>
       (() => {
@@ -5053,7 +5371,9 @@ async fn dashboard() -> impl IntoResponse {
               <button type="button" class="provider-menu-item" role="menuitem" data-provider="codex">Codex (ChatGPT)</button>
               <button type="button" class="provider-menu-item" role="menuitem" data-provider="antigravity">Antigravity (Google)</button>
               <button type="button" class="provider-menu-item" role="menuitem" data-provider="gemini">Gemini (Google)</button>
-              <button type="button" class="provider-menu-item" role="menuitem" data-provider="qwen">Qwen</button>
+              <button type="button" class="provider-menu-item" role="menuitem" data-provider="qwen">Qwen Chat</button>
+              <button type="button" class="provider-menu-item" role="menuitem" data-provider="qwen_token_plan">Qwen Cloud Token Plan</button>
+              <button type="button" class="provider-menu-item" role="menuitem" data-provider="qwen_payg">Qwen Cloud Pay-as-you-go</button>
               <button type="button" class="provider-menu-item" role="menuitem" data-provider="deepseek">DeepSeek</button>
               <button type="button" class="provider-menu-item" role="menuitem" data-provider="minimax">MiniMax</button>
               <button type="button" class="provider-menu-item" role="menuitem" data-provider="grok">Grok (xAI)</button>
@@ -5177,7 +5497,7 @@ async fn dashboard() -> impl IntoResponse {
             <span id="qwenProviderTitle">Qwen</span>
             <span class="provider-badge-count" id="qwenBadgeCount">0 accounts</span>
           </span>
-          <button type="button" class="mini-btn provider-refresh-button" title="Refresh Qwen models and quota" aria-label="Refresh Qwen models and quota" onclick="refreshModelCatalog('qwen')">&#8635;</button>
+          <button type="button" class="mini-btn provider-refresh-button" title="Refresh Qwen models and quota" aria-label="Refresh Qwen models and quota" onclick="refreshQwenGroup()">&#8635;</button>
         </div>
         <div id="qwenCards" class="provider-cards"></div>
       </section>
@@ -5258,7 +5578,7 @@ async fn dashboard() -> impl IntoResponse {
         </div>
       </div>
     </div>
-    <script src="/assets/compatible.js"></script>
+    <script src="/assets/compatible.js?v=qwen-cloud-navigation-2"></script>
     <script>
       let adminAuthEnabled = false;
       let adminAuthenticated = false;
@@ -7202,8 +7522,9 @@ async fn dashboard() -> impl IntoResponse {
       function updateOverview() {
         const accounts = allAccountsWithProvider();
         const totalAccounts = accounts.length;
-        const providersWithAccounts = Object.keys(dashboardState.providers)
-          .filter(function(provider) { return (dashboardState.providers[provider] || []).length > 0; }).length;
+        const providersWithAccounts = new Set(accounts.map(function(item) {
+          return item.provider === 'compatible' && isQwenCloudAccount(item.account) ? 'qwen' : item.provider;
+        })).size;
         const attentionItems = accounts.map(function(item) {
           return { item: item, reasons: accountAttentionReasons(item) };
         }).filter(function(entry) { return entry.reasons.length > 0; });
@@ -7404,7 +7725,10 @@ async fn dashboard() -> impl IntoResponse {
       }
       function closeModal(id, keepBackgroundInactive) {
         if (id === 'compatibleModal') {
+          if (typeof cancelQwenCloudSignIn === 'function') cancelQwenCloudSignIn();
           const key = document.getElementById('compatibleKey');
+          const cookie = document.getElementById('compatibleConsoleCookie');
+          if (cookie) cookie.value = '';
           if (key) key.value = '';
         }
         const modal = document.getElementById(id);
@@ -7476,6 +7800,7 @@ async fn dashboard() -> impl IntoResponse {
           '/claude/quota.json': quotas.claude,
           '/glm/accounts.json': providers.glm,
           '/compatible/accounts.json': providers.compatible,
+          '/compatible/quota.json': quotas.compatible,
           '/glm/quota.json': quotas.glm,
           '/admin/account-routing': dashboardSnapshot.account_routing
         };
@@ -7781,7 +8106,12 @@ async fn dashboard() -> impl IntoResponse {
           quota.limits.forEach(function(l) {
             var label = l.label || l.scope || 'Limit';
             var pct = l.used_percent != null ? l.used_percent : 0;
-            var hint = (l.used_text || l.used || '') + '/' + (l.limit_text || l.limit || '') + ' ' + (l.reset_label || '');
+            var used = l.used_text ?? l.used;
+            var total = l.limit_text ?? l.limit;
+            var hint = used != null || total != null
+              ? (used ?? '?') + '/' + (total ?? '?')
+              : (l.used_percent != null ? Number(l.used_percent).toFixed(1) + '% used' : 'Not reported');
+            if (l.reset_label || l.reset_at) hint += ' · ' + (l.reset_label || l.reset_at);
             bars += renderProgressBar(label, hint, pct);
           });
         }
@@ -7908,13 +8238,15 @@ async fn dashboard() -> impl IntoResponse {
         var credits = quota && quota.credits || {};
         var currency = credits.currency ? ' ' + credits.currency : '';
         var balance = credits.unlimited === true ? 'Unlimited'
-          : credits.balance != null && credits.balance !== '' ? String(credits.balance) + currency
+          : credits.balance != null && credits.balance !== '' ? (credits.estimated === true ? '≈ ' : '') + String(credits.balance) + currency
           : credits.has_credits === false ? 'No credits available'
           : credits.has_credits === true ? 'Available; balance not reported' : 'Not reported';
         var rows = [['Available credits', balance]];
         if (typeof credits.enabled === 'boolean') rows.push(['Usage credits', credits.enabled ? 'Enabled' : 'Disabled']);
         if (credits.used != null) rows.push(['Credits used', String(credits.used) + currency]);
         if (credits.monthly_limit != null) rows.push(['Credit spend limit', String(credits.monthly_limit) + currency]);
+        if (credits.cash_balance != null) rows.push(['Cash balance', String(credits.cash_balance) + currency]);
+        if (credits.credit_limit != null) rows.push(['Credit limit', String(credits.credit_limit) + currency]);
         if (credits.note) rows.push(['Credit note', credits.note]);
         return '<div class="quota-balance-block">' + rows.map(function(row) {
           return '<div class="quota-status"><strong>' + escapeHtml(row[0]) + ':</strong> ' + escapeHtml(row[1]) + '</div>';
@@ -8058,6 +8390,9 @@ async fn dashboard() -> impl IntoResponse {
           ? '<button type="button" role="menuitem" aria-label="' + escapeHtml((isPriority ? 'Remove priority from ' : 'Use first ') + label) + '" onclick="toggleAccountPriority(' + providerArg + ', ' + accountKeyArg + ', ' + (isPriority ? 'false' : 'true') + ')" class="mini-btn action-btn">' + (isPriority ? 'Remove priority' : 'Use first') + '</button>'
           : '';
         const refreshAction = '<button type="button" role="menuitem" aria-label="' + escapeHtml('Refresh models and quota for ' + label) + '" onclick="refreshModelCatalog(' + providerArg + ', ' + (hasFile ? fileArg : "''") + ')" class="mini-btn action-btn">Refresh models + quota</button>';
+        const editAction = hasFile && provider === 'compatible'
+          ? '<button type="button" role="menuitem" aria-label="' + escapeHtml('Edit ' + label) + '" data-edit-compatible="' + escapeHtml(a.file_name) + '" onclick="openCompatibleAccount(' + fileArg + ')" class="mini-btn action-btn">Edit</button>'
+          : '';
         const forceEnableAction = hasFile && isCooldown
           ? '<button type="button" role="menuitem" aria-label="' + escapeHtml('Force enable ' + label) + '" onclick="toggleCred(' + fileArg + ', true, ' + labelArg + ')" class="mini-btn action-btn is-enabled">Force enable</button>'
           : '';
@@ -8068,6 +8403,7 @@ async fn dashboard() -> impl IntoResponse {
         return '<span class="account-menu-wrap">'
           + '<button type="button" class="mini-btn account-menu-button" aria-label="' + escapeHtml('Open actions for ' + label) + '" aria-haspopup="menu" aria-expanded="false" aria-controls="' + escapeHtml(menuId) + '" onclick="toggleAccountActionMenu(event, ' + menuArg + ')">&#8942;</button>'
           + '<span id="' + escapeHtml(menuId) + '" class="account-action-menu" role="menu" hidden onclick="event.stopPropagation()">'
+          + editAction
           + refreshAction
           + priorityAction
           + forceEnableAction
@@ -8499,8 +8835,7 @@ async fn dashboard() -> impl IntoResponse {
         var data = await res.json();
         var accounts = data.accounts || [];
         dashboardState.providers.qwen = accounts;
-        var cards = accounts.map(function(a) { return buildQwenCard(a, lastQwenQuota.get(a.file_name || a.label)); }).join('');
-        renderProviderCards('qwen', 'qwenCards', 'qwenBadgeCount', accounts, cards, 'No Qwen accounts');
+        renderQwenProviderCards();
         updateOverview();
       }
       async function refreshQwenQuota() {
@@ -9543,10 +9878,10 @@ async fn dashboard() -> impl IntoResponse {
       }
       let lastGrokQuota = new Map();
       const providerCardSignatures = new Map();
-      function renderProviderCards(provider, cardsId, badgeId, accounts, cards, emptyText) {
+      function renderProviderCards(provider, cardsId, badgeId, accounts, cards, emptyText, extraQuota) {
         const quota = dashboardState.quotas[provider];
         const quotaValue = quota instanceof Map ? Array.from(quota.entries()) : quota;
-        const signature = JSON.stringify({ accounts: accounts, quota: quotaValue });
+        const signature = JSON.stringify({ accounts: accounts, quota: quotaValue, extraQuota: extraQuota });
         if (providerCardSignatures.get(provider) === signature) return;
         providerCardSignatures.set(provider, signature);
         document.getElementById(cardsId).innerHTML = cards || '<div class="empty-state">' + emptyText + '</div>';
@@ -9609,11 +9944,21 @@ async fn dashboard() -> impl IntoResponse {
       }
       let contextChart = null;
       const chartColors = {
-        input: '#3b82f6',
-        output: '#22c55e',
-        cache: '#f59e0b',
-        reasoning: '#a855f7'
+        input: '#38bdf8',
+        output: '#8b5cf6',
+        cache: '#22c55e',
+        reasoning: '#f59e0b'
       };
+      function chartAreaFill(color) {
+        return function(context) {
+          const area = context.chart.chartArea;
+          if (!area) return color + '22';
+          const gradient = context.chart.ctx.createLinearGradient(0, area.top, 0, area.bottom);
+          gradient.addColorStop(0, color + '55');
+          gradient.addColorStop(1, color + '04');
+          return gradient;
+        };
+      }
       const contextPresets = {
         hour: { preset: 'hour', label: '1h', hours: 1, bucketMinutes: 1 },
         day: { preset: 'day', label: '24h', hours: 24, bucketMinutes: 5 },
@@ -9806,45 +10151,49 @@ async fn dashboard() -> impl IntoResponse {
                   label: 'Input',
                   data: inputData,
                   borderColor: chartColors.input,
-                  backgroundColor: chartColors.input + '18',
+                  backgroundColor: chartAreaFill(chartColors.input),
                   borderWidth: 2,
                   pointRadius: 0,
+                  pointHoverRadius: 5,
                   pointHitRadius: 6,
-                  tension: 0.2,
+                  tension: 0.4,
                   fill: true
                 },
                 {
                   label: 'Output',
                   data: outputData,
                   borderColor: chartColors.output,
-                  backgroundColor: chartColors.output + '18',
+                  backgroundColor: chartAreaFill(chartColors.output),
                   borderWidth: 2,
                   pointRadius: 0,
+                  pointHoverRadius: 5,
                   pointHitRadius: 6,
-                  tension: 0.2,
+                  tension: 0.4,
                   fill: true
                 },
                 {
                   label: 'Cache',
                   data: cacheData,
                   borderColor: chartColors.cache,
-                  borderWidth: 1.5,
-                  borderDash: [5, 3],
+                  backgroundColor: chartAreaFill(chartColors.cache),
+                  borderWidth: 2,
                   pointRadius: 0,
+                  pointHoverRadius: 5,
                   pointHitRadius: 6,
-                  tension: 0.2,
-                  fill: false
+                  tension: 0.4,
+                  fill: true
                 },
                 {
                   label: 'Reasoning',
                   data: reasoningData,
                   borderColor: chartColors.reasoning,
-                  borderWidth: 1.5,
-                  borderDash: [5, 3],
+                  backgroundColor: chartAreaFill(chartColors.reasoning),
+                  borderWidth: 2,
                   pointRadius: 0,
+                  pointHoverRadius: 5,
                   pointHitRadius: 6,
-                  tension: 0.2,
-                  fill: false
+                  tension: 0.4,
+                  fill: true
                 }
               ]
             },
@@ -9859,6 +10208,15 @@ async fn dashboard() -> impl IntoResponse {
               plugins: {
                 legend: { display: false },
                 tooltip: {
+                  backgroundColor: getComputedStyle(document.documentElement).getPropertyValue('--surface-alt').trim() || '#141e33',
+                  titleColor: getComputedStyle(document.documentElement).getPropertyValue('--text').trim() || '#e8eefc',
+                  bodyColor: getComputedStyle(document.documentElement).getPropertyValue('--muted').trim() || '#8795b1',
+                  borderColor: getComputedStyle(document.documentElement).getPropertyValue('--border').trim() || '#1c2840',
+                  borderWidth: 1,
+                  cornerRadius: 10,
+                  padding: 12,
+                  boxPadding: 4,
+                  usePointStyle: true,
                   callbacks: {
                     label: function(ctx) {
                       return ctx.dataset.label + ': ' + ctx.parsed.y.toLocaleString() + ' tokens';
@@ -9879,7 +10237,8 @@ async fn dashboard() -> impl IntoResponse {
                     callback: function(v) { return v >= 1000000 ? (v/1000000).toFixed(1)+'M' : v >= 1000 ? (v/1000).toFixed(0)+'K' : v; },
                     color: getComputedStyle(document.documentElement).getPropertyValue('--muted').trim() || '#94a3b8'
                   },
-                  grid: { color: (getComputedStyle(document.documentElement).getPropertyValue('--border').trim() || '#25314a') + '40' }
+                  border: { display: false, dash: [4, 4] },
+                  grid: { color: (getComputedStyle(document.documentElement).getPropertyValue('--border').trim() || '#1c2840') + '99' }
                 }
               }
             }
@@ -10472,6 +10831,7 @@ async fn dashboard() -> impl IntoResponse {
           else if (provider === 'claude') openModal('addClaudeModal');
           else if (provider === 'glm') openModal('addGlmModal');
           else if (provider === 'compatible') openCompatibleAccount();
+          else if (provider === 'qwen_token_plan' || provider === 'qwen_payg') openCompatibleAccount(null, provider);
           else if (provider === 'custom-model') openCustomModelModal();
         });
       });
@@ -12460,7 +12820,8 @@ async fn dashboard_snapshot_route(State(state): State<AppState>, headers: Header
             "grok": provider_quota_summary::with_summaries(target::grok::admin::cached_quota_json(&state)),
             "copilot": quota("copilot"),
             "claude": quota("claude"),
-            "glm": quota("glm")
+            "glm": quota("glm"),
+            "compatible": quota("compatible")
         },
         "account_routing": {
             "ok": true,
@@ -14194,7 +14555,7 @@ fn notification_account_options(state: &AppState) -> Vec<notifications::Notifica
     for account in state.compatible_accounts.lock().unwrap().clone() {
         out.push(notifications::NotificationAccountOption {
             provider: "compatible".to_string(),
-            provider_label: "Compatible API".to_string(),
+            provider_label: account.service.label().to_string(),
             key: compatible_stats_key(&account),
             label: account.label.clone(),
             account_id: account.account_id.clone(),
