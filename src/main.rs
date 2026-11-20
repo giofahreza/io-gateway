@@ -5313,12 +5313,39 @@ async fn dashboard() -> impl IntoResponse {
       .modal { backdrop-filter: blur(4px); }
       .modal-card { padding: 22px; border-radius: 16px; }
       .toast { border-radius: 12px; padding: 12px 16px; }
+      /* Settings title and tabs stay pinned while the panels scroll. The negative
+         offsets cancel the card padding so the pinned bar covers it. */
+      .settings-modal-head {
+        position: sticky;
+        top: -22px;
+        z-index: 6;
+        margin: -22px -22px 0;
+        padding: 22px 22px 14px;
+        background: var(--surface);
+      }
+      .settings-modal-head .settings-tabs {
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        margin: 10px 0 0;
+      }
       @media (max-width: 768px) {
         .page-shell { --shell-pad: 12px; }
         .page-header h1 { font-size: 18px; }
         .overview-card { padding: 16px; }
         .overview-value { font-size: 28px; }
         .chart-wrap { height: 240px; }
+        .settings-tabs {
+          display: flex;
+          grid-template-columns: none;
+          gap: 6px;
+          overflow-x: auto;
+          scrollbar-width: thin;
+        }
+        .settings-tab {
+          flex: 0 0 auto;
+          min-height: 40px;
+          padding: 8px 12px;
+          white-space: nowrap;
+        }
       }
     </style>
     <script>
@@ -10498,6 +10525,7 @@ async fn dashboard() -> impl IntoResponse {
     </div>
     <div id="appSettingsModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="appSettingsTitle" aria-hidden="true" style="display:none;">
       <div class="modal-card">
+        <div class="settings-modal-head">
         <h2 id="appSettingsTitle" style="margin-top:0;">Settings</h2>
         <div class="settings-tabs" role="tablist" aria-label="Settings sections">
           <button type="button" class="settings-tab is-active" role="tab" aria-selected="true" aria-controls="settingsDashboardPanel" data-settings-tab="dashboard">Dashboard</button>
@@ -10505,6 +10533,7 @@ async fn dashboard() -> impl IntoResponse {
           <button type="button" class="settings-tab" role="tab" aria-selected="false" aria-controls="settingsApiKeysPanel" data-settings-tab="api-keys">API Keys</button>
           <button type="button" class="settings-tab" role="tab" aria-selected="false" aria-controls="settingsResetCreditsPanel" data-settings-tab="reset-credits">Reset credits</button>
           <button type="button" class="settings-tab" role="tab" aria-selected="false" aria-controls="settingsNotificationsPanel" data-settings-tab="notifications">Notifications</button>
+        </div>
         </div>
         <div id="settingsDashboardPanel" class="settings-panel" role="tabpanel" data-settings-panel="dashboard">
           <div class="settings-block custom-model-form-row">
