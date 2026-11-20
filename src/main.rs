@@ -5372,8 +5372,7 @@ async fn dashboard() -> impl IntoResponse {
               <button type="button" class="provider-menu-item" role="menuitem" data-provider="antigravity">Antigravity (Google)</button>
               <button type="button" class="provider-menu-item" role="menuitem" data-provider="gemini">Gemini (Google)</button>
               <button type="button" class="provider-menu-item" role="menuitem" data-provider="qwen">Qwen Chat</button>
-              <button type="button" class="provider-menu-item" role="menuitem" data-provider="qwen_token_plan">Qwen Cloud Token Plan</button>
-              <button type="button" class="provider-menu-item" role="menuitem" data-provider="qwen_payg">Qwen Cloud Pay-as-you-go</button>
+              <button type="button" class="provider-menu-item" role="menuitem" data-provider="qwen_cloud">Qwen Cloud</button>
               <button type="button" class="provider-menu-item" role="menuitem" data-provider="deepseek">DeepSeek</button>
               <button type="button" class="provider-menu-item" role="menuitem" data-provider="minimax">MiniMax</button>
               <button type="button" class="provider-menu-item" role="menuitem" data-provider="grok">Grok (xAI)</button>
@@ -10831,7 +10830,7 @@ async fn dashboard() -> impl IntoResponse {
           else if (provider === 'claude') openModal('addClaudeModal');
           else if (provider === 'glm') openModal('addGlmModal');
           else if (provider === 'compatible') openCompatibleAccount();
-          else if (provider === 'qwen_token_plan' || provider === 'qwen_payg') openCompatibleAccount(null, provider);
+          else if (provider === 'qwen_cloud') openCompatibleAccount(null, 'qwen_token_plan');
           else if (provider === 'custom-model') openCustomModelModal();
         });
       });

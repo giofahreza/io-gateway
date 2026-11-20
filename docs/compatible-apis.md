@@ -58,7 +58,7 @@ The integration check uses a local mock service and temporary gateway configurat
 
 ## Qwen Cloud Token Plan and Pay-as-you-go
 
-Choose the matching provider in the web **Add account** menu or TUI options **12** (Token Plan) and **13** (Pay-as-you-go). You can also change the provider in an existing compatible account's editor. Account IDs, usage history, `cmp:` model names and account routing remain the same. Token Plan and pay-as-you-go cards appear in the **Qwen** group in both web and TUI; only custom services appear in **Compatible APIs**. Official Qwen Cloud URLs are recognized even when an older credential was saved as custom. Selecting a Qwen preset fills the URLs automatically; changing presets replaces the previous preset URLs.
+Choose **Qwen Cloud** in the web **Add account** menu or TUI option **12**, then enter your API key. The account type follows the key: `sk-sp-` keys are Token Plan, and any other Qwen Cloud key (`sk-ws-`, or the older `sk-`) is Pay-as-you-go. The web editor shows the detected type and lets you override it, and the TUI asks for the key first. You can also change the account type in an existing compatible account's editor. Account IDs, usage history, `cmp:` model names and account routing remain the same. Token Plan and pay-as-you-go cards appear in the **Qwen** group in both web and TUI; only custom services appear in **Compatible APIs**. Official Qwen Cloud URLs are recognized even when an older credential was saved as custom. Selecting a Qwen preset fills the URLs automatically; changing presets replaces the previous preset URLs.
 
 The presets use both OpenAI and Anthropic formats:
 

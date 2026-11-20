@@ -1840,13 +1840,30 @@ impl TuiApp {
         preset: Option<&str>,
     ) -> Result<(), String> {
         let old = existing.as_ref().unwrap_or(&Value::Null);
-        let service_default = preset.unwrap_or_else(|| old["service"].as_str().unwrap_or("custom"));
-        let service_input = prompt_compatible_field(
-            terminal,
-            "Provider: 1=Custom, 2=Qwen Cloud Token Plan, 3=Qwen Cloud Pay-as-you-go",
-            service_default,
-            false,
-        )?;
+        // A new Qwen Cloud account asks for the key first, because the key decides
+        // whether this is Token Plan or pay-as-you-go.
+        let early_key = if existing.is_none() && preset == Some("qwen_cloud") {
+            let key = prompt_secret_in_terminal(terminal, "Qwen Cloud API key: ")?;
+            if key.trim().is_empty() {
+                return Err("API key is required".into());
+            }
+            Some(key)
+        } else {
+            None
+        };
+        let service_input = match &early_key {
+            Some(key) => qwen_service_for_key(key).to_string(),
+            None => {
+                let service_default =
+                    preset.unwrap_or_else(|| old["service"].as_str().unwrap_or("custom"));
+                prompt_compatible_field(
+                    terminal,
+                    "Provider: 1=Custom, 2=Qwen Cloud Token Plan, 3=Qwen Cloud Pay-as-you-go",
+                    service_default,
+                    false,
+                )?
+            }
+        };
         let (service, service_label, host) = match service_input.as_str() {
             "1" | "custom" => ("custom", "", ""),
             "2" | "qwen_token_plan" => ("qwen_token_plan", "Qwen Cloud Token Plan", "token-plan"),
@@ -1854,9 +1871,14 @@ impl TuiApp {
             _ => return Err("Choose a listed provider".into()),
         };
         let label_default = string_at(old, &["label"]);
+        let name_prompt = if early_key.is_some() {
+            format!("Name (detected {service_label} from the key)")
+        } else {
+            "Name".to_string()
+        };
         let label = prompt_compatible_field(
             terminal,
-            "Name",
+            &name_prompt,
             if label_default.is_empty() {
                 service_label
             } else {
@@ -1882,7 +1904,11 @@ impl TuiApp {
         };
         let base_url = prompt_compatible_field(
             terminal,
-            "OpenAI base URL (include /v1 if required)",
+            if early_key.is_some() && service == "qwen_payg" {
+                "OpenAI base URL (include /v1; Singapore by default, use your key's region)"
+            } else {
+                "OpenAI base URL (include /v1 if required)"
+            },
             &url_default("base_url", "compatible-mode/v1"),
             true,
         )?;
@@ -1895,14 +1921,17 @@ impl TuiApp {
         if base_url.is_empty() && anthropic_base_url.is_empty() {
             return Err("Enter at least one API base URL".into());
         }
-        let api_key = prompt_secret_in_terminal(
-            terminal,
-            if existing.is_some() {
-                "API key (blank = keep saved key): "
-            } else {
-                "API key: "
-            },
-        )?;
+        let api_key = match early_key {
+            Some(key) => key,
+            None => prompt_secret_in_terminal(
+                terminal,
+                if existing.is_some() {
+                    "API key (blank = keep saved key): "
+                } else {
+                    "API key: "
+                },
+            )?,
+        };
         let model_default = old["models"]
             .as_array()
             .map(|v| {
@@ -1981,7 +2010,7 @@ impl TuiApp {
                 });
             }
             "compatible" => self.edit_compatible_account(terminal, None, None)?,
-            "qwen_token_plan" | "qwen_payg" => {
+            "qwen_cloud" | "qwen_token_plan" | "qwen_payg" => {
                 self.edit_compatible_account(terminal, None, Some(&provider))?
             }
             "claude" => self.begin_claude_account(terminal)?,
@@ -5650,7 +5679,7 @@ fn prompt_account_provider(
 ) -> Result<String, String> {
     let value = prompt_in_terminal(
         terminal,
-        "Provider [1=Codex, 2=Antigravity, 3=Gemini, 4=Qwen Chat, 5=DeepSeek, 6=MiniMax, 7=Grok, 8=Copilot, 9=Claude, 10=GLM, 11=Compatible API, 12=Qwen Token Plan, 13=Qwen Pay-as-you-go]: ",
+        "Provider [1=Codex, 2=Antigravity, 3=Gemini, 4=Qwen Chat, 5=DeepSeek, 6=MiniMax, 7=Grok, 8=Copilot, 9=Claude, 10=GLM, 11=Compatible API, 12=Qwen Cloud]: ",
     )?;
     let normalized = value.trim().to_ascii_lowercase();
     let provider = match normalized.as_str() {
@@ -5665,11 +5694,22 @@ fn prompt_account_provider(
         "9" | "claude" | "anthropic" => "claude",
         "10" | "glm" | "zai" | "z.ai" => "glm",
         "11" | "compatible" | "cmp" | "openai" | "anthropic-compatible" => "compatible",
-        "12" | "qwen_token_plan" | "qwen-token-plan" => "qwen_token_plan",
-        "13" | "qwen_payg" | "qwen-payg" => "qwen_payg",
+        "12" | "qwen_cloud" | "qwen-cloud" => "qwen_cloud",
+        "qwen_token_plan" | "qwen-token-plan" => "qwen_token_plan",
+        "qwen_payg" | "qwen-payg" => "qwen_payg",
         _ => return Err("unknown provider; choose a listed number or provider name".to_string()),
     };
     Ok(provider.to_string())
+}
+
+/// Qwen Cloud Token Plan keys start with `sk-sp-`; every other Qwen Cloud key
+/// (`sk-ws-`, or the older `sk-`) is pay-as-you-go.
+fn qwen_service_for_key(key: &str) -> &'static str {
+    if key.trim().starts_with("sk-sp-") {
+        "qwen_token_plan"
+    } else {
+        "qwen_payg"
+    }
 }
 
 fn prompt_compatible_field(
@@ -9122,6 +9162,15 @@ impl EmptyStringExt for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qwen_cloud_type_follows_the_key_prefix() {
+        assert_eq!(qwen_service_for_key("sk-sp-abc123"), "qwen_token_plan");
+        assert_eq!(qwen_service_for_key("  sk-sp-abc123\n"), "qwen_token_plan");
+        assert_eq!(qwen_service_for_key("sk-ws-abc123"), "qwen_payg");
+        assert_eq!(qwen_service_for_key("sk-abc123"), "qwen_payg");
+        assert_eq!(qwen_service_for_key(""), "qwen_payg");
+    }
 
     #[test]
     fn qwen_cloud_groups_with_qwen_and_keeps_compatible_quota_and_action_identity() {

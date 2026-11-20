@@ -15,8 +15,9 @@ function ensureCompatibleModal() {
     <h2 id="compatibleTitle" style="margin-top:0">Add compatible API</h2>
     <p class="muted">Connect a service that accepts OpenAI or Anthropic requests. Use its upstream model IDs here; clients select them with <code>cmp:</code>.</p>
     <form id="compatibleForm">
-      <label for="compatibleService">Provider</label>
+      <label for="compatibleService">Account type</label>
       <select id="compatibleService"><option value="custom">Custom compatible API</option><option value="qwen_token_plan">Qwen Cloud Token Plan</option><option value="qwen_payg">Qwen Cloud Pay-as-you-go</option></select>
+      <div id="compatibleServiceHint" class="muted" style="margin:6px 0 12px" hidden></div>
       <label for="compatibleName">Name</label>
       <input id="compatibleName" required autocomplete="off" placeholder="e.g. Qwen Coding Plan">
       <label for="compatibleFormat" style="margin-top:12px">API format</label>
@@ -56,6 +57,7 @@ function ensureCompatibleModal() {
   document.getElementById('compatibleFormat').addEventListener('change', updateCompatibleFormat);
   document.getElementById('compatibleService').addEventListener('change', () => updateCompatibleService(true));
   for (const id of ['compatibleOpenai', 'compatibleAnthropic']) document.getElementById(id).addEventListener('change', detectCompatibleService);
+  document.getElementById('compatibleKey').addEventListener('input', detectQwenServiceFromKey);
   document.getElementById('compatibleClose').addEventListener('click', closeCompatibleModal);
   document.getElementById('compatibleForm').addEventListener('submit', saveCompatibleAccount);
   document.getElementById('compatibleDiscover').addEventListener('click', discoverCompatibleModels);
@@ -69,8 +71,19 @@ function ensureCompatibleModal() {
 function isQwenCloudAccount(account) {
   return account && ['qwen_token_plan', 'qwen_payg'].includes(account.service);
 }
+// A Qwen Cloud API key is Token Plan when it starts with sk-sp-; every other
+// Qwen Cloud key (sk-ws- or the older sk-) is pay-as-you-go. The URL host is
+// checked first because the host decides which endpoint a key can reach.
+function detectQwenServiceFromKey() {
+  const select = document.getElementById('compatibleService');
+  const key = document.getElementById('compatibleKey').value.trim();
+  if (select.value === 'custom' || !key) return;
+  const service = key.startsWith('sk-sp-') ? 'qwen_token_plan' : 'qwen_payg';
+  if (service === select.value) return;
+  select.value = service;
+  updateCompatibleService(true);
+}
 function detectCompatibleService() {
-  if (document.getElementById('compatibleService').value !== 'custom') return;
   for (const id of ['compatibleOpenai', 'compatibleAnthropic']) {
     let host;
     try { host = new URL(document.getElementById(id).value).hostname; } catch (_) { continue; }
@@ -91,7 +104,12 @@ function updateCompatibleService(preset) {
   const service = document.getElementById('compatibleService').value;
   document.getElementById('compatibleConsoleGroup').hidden = service === 'custom';
   const label = service === 'qwen_token_plan' ? 'Qwen Cloud Token Plan' : service === 'qwen_payg' ? 'Qwen Cloud Pay-as-you-go' : 'compatible API';
-  document.getElementById('compatibleTitle').textContent = (document.getElementById('compatibleForm').dataset.fileName ? 'Edit ' : 'Add ') + label;
+  const isNew = !document.getElementById('compatibleForm').dataset.fileName;
+  document.getElementById('compatibleTitle').textContent = (isNew ? 'Add ' : 'Edit ') + (isNew && service !== 'custom' ? 'Qwen Cloud' : label);
+  const hint = document.getElementById('compatibleServiceHint');
+  hint.hidden = service === 'custom';
+  hint.textContent = service === 'custom' ? '' : 'Detected from your API key: sk-sp- keys are Token Plan, other keys are Pay-as-you-go. Change the account type to override.'
+    + (service === 'qwen_payg' ? ' Pay-as-you-go keys only work in the region they were created in; Singapore is filled in, so edit the URLs for another region.' : '');
   if (preset && service !== 'custom') {
     const host = service === 'qwen_token_plan' ? 'token-plan' : 'ap-southeast-1';
     document.getElementById('compatibleOpenai').value = 'https://' + host + '.maas.qwencloudapi.com/compatible-mode/v1';
