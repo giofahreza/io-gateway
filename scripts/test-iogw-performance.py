@@ -388,7 +388,8 @@ def animated_ui(terminal, gateway, binary):
         terminal.marker(b"Account Details")
         terminal.marker(b"Account 01")
         terminal.send(b"\x1b")
-        terminal.until(terminal.animated)
+        # Wait for the popup to close. An Esc followed at once by another key can be read as Alt+key.
+        terminal.until(lambda: terminal.animated() and "Account Details" not in terminal.screen.text())
         terminal.send(b"k")
         terminal.marker(b"Account Usage")
         terminal.send(b"a")
@@ -638,13 +639,13 @@ def station_theme(terminal, gateway, binary):
     terminal.send(b"\r")
     terminal.marker(b"Account Details")
     terminal.send(b"\x1b")
-    terminal.marker(b"Station / ")
+    terminal.until(lambda: "Station / " in terminal.screen.text() and "Account Details" not in terminal.screen.text())
     terminal.send(b"b ")  # Hide bubbles and pause all scenery.
     terminal.marker(b"PAUSED")
     terminal.until(lambda: not any("╭" in "".join(row) for row in terminal.screen.cells[:-4]))
     latency = terminal.help_latency()
     terminal.send(b"\x1b")
-    terminal.marker(b"Station / ")
+    terminal.until(lambda: "Station / " in terminal.screen.text() and "Commands" not in terminal.screen.text())
     preference = Path(terminal.env["XDG_CONFIG_HOME"]) / "iogw/plugins/selected-theme.json"
     assert json.loads(preference.read_text())["theme"] == "pixel-station"
     terminal.send(b"t")
