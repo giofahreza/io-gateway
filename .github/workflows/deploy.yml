@@ -163,7 +163,7 @@ jobs:
             asset_suffix: macos-x86_64.tar.gz
             macosx_deployment_target: '10.13'
           - platform: macos-aarch64
-            runner: macos-14
+            runner: macos-15
             target: aarch64-apple-darwin
             archive: tar.gz
             asset_suffix: macos-aarch64.tar.gz
