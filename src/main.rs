@@ -3131,7 +3131,7 @@ async fn dashboard() -> impl IntoResponse {
       }
       .provider-settings-row {
         display: grid;
-        grid-template-columns: minmax(0, 1fr) auto auto;
+        grid-template-columns: auto minmax(0, 1fr) auto;
         gap: 10px;
         align-items: center;
         padding: 8px;
@@ -3142,6 +3142,41 @@ async fn dashboard() -> impl IntoResponse {
       .provider-settings-row.is-hidden {
         opacity: 0.62;
       }
+      .provider-settings-row.is-dragging {
+        position: relative;
+        z-index: 2;
+        opacity: 1;
+        border-color: var(--accent);
+        background: var(--surface);
+        box-shadow: var(--shadow);
+      }
+      .provider-settings-list.is-sorting {
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      .provider-drag-handle {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 28px;
+        height: 34px;
+        border-radius: 6px;
+        color: var(--muted);
+        font-size: 16px;
+        letter-spacing: -4px;
+        cursor: grab;
+        touch-action: none;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      .provider-drag-handle:hover,
+      .provider-drag-handle:focus-visible {
+        background: var(--row-hover);
+        color: var(--text);
+      }
+      .provider-settings-list.is-sorting .provider-drag-handle {
+        cursor: grabbing;
+      }
       .provider-settings-visible {
         min-width: 0;
         overflow-wrap: anywhere;
@@ -3149,18 +3184,6 @@ async fn dashboard() -> impl IntoResponse {
       .provider-settings-key {
         color: var(--muted);
         font-size: 12px;
-      }
-      .provider-settings-actions {
-        display: flex;
-        gap: 6px;
-        justify-content: flex-end;
-      }
-      .provider-settings-actions .mini-btn {
-        min-width: 34px;
-      }
-      .provider-settings-actions .mini-btn:disabled {
-        cursor: not-allowed;
-        opacity: 0.45;
       }
       .settings-segmented {
         display: inline-flex;
@@ -4930,10 +4953,6 @@ async fn dashboard() -> impl IntoResponse {
           border-color: var(--accent);
           background: var(--surface);
         }
-        .provider-settings-row {
-          grid-template-columns: 1fr;
-          align-items: stretch;
-        }
         .api-key-create-row,
         .api-key-row {
           grid-template-columns: 1fr;
@@ -4946,12 +4965,8 @@ async fn dashboard() -> impl IntoResponse {
           grid-template-columns: 1fr;
         }
         .api-key-reveal-header,
-        .provider-settings-actions,
         .api-key-actions {
           justify-content: flex-start;
-        }
-        .provider-settings-actions .mini-btn {
-          flex: 1;
         }
         .notification-channel-grid,
         .test-api-grid,
@@ -5890,26 +5905,89 @@ async fn dashboard() -> impl IntoResponse {
         if (!list) return;
         var settings = normalizeProviderDashboardSettings(dashboardState.providerSettings);
         dashboardState.providerSettings = settings;
-        var total = settings.order.length;
-        list.innerHTML = settings.order.map(function(provider, index) {
+        list.innerHTML = settings.order.map(function(provider) {
           var label = providerLabels[provider] || provider;
           var checked = settings.hidden[provider] === true ? '' : ' checked';
           var hiddenClass = settings.hidden[provider] === true ? ' is-hidden' : '';
           var providerArg = escapeHtml(jsString(provider));
-          return '<div class="provider-settings-row' + hiddenClass + '">'
+          return '<div class="provider-settings-row' + hiddenClass + '" data-provider-row="' + escapeHtml(provider) + '">'
+            + '<span class="provider-drag-handle" role="button" tabindex="0" data-provider-handle="' + escapeHtml(provider) + '" title="Drag to reorder" aria-label="' + escapeHtml('Reorder ' + label + ': drag, or press Arrow Up or Arrow Down') + '">&#8942;&#8942;</span>'
             + '<label class="check-row provider-settings-visible">'
             + '<input type="checkbox" onchange="setProviderDashboardVisible(' + providerArg + ', this.checked)"' + checked + '> '
             + '<span>' + escapeHtml(label) + '</span>'
             + '</label>'
             + '<span class="provider-settings-key"><code>' + escapeHtml(provider) + '</code></span>'
-            + '<span class="provider-settings-actions">'
-            + '<button type="button" class="mini-btn" aria-label="' + escapeHtml('Move ' + label + ' up') + '" onclick="moveProviderDashboardSetting(' + providerArg + ', -1)"' + (index === 0 ? ' disabled' : '') + '>&uarr;</button>'
-            + '<button type="button" class="mini-btn" aria-label="' + escapeHtml('Move ' + label + ' down') + '" onclick="moveProviderDashboardSetting(' + providerArg + ', 1)"' + (index === total - 1 ? ' disabled' : '') + '>&darr;</button>'
-            + '</span>'
             + '</div>';
         }).join('');
+        initProviderSettingsDrag();
         updateProviderLayoutModeControl();
         updateAppSettingsStatus();
+      }
+      // Pointer events cover mouse, pen and touch. The list itself holds the pointer
+      // capture because moving a row in the DOM would release capture on the handle.
+      function initProviderSettingsDrag() {
+        var list = document.getElementById('providerSettingsList');
+        if (!list || list.dataset.dragReady === '1') return;
+        list.dataset.dragReady = '1';
+        var drag = null;
+        function rowsOf() {
+          return Array.prototype.slice.call(list.querySelectorAll('.provider-settings-row'));
+        }
+        function finishDrag(save) {
+          if (!drag) return;
+          var current = drag;
+          drag = null;
+          list.classList.remove('is-sorting');
+          current.row.classList.remove('is-dragging');
+          try { list.releasePointerCapture(current.pointerId); } catch (error) {}
+          if (save) {
+            var order = rowsOf().map(function(row) { return row.getAttribute('data-provider-row'); });
+            var settings = normalizeProviderDashboardSettings(dashboardState.providerSettings);
+            if (order.join() !== settings.order.join()) {
+              settings.order = order;
+              saveAndRenderProviderDashboardSettings(settings);
+              return;
+            }
+          }
+          renderProviderSettingsList();
+        }
+        list.addEventListener('pointerdown', function(event) {
+          var handle = event.target.closest && event.target.closest('.provider-drag-handle');
+          if (!handle || (event.pointerType === 'mouse' && event.button !== 0)) return;
+          event.preventDefault();
+          drag = { row: handle.closest('.provider-settings-row'), pointerId: event.pointerId };
+          drag.row.classList.add('is-dragging');
+          list.classList.add('is-sorting');
+          list.setPointerCapture(event.pointerId);
+        });
+        list.addEventListener('pointermove', function(event) {
+          if (!drag || event.pointerId !== drag.pointerId) return;
+          var next = rowsOf().filter(function(row) { return row !== drag.row; }).find(function(row) {
+            var box = row.getBoundingClientRect();
+            return event.clientY < box.top + box.height / 2;
+          });
+          var currentNext = drag.row.nextElementSibling;
+          if ((next || currentNext) && next !== currentNext) list.insertBefore(drag.row, next || null);
+          var scroller = list.closest('.modal-card');
+          if (scroller) {
+            var area = scroller.getBoundingClientRect();
+            if (event.clientY < area.top + 48) scroller.scrollTop -= 12;
+            else if (event.clientY > area.bottom - 48) scroller.scrollTop += 12;
+          }
+        });
+        list.addEventListener('pointerup', function(event) {
+          if (drag && event.pointerId === drag.pointerId) finishDrag(true);
+        });
+        list.addEventListener('pointercancel', function() { finishDrag(false); });
+        list.addEventListener('keydown', function(event) {
+          var handle = event.target.closest && event.target.closest('.provider-drag-handle');
+          if (!handle || (event.key !== 'ArrowUp' && event.key !== 'ArrowDown')) return;
+          event.preventDefault();
+          var provider = handle.getAttribute('data-provider-handle');
+          moveProviderDashboardSetting(provider, event.key === 'ArrowUp' ? -1 : 1);
+          var moved = list.querySelector('[data-provider-handle="' + provider + '"]');
+          if (moved) moved.focus();
+        });
       }
       function saveAndRenderProviderDashboardSettings(settings) {
         writeProviderDashboardSettings(settings);
