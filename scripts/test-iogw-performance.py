@@ -344,7 +344,7 @@ def stalled_login(terminal, gateway):
     terminal.marker(b"Admin login required.")
     assert gateway.count("/usage/summary.json") == 0
     offset, _ = terminal.send(b"o")
-    terminal.marker(b"OTP:", offset)
+    terminal.prompt(b"OTP:", offset)
     terminal.send(b"123456\n")
     terminal.until(lambda: gateway.count("/admin/login") == 1)
     return {"help_during_login_ms": round(terminal.help_latency(), 2)}
@@ -353,7 +353,7 @@ def stalled_login(terminal, gateway):
 def completed_login(terminal, gateway):
     terminal.marker(b"Admin login required.")
     offset, _ = terminal.send(b"o")
-    terminal.marker(b"OTP:", offset)
+    terminal.prompt(b"OTP:", offset)
     terminal.send(b"123456\n")
     terminal.marker(b"logged in")
     terminal.marker(b"111")
@@ -478,8 +478,8 @@ def animated_auth(terminal, gateway, binary, theme="pixel-cafe"):
     terminal.marker("Login required · [o] Log in".encode())
     terminal.send(b"?")
     terminal.marker(b"Commands")
-    terminal.send(b"?o")
-    terminal.marker(b"OTP:")
+    offset, _ = terminal.send(b"?o")
+    terminal.prompt(b"OTP:", offset)
     terminal.send(b"123456\n")
     terminal.marker(b"logged in")
     terminal.until(lambda: "CONNECTED" in terminal.screen.text())
@@ -578,7 +578,7 @@ def animated_actions(terminal, gateway, binary):
     terminal.send(b"x")
     terminal.marker(b"Delete Account")
     terminal.send(b"n")
-    terminal.marker(b"delete cancelled")
+    terminal.marker(b"action cancelled")
     assert gateway.count("/credentials/delete") == 0
     terminal.send(b"xy")  # Confirmation uses the same snapshotted target as normal UI.
     terminal.until(lambda: gateway.count("/credentials/delete") == 1)
@@ -596,7 +596,7 @@ def animated_actions(terminal, gateway, binary):
     terminal.send(b"x")
     terminal.marker(b"Delete Custom Model")
     terminal.send(b"n")
-    terminal.marker(b"delete cancelled")
+    terminal.marker(b"action cancelled")
     return {"shared_filters_reordering_prompts_and_confirmed_actions": True}
 
 
