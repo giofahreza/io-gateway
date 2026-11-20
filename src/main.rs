@@ -5046,7 +5046,7 @@ async fn dashboard() -> impl IntoResponse {
         --surface: #0d1526;
         --surface-alt: #141e33;
         --surface-raised: #0a1120;
-        --border: #1a212e;
+        --border: #25365a;
         --text: #e8eefc;
         --muted: #8795b1;
         --button-bg: #2f7bf6;
