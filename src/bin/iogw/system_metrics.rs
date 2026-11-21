@@ -1,8 +1,9 @@
 //! Optional local-machine telemetry. No reads or subprocesses on the TUI thread.
 //! Missing counters stay unknown; rate counters require two successful samples.
+#[cfg(target_os = "linux")]
+use std::fs;
 use std::{
     collections::VecDeque,
-    fs,
     time::{Duration, Instant},
 };
 use tokio::{sync::watch, task::JoinHandle};
@@ -10,6 +11,9 @@ use tokio::{sync::watch, task::JoinHandle};
 #[cfg(target_os = "linux")]
 #[path = "intel_gpu.rs"]
 mod intel_gpu;
+#[cfg(target_os = "macos")]
+#[path = "macos_metrics.rs"]
+mod macos_metrics;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum GpuSource {
@@ -19,6 +23,7 @@ pub(super) enum GpuSource {
     Nvidia,
     IntelPmu,
     IntelClients,
+    MacIoreg,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -217,7 +222,43 @@ impl Sampler {
                 sampled_at: Some(now),
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            let now = Instant::now();
+            let cpu = macos_metrics::cpu_percent();
+            let memory = macos_metrics::memory_bytes();
+            let interface = macos_metrics::default_interface().unwrap_or_default();
+            let current_net = macos_metrics::network_bytes(&interface);
+            let network = self.network.as_ref().zip(current_net).and_then(
+                |((old_interface, rx, tx, at), (new_rx, new_tx))| {
+                    (old_interface == &interface)
+                        .then(|| rates((*rx, *tx), (new_rx, new_tx), now.duration_since(*at)))
+                        .flatten()
+                },
+            );
+            self.network = current_net.map(|(rx, tx)| (interface.clone(), rx, tx, now));
+            let current_disk = macos_metrics::disk_counters();
+            let disk_io = self
+                .disk_io
+                .zip(current_disk)
+                .and_then(|((r, w, at), current)| rates((r, w), current, now.duration_since(at)));
+            self.disk_io = current_disk.map(|(r, w)| (r, w, now));
+            let (gpu, vram) = macos_metrics::gpu();
+            Snapshot {
+                history: VecDeque::new(),
+                cpu,
+                memory,
+                disk: macos_metrics::root_disk(),
+                disk_io,
+                network,
+                interface,
+                gpu,
+                gpu_source: gpu.map_or(GpuSource::Unknown, |_| GpuSource::MacIoreg),
+                vram,
+                sampled_at: Some(now),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             Snapshot {
                 sampled_at: Some(Instant::now()),
@@ -487,6 +528,30 @@ mod tests {
         assert!(monitor.snapshot.disk.is_some());
         monitor.stop();
         assert!(monitor.task.is_none());
+        assert!(monitor.snapshot.sampled_at.is_none());
+    }
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn monitor_samples_macos_hardware() {
+        let mut monitor = Monitor::default();
+        monitor.start();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                monitor.poll();
+                if monitor.snapshot.cpu.is_some()
+                    && monitor.snapshot.memory.is_some()
+                    && monitor.snapshot.disk.is_some()
+                    && monitor.snapshot.disk_io.is_some()
+                    && monitor.snapshot.network.is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("macOS metrics arrive after two samples");
+        monitor.stop();
         assert!(monitor.snapshot.sampled_at.is_none());
     }
     #[test]

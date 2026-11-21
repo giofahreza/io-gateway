@@ -2612,6 +2612,7 @@ fn render_system(
         match sample.gpu_source {
             super::system_metrics::GpuSource::IntelClients => "Intel · *readable clients".into(),
             super::system_metrics::GpuSource::IntelPmu => "Intel · system-wide".into(),
+            super::system_metrics::GpuSource::MacIoreg => "Apple · shared memory".into(),
             _ => format!("VRAM {}", capacity(sample.vram)),
         },
         "used / total".into(),

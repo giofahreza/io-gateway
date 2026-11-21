@@ -33,7 +33,9 @@ The full-frame room has no outer padding or below-cat status squares/quota bars.
 Local-machine hardware telemetry lives in `../system_metrics.rs`, starts only
 in the visible animated Overview, and samples off-thread once per second.
 Linux CPU/RAM/root-capacity/physical-disk I/O/default-interface traffic use kernel
-counters; AMD sysfs and bounded `nvidia-smi` provide best-effort GPU/VRAM.
+counters; AMD sysfs and bounded `nvidia-smi` provide best-effort GPU/VRAM. macOS
+uses its bundled `top`, `vm_stat`, `df`, `netstat`, route, and I/O Registry
+counters for the same local readings, including Apple GPU utilization.
 Unsupported platforms/counters show `N/A`; no new runtime dependency is required.
 The café host draws a single wall-mounted, five-unit server cabinet with shared
 rails, handles and patch cables. Readings live inside the units; CPU/GPU fans,
