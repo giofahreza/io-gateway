@@ -655,6 +655,7 @@ struct TuiApp {
     command_modal_scroll: usize,
     show_account_details: bool,
     account_details_scroll: usize,
+    show_model_details: bool,
     show_api_key_details: bool,
     api_key_details_scroll: usize,
     show_api_key_reveal: bool,
@@ -1348,7 +1349,8 @@ async fn run_tui_loop(
         if app.confirmation_modal.is_some() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => app.confirm_selection(),
-                KeyCode::Char('n')
+                KeyCode::Esc
+                | KeyCode::Char('n')
                 | KeyCode::Char('q')
                 | KeyCode::Char('Q')
                 | KeyCode::Char('?') => app.cancel_confirmation(),
@@ -1429,6 +1431,19 @@ async fn run_tui_loop(
             }
             continue;
         }
+        if app.show_model_details {
+            match key.code {
+                KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Char('?')
+                | KeyCode::Char('q')
+                | KeyCode::Char('Q') => {
+                    app.show_model_details = false;
+                }
+                _ => {}
+            }
+            continue;
+        }
         if app.show_command_modal {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Char('Q') => {
@@ -1483,14 +1498,11 @@ async fn run_tui_loop(
                 } else if app.tab == Tab::Notifications {
                     app.toggle_selected_notification_account();
                 } else {
-                    app.open_selected_account_details();
+                    app.open_selected_overview_details();
                 }
             }
             KeyCode::Esc => {}
-            KeyCode::Char('v')
-                if app.tab == Tab::Overview
-                    && app.overview_section == OverviewSection::AccountUsage =>
-            {
+            KeyCode::Char('v') if app.tab == Tab::Overview => {
                 app.hide_selected_usage_account();
             }
             KeyCode::Char('r' | 'R') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1507,10 +1519,7 @@ async fn run_tui_loop(
             KeyCode::Char('a') if app.tab == Tab::Notifications => {
                 app.set_all_notification_accounts(true);
             }
-            KeyCode::Char('a')
-                if app.tab == Tab::Overview
-                    && app.overview_section == OverviewSection::AccountUsage =>
-            {
+            KeyCode::Char('a') if app.tab == Tab::Overview => {
                 let selected_account_index = selected_overview_account_index(&app);
                 app.limit_display_mode.toggle();
                 app.selected = selected_account_index
@@ -1523,9 +1532,7 @@ async fn run_tui_loop(
             KeyCode::Char('u') => {
                 if app.tab == Tab::Notifications {
                     app.set_all_notification_accounts(false);
-                } else if app.tab == Tab::Overview
-                    && app.overview_section == OverviewSection::AccountUsage
-                {
+                } else if app.tab == Tab::Overview {
                     app.show_all_usage_filters();
                 }
             }
@@ -1565,10 +1572,7 @@ async fn run_tui_loop(
                     access,
                 });
             }
-            KeyCode::Char('n')
-                if app.tab == Tab::Overview
-                    && app.overview_section == OverviewSection::AccountUsage =>
-            {
+            KeyCode::Char('n') if app.tab == Tab::Overview => {
                 if let Err(error) = app.begin_add_account(terminal) {
                     app.message = error;
                 }
@@ -1584,26 +1588,17 @@ async fn run_tui_loop(
             KeyCode::Char('w') | KeyCode::Char(' ') if app.tab == Tab::Notifications => {
                 app.toggle_selected_notification_account();
             }
-            KeyCode::Char('i')
-                if app.tab == Tab::Overview
-                    && app.overview_section == OverviewSection::AccountUsage =>
-            {
+            KeyCode::Char('i') if app.tab == Tab::Overview => {
                 if let Err(error) = app.edit_selected_compatible_account(terminal) {
                     app.message = error;
                 }
             }
-            KeyCode::Char('s')
-                if app.tab == Tab::Overview
-                    && app.overview_section == OverviewSection::AccountUsage =>
-            {
+            KeyCode::Char('s') if app.tab == Tab::Overview => {
                 if let Err(error) = app.edit_claude_reset_policy(terminal) {
                     app.message = error;
                 }
             }
-            KeyCode::Char('z')
-                if app.tab == Tab::Overview
-                    && app.overview_section == OverviewSection::AccountUsage =>
-            {
+            KeyCode::Char('z') if app.tab == Tab::Overview => {
                 if let Err(error) = app.request_reset_confirmation(terminal) {
                     app.message = error;
                 }
@@ -1616,41 +1611,19 @@ async fn run_tui_loop(
             KeyCode::Char('e') if app.tab == Tab::Notifications => {
                 app.toggle_notifications_enabled();
             }
-            KeyCode::Char('e')
-                if app.tab == Tab::Overview
-                    && matches!(
-                        app.overview_section,
-                        OverviewSection::CustomModels | OverviewSection::AccountUsage
-                    ) =>
-            {
+            KeyCode::Char('e') if app.tab == Tab::Overview => {
                 app.enable_selected();
             }
-            KeyCode::Char('d')
-                if app.tab == Tab::Overview
-                    && matches!(
-                        app.overview_section,
-                        OverviewSection::CustomModels | OverviewSection::AccountUsage
-                    ) =>
-            {
+            KeyCode::Char('d') if app.tab == Tab::Overview => {
                 app.disable_selected();
             }
             KeyCode::Char('p') if app.tab == Tab::Notifications => {
                 app.toggle_selected_notification_provider();
             }
-            KeyCode::Char('p')
-                if app.tab == Tab::Overview
-                    && app.overview_section == OverviewSection::AccountUsage =>
-            {
+            KeyCode::Char('p') if app.tab == Tab::Overview => {
                 app.hide_selected_usage_provider();
             }
-            KeyCode::Char('x')
-                if app.tab == Tab::Keys
-                    || (app.tab == Tab::Overview
-                        && matches!(
-                            app.overview_section,
-                            OverviewSection::CustomModels | OverviewSection::AccountUsage
-                        )) =>
-            {
+            KeyCode::Char('x') if app.tab == Tab::Keys || app.tab == Tab::Overview => {
                 app.request_delete_confirmation();
             }
             KeyCode::Char('t') => {
@@ -1668,6 +1641,7 @@ impl TuiApp {
     fn has_modal(&self) -> bool {
         self.show_command_modal
             || self.show_account_details
+            || self.show_model_details
             || self.show_api_key_details
             || self.show_api_key_reveal
             || self.confirmation_modal.is_some()
@@ -1733,6 +1707,7 @@ impl TuiApp {
             command_modal_scroll: 0,
             show_account_details: false,
             account_details_scroll: 0,
+            show_model_details: false,
             show_api_key_details: false,
             api_key_details_scroll: 0,
             show_api_key_reveal: false,
@@ -1752,7 +1727,7 @@ impl TuiApp {
     }
 
     fn refresh_quota(&mut self, hard: bool) {
-        if !hard && self.overview_section != OverviewSection::AccountUsage {
+        if !hard && self.tab != Tab::Overview {
             self.message = "no focused account: use R to refresh all data".into();
             return;
         }
@@ -2493,7 +2468,7 @@ impl TuiApp {
     }
 
     fn move_selected_usage_account(&mut self, delta: isize) {
-        if self.tab != Tab::Overview || self.overview_section != OverviewSection::AccountUsage {
+        if self.tab != Tab::Overview {
             return;
         }
         let Some(selected) = selected_overview_usage_row(self) else {
@@ -2552,7 +2527,7 @@ impl TuiApp {
     }
 
     fn move_selected_usage_provider(&mut self, delta: isize) {
-        if self.tab != Tab::Overview || self.overview_section != OverviewSection::AccountUsage {
+        if self.tab != Tab::Overview {
             return;
         }
         let Some(selected) = selected_overview_usage_row(self) else {
@@ -2634,14 +2609,15 @@ impl TuiApp {
                 self.overview_model_selected =
                     moved_index(self.overview_model_selected, self.data.models.len(), delta);
             }
-            OverviewSection::AccountUsage => {
+            OverviewSection::Metrics
+            | OverviewSection::ContextUsage
+            | OverviewSection::AccountUsage => {
                 self.overview_account_selected = moved_index(
                     self.overview_account_selected,
                     overview_account_usage_account_count(self),
                     delta,
                 );
             }
-            _ => {}
         }
         self.sync_selected_from_overview_section();
     }
@@ -2721,6 +2697,21 @@ impl TuiApp {
             return self.data.models.get(self.overview_model_selected).cloned();
         }
         None
+    }
+
+    fn open_selected_overview_details(&mut self) {
+        if self.tab != Tab::Overview {
+            return;
+        }
+        if self.overview_section == OverviewSection::CustomModels {
+            if self.selected_model().is_some() {
+                self.show_model_details = true;
+            } else {
+                self.message = "no custom model selected".to_string();
+            }
+        } else {
+            self.open_selected_account_details();
+        }
     }
 
     fn open_selected_account_details(&mut self) {
@@ -3093,7 +3084,7 @@ impl TuiApp {
                 action: ConfirmationAction::RevokeApiKey { id: key.id.clone() },
             });
         } else if self.tab == Tab::Overview
-            && self.overview_section == OverviewSection::AccountUsage
+            && self.overview_section != OverviewSection::CustomModels
         {
             let Some(account) = self.selected_account() else {
                 return;
@@ -3109,9 +3100,7 @@ impl TuiApp {
                     file_name: account.file_name,
                 },
             });
-        } else if self.tab == Tab::Overview
-            && self.overview_section == OverviewSection::CustomModels
-        {
+        } else if self.tab == Tab::Overview {
             let Some(model) = self.selected_model() else {
                 return;
             };
@@ -3429,17 +3418,8 @@ fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp) {
             " ? commands | tab switch | j/k move | r refresh | n new key | Enter details | e edit | x revoke "
                 .to_string()
         } else {
-            let section_hint = match app.overview_section {
-                OverviewSection::AccountUsage => format!(
-                    "a quota: {} | n add account | i edit API | e/d enable/disable | x delete",
-                    app.limit_display_mode.label()
-                ),
-                OverviewSection::CustomModels => "e/d enable/disable | x delete".to_string(),
-                _ => "".to_string(),
-            };
             format!(
-                " ? commands | tab switch | h/l section | j/k move | r account | R all | Ctrl+R hard | o login | {} ",
-                section_hint
+                " ? commands | tab switch | h/l section | j/k move | r account | R all | Ctrl+R hard | a quota | n add | e/d toggle | x delete | o login "
             )
         }
     } else {
@@ -3610,6 +3590,9 @@ fn draw_tui_modals(frame: &mut Frame<'_>, app: &TuiApp) {
     }
     if app.show_account_details {
         draw_account_details_modal(frame, frame.area(), app);
+    }
+    if app.show_model_details {
+        draw_model_details_modal(frame, frame.area(), app);
     }
     if app.show_api_key_details {
         draw_api_key_details_modal(frame, frame.area(), app);
@@ -5140,60 +5123,57 @@ fn command_modal_rows(app: &TuiApp) -> Vec<(String, String)> {
                     )
                 },
             ));
-            match app.overview_section {
-                OverviewSection::Metrics => {
-                    rows.push((String::new(), "METRICS".to_string()));
-                }
-                OverviewSection::ContextUsage => {
-                    rows.push((String::new(), "CONTEXT USAGE".to_string()));
-                }
-                OverviewSection::CustomModels => {
-                    rows.push((String::new(), "CUSTOM MODELS".to_string()));
-                    rows.push(("j/k · Up/Down".to_string(), "select a model".to_string()));
-                    rows.push(("e".to_string(), "enable selected model".to_string()));
-                    rows.push(("d".to_string(), "disable selected model".to_string()));
-                    rows.push(("x".to_string(), "delete selected model".to_string()));
-                }
-                OverviewSection::AccountUsage => {
-                    rows.push((String::new(), "ACCOUNT USAGE".to_string()));
-                    rows.push(("j/k · Up/Down".to_string(), "select an account".to_string()));
-                    rows.push((
-                        "Ctrl+j/k/Enter".to_string(),
-                        "reorder selected account within its provider".to_string(),
-                    ));
-                    rows.push((
-                        "Ctrl+Up/Down".to_string(),
-                        "reorder selected provider".to_string(),
-                    ));
-                    rows.push(("Enter".to_string(), "show account details".to_string()));
-                    rows.push((
-                        "s".to_string(),
-                        "edit Claude automatic reset policy (confirmation required)".to_string(),
-                    ));
-                    rows.push((
-                        "z".to_string(),
-                        "select a Codex/Claude limit reset (confirmation required)".to_string(),
-                    ));
-                    rows.push((
-                        "n".to_string(),
-                        "add an account (choose provider)".to_string(),
-                    ));
-                    rows.push((
-                        "a".to_string(),
-                        format!("toggle quota view ({})", app.limit_display_mode.label()),
-                    ));
-                    rows.push((
-                        "i".to_string(),
-                        "edit compatible API name, URLs, key, and models".to_string(),
-                    ));
-                    rows.push(("e".to_string(), "enable selected account".to_string()));
-                    rows.push(("d".to_string(), "disable selected account".to_string()));
-                    rows.push(("p".to_string(), "hide selected provider".to_string()));
-                    rows.push(("v".to_string(), "hide selected account".to_string()));
-                    rows.push(("u".to_string(), "show all hidden account rows".to_string()));
-                    rows.push(("x".to_string(), "delete selected account".to_string()));
-                }
-            }
+            rows.push((String::new(), "OVERVIEW ACTIONS".to_string()));
+            rows.push((
+                "j/k · Up/Down".to_string(),
+                "select the focused account or custom model".to_string(),
+            ));
+            rows.push((
+                "Enter".to_string(),
+                "show details for the focused account or custom model".to_string(),
+            ));
+            rows.push((
+                "Ctrl+j/k/Enter".to_string(),
+                "on an account: reorder it within its provider".to_string(),
+            ));
+            rows.push((
+                "Ctrl+Up/Down".to_string(),
+                "on an account: reorder its provider".to_string(),
+            ));
+            rows.push((
+                "n".to_string(),
+                "add an account (choose provider)".to_string(),
+            ));
+            rows.push((
+                "a".to_string(),
+                format!("toggle quota view ({})", app.limit_display_mode.label()),
+            ));
+            rows.push((
+                "i".to_string(),
+                "edit the selected compatible account".to_string(),
+            ));
+            rows.push((
+                "e/d".to_string(),
+                "enable/disable the focused account or model".to_string(),
+            ));
+            rows.push((
+                "s".to_string(),
+                "edit Claude automatic reset policy (confirmation required)".to_string(),
+            ));
+            rows.push((
+                "z".to_string(),
+                "select a Codex/Claude limit reset (confirmation required)".to_string(),
+            ));
+            rows.push((
+                "p".to_string(),
+                "hide the selected account's provider".to_string(),
+            ));
+            rows.push(("v".to_string(), "hide the selected account".to_string()));
+            rows.push(("u".to_string(), "show all hidden account rows".to_string()));
+            rows.push((
+                "x".to_string(),
+                "delete the focused account or custom model".to_string(),
+            ));
         }
         Tab::Keys => {
             rows.push((String::new(), "API KEYS".to_string()));
@@ -5541,6 +5521,36 @@ fn draw_account_details_modal(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             .style(btop_style())
             .block(btop_block_with_border("Account Details", BTOP_MEM_BOX))
             .scroll((scroll, 0)),
+        modal,
+    );
+}
+
+fn draw_model_details_modal(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let Some(model) = app.selected_model() else {
+        return;
+    };
+    let lines = vec![
+        detail_line("Alias", display_or(&model.alias, "not reported")),
+        detail_line("Name", display_or(&model.display_name, "not reported")),
+        detail_line("Model ID", display_or(&model.id, "not reported")),
+        detail_line("Status", if model.enabled { "Enabled" } else { "Disabled" }),
+        detail_line("Routes", model.routes.to_string()),
+        detail_line("Targets", model.targets.to_string()),
+        Line::from(vec![
+            Span::styled("Enter/Esc/q", btop_header_style()),
+            Span::raw(" close details"),
+        ]),
+    ];
+    let modal = centered_rect(area, 72, 12);
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(btop_style())
+            .block(btop_block_with_border(
+                "Custom Model Details",
+                BTOP_PROC_BOX,
+            ))
+            .wrap(Wrap { trim: false }),
         modal,
     );
 }
@@ -9443,7 +9453,7 @@ mod tests {
     }
 
     #[test]
-    fn command_modal_keymaps_follow_the_active_section() {
+    fn command_modal_keymaps_are_global_across_overview_sections() {
         let mut app =
             TuiApp::new(GatewayClient::new("http://127.0.0.1:1".to_string()).unwrap()).unwrap();
 
@@ -9455,17 +9465,23 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        app.overview_section = OverviewSection::AccountUsage;
-        let account_usage = keys(&app);
-        assert!(account_usage.iter().any(|key| key == "Ctrl+j/k/Enter"));
-        assert!(account_usage.iter().any(|key| key == "x"));
-        assert!(account_usage.iter().any(|key| key == "n"));
-
-        app.overview_section = OverviewSection::CustomModels;
-        let models = keys(&app);
-        assert!(models.iter().any(|key| key == "e"));
-        assert!(models.iter().any(|key| key == "x"));
-        assert!(!models.iter().any(|key| key == "Ctrl+j/k/Enter"));
+        for section in [
+            OverviewSection::Metrics,
+            OverviewSection::ContextUsage,
+            OverviewSection::CustomModels,
+            OverviewSection::AccountUsage,
+        ] {
+            app.overview_section = section;
+            let overview = keys(&app);
+            for key in ["Enter", "n", "a", "i", "e/d", "s", "z", "p", "v", "u", "x"] {
+                assert!(
+                    overview.iter().any(|candidate| candidate == key),
+                    "{} is missing {key}",
+                    section.title()
+                );
+            }
+            assert!(overview.iter().any(|key| key == "Ctrl+j/k/Enter"));
+        }
 
         app.tab = Tab::Keys;
         let api_keys = keys(&app);

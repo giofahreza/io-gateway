@@ -2209,7 +2209,7 @@ fn render_scene(
     for (index, text) in [
         details.as_str(),
         notice.unwrap_or(&quota),
-        "h/l ←/→ cats · b bubbles · t theme · r account · R all · Ctrl+R hard · ? keys · Space pause · F4/Esc UI",
+        "h/l ←/→ cats · j/k item · b bubbles · t theme · a quota · n add · e/d toggle · x delete · r account · R all · Ctrl+R hard · ? keys · Space pause · F4/Esc UI",
     ]
     .into_iter()
     .enumerate()
@@ -4834,7 +4834,7 @@ mod tests {
 
     #[test]
     fn model_cat_navigation_never_targets_a_credential_and_normal_sections_still_work() {
-        use super::super::{AccountRow, GatewayClient, OverviewSection, TuiApp};
+        use super::super::{AccountRow, GatewayClient, ModelRow, OverviewSection, TuiApp};
         let mut app =
             TuiApp::new(GatewayClient::new("http://127.0.0.1:1".into()).unwrap()).unwrap();
         app.hidden_usage_accounts.clear();
@@ -4856,14 +4856,28 @@ mod tests {
         assert!(app.animation.models_focused());
         app.open_selected_account_details();
         assert!(!app.show_account_details);
+        app.data.models.push(ModelRow {
+            alias: "model-one".into(),
+            id: "model-one".into(),
+            ..Default::default()
+        });
+        app.open_selected_overview_details();
+        assert!(app.show_model_details);
+        app.show_model_details = false;
         app.refresh_quota(false);
-        assert!(app.message.contains("no focused account"));
+        assert!(app.message.contains("admin login required"));
         app.enable_selected();
         assert!(!app.network.command_pending());
         app.disable_selected();
         assert!(!app.network.command_pending());
         app.request_delete_confirmation();
-        assert!(app.confirmation_modal.is_none());
+        assert_eq!(
+            app.confirmation_modal
+                .as_ref()
+                .map(|modal| modal.title.as_str()),
+            Some("Delete Custom Model")
+        );
+        app.cancel_confirmation();
         app.animation.move_cat(1);
         app.sync_from_animated_cat();
         assert!(app.overview_section == OverviewSection::AccountUsage);
