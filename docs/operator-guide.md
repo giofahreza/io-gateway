@@ -566,6 +566,14 @@ All client requests use `Authorization: Bearer <IO_GATEWAY_KEY>`.
 | `GET /codex/models` | Codex-path model catalog |
 | `POST /codex/responses` | Codex-path Responses API |
 
+Model pickers can request `GET /codex/models?view=discovery` for a compact
+`{"models":[...]}` response containing only `id` (when present), `slug`,
+`display_name`, and `visibility`. It projects the same caller-scoped catalog,
+including aliases and custom models, without runtime instructions. Hidden entries
+retain their visibility marker so clients can filter them. Omit `view`, or use
+`view=full`, for the complete Codex runtime catalog. Codex CLI clients must keep
+using the full catalog; the discovery view is only for listing model choices.
+
 ### Admin endpoints (session cookie required)
 
 | Endpoint | Description |

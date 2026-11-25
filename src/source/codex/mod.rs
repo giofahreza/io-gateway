@@ -4,6 +4,7 @@ use serde_json::{Map, Value};
 
 use crate::source::{RouteError, RoutedRequest, TargetModel};
 
+pub mod catalog;
 pub mod codex;
 pub mod response;
 pub mod route;
@@ -559,10 +560,13 @@ mod tests {
     }
 }
 
-/// Lists raw upstream Codex models without OpenAI compatibility translation.
+/// Lists full Codex runtime metadata, or an explicit compact discovery view.
 #[utoipa::path(
     get,
     path = "/codex/models",
+    params(
+        ("view" = Option<String>, Query, description = "Use discovery for IDs, labels and visibility only; omitted or full preserves the runtime catalog")
+    ),
     security(("bearer_auth" = [])),
     responses(
         (

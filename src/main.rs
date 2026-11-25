@@ -17294,7 +17294,7 @@ async fn proxy(
                 // building that catalog, not only the raw Codex fetcher.
                 None,
             );
-            return codex_models_response(state, headers, &authenticated.access).await;
+            return codex_models_response(state, headers, &uri, &authenticated.access).await;
         }
         TargetModel::UnifiedV1Models => {
             // See the matching Codex catalog branch above. A model catalog
@@ -17876,6 +17876,10 @@ async fn proxy(
                 }
             };
             let body_bytes = augment_codex_models_json(&body_bytes, &state, &authenticated.access);
+            let body_bytes = match source::codex::catalog::response_body(body_bytes, &uri) {
+                Ok(body) => body,
+                Err(message) => return (StatusCode::BAD_GATEWAY, message).into_response(),
+            };
             let mut headers = out_headers;
             headers.insert(
                 axum::http::header::CONTENT_TYPE,
@@ -22291,6 +22295,7 @@ fn anthropic_error_type_for_status(status: StatusCode) -> &'static str {
 async fn codex_models_response(
     state: AppState,
     headers: HeaderMap,
+    uri: &axum::http::Uri,
     access: &api_keys::ApiKeyAccess,
 ) -> axum::response::Response {
     let body_bytes = if access.all {
@@ -22303,6 +22308,10 @@ async fn codex_models_response(
     }
     .unwrap_or_else(|| Bytes::from_static(br#"{"models":[]}"#));
     let body_bytes = augment_codex_models_json(&body_bytes, &state, access);
+    let body_bytes = match source::codex::catalog::response_body(body_bytes, uri) {
+        Ok(body) => body,
+        Err(message) => return (StatusCode::BAD_GATEWAY, message).into_response(),
+    };
     (
         StatusCode::OK,
         [("Content-Type", "application/json")],
