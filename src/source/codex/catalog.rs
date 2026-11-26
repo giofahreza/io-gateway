@@ -2,6 +2,70 @@ use axum::http::Uri;
 use bytes::Bytes;
 use serde_json::Value;
 
+/// Read each permitted account's live Claude catalog independently. A global
+/// provider cache could expose models discovered through an unauthorized
+/// account. Bound the whole fetch so a slow provider cannot block model pickers.
+pub(crate) async fn claude_models(
+    state: &crate::AppState,
+    access: &crate::api_keys::ApiKeyAccess,
+) -> Vec<Value> {
+    let accounts = state
+        .claude_accounts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|account| {
+            account.enabled
+                && crate::api_key_rule_allows_account(access, "claude", |selector| {
+                    crate::claude_account_matches_api_key_account(account, selector)
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let catalogs = futures_util::future::join_all(accounts.iter().map(|account| async {
+        tokio::time::timeout(crate::MODEL_LIST_TIMEOUT, async {
+            let token = crate::target::claude::auth::ensure_access_token(state, account).await?;
+            let base = crate::target::claude::auth::api_base_url(account.api_base_url.as_deref());
+            crate::target::claude::auth::fetch_models(&state.client, &token, &base).await
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_else(|| account.models.clone())
+    }))
+    .await;
+
+    catalogs
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let id = model.id.trim();
+            let id = id.strip_prefix("cld:").unwrap_or(id);
+            if id.is_empty() || id.contains(':') || id.chars().any(char::is_whitespace) {
+                return None;
+            }
+            let slug = format!("cld:{id}");
+            let label = model
+                .display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or(id);
+            // Use Claude's baseline context size. The Responses adapter does
+            // not map Codex reasoning levels to Anthropic thinking controls.
+            Some(crate::codex_provider_model(
+                &slug,
+                label,
+                "Claude model routed through the configured Claude subscription account.",
+                200_000,
+                false,
+                true,
+            ))
+        })
+        .collect()
+}
+
 /// Discovery is an explicit projection of the already scoped, augmented Codex
 /// catalog. The default response remains byte-for-byte intact for CLI clients.
 pub fn response_body(body: Bytes, uri: &Uri) -> Result<Bytes, &'static str> {

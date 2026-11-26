@@ -17875,7 +17875,8 @@ async fn proxy(
                     return (StatusCode::BAD_GATEWAY, "upstream error").into_response();
                 }
             };
-            let body_bytes = augment_codex_models_json(&body_bytes, &state, &authenticated.access);
+            let body_bytes =
+                augment_codex_models_json(&body_bytes, &state, &authenticated.access).await;
             let body_bytes = match source::codex::catalog::response_body(body_bytes, &uri) {
                 Ok(body) => body,
                 Err(message) => return (StatusCode::BAD_GATEWAY, message).into_response(),
@@ -22307,7 +22308,7 @@ async fn codex_models_response(
         fetch_raw_codex_models_body(&state, &headers).await
     }
     .unwrap_or_else(|| Bytes::from_static(br#"{"models":[]}"#));
-    let body_bytes = augment_codex_models_json(&body_bytes, &state, access);
+    let body_bytes = augment_codex_models_json(&body_bytes, &state, access).await;
     let body_bytes = match source::codex::catalog::response_body(body_bytes, uri) {
         Ok(body) => body,
         Err(message) => return (StatusCode::BAD_GATEWAY, message).into_response(),
@@ -27124,7 +27125,7 @@ fn is_hop_header(name: &str) -> bool {
     )
 }
 
-fn augment_codex_models_json(
+async fn augment_codex_models_json(
     body: &Bytes,
     state: &AppState,
     access: &api_keys::ApiKeyAccess,
@@ -27151,7 +27152,11 @@ fn augment_codex_models_json(
         .map(|slug| slug.to_string())
         .collect::<HashSet<_>>();
 
-    for model in codex_provider_model_metadata(state, access) {
+    let claude_models = source::codex::catalog::claude_models(state, access).await;
+    for model in codex_provider_model_metadata(state, access)
+        .into_iter()
+        .chain(claude_models)
+    {
         let Some(slug) = model.get("slug").and_then(|value| value.as_str()) else {
             continue;
         };

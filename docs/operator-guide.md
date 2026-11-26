@@ -1311,6 +1311,12 @@ curl -sS http://127.0.0.1:8319/login/claude/start \
 
 Access tokens are refreshed automatically when they expire.
 
+Enabled Claude accounts also contribute `cld:` models to `/codex/models`,
+including its compact `?view=discovery` response used by Workbench. Discovery
+reads only accounts permitted by the caller's gateway key, uses live model lists,
+and falls back to each account's saved models if its model list is unavailable.
+Claude models can therefore be selected in a Codex chat using IO Gateway.
+
 ```bash
 curl http://127.0.0.1:8319/v1/responses \
   -H "Authorization: Bearer $IO_GATEWAY_KEY" \
