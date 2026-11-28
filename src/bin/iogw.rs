@@ -2,7 +2,10 @@ use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -34,6 +37,10 @@ use std::{
 mod animated;
 #[path = "../provider_quota_summary.rs"]
 mod provider_quota_summary;
+#[path = "iogw/scene3d.rs"]
+mod scene3d;
+#[path = "iogw/sixel.rs"]
+mod sixel;
 #[path = "iogw/system_metrics.rs"]
 mod system_metrics;
 #[path = "iogw/tui_network.rs"]
@@ -143,7 +150,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Open the interactive terminal UI.
-    Tui,
+    Tui(TuiArgs),
     /// Install, inspect or remove optional animated UI scene packs.
     Plugins(animated::PluginsCommand),
     /// Create and store an admin session cookie.
@@ -166,6 +173,13 @@ enum Command {
     Notifications(NotificationsCommand),
     /// Call a raw gateway path.
     Raw(RawArgs),
+}
+
+#[derive(Args, Debug, Default)]
+struct TuiArgs {
+    /// Start the optional interactive Panda3D GPU overview (F5 also toggles it).
+    #[arg(long = "3d")]
+    scene3d: bool,
 }
 
 #[derive(Args, Debug)]
@@ -665,6 +679,7 @@ struct TuiApp {
     message: String,
     network: TuiNetwork,
     animation: animated::Animation,
+    scene3d: Option<scene3d::Scene>,
 }
 
 #[tokio::main]
@@ -682,8 +697,8 @@ async fn run() -> Result<(), String> {
         return print_response(cli.json, animated::command(command)?);
     }
     let mut client = GatewayClient::new(resolve_base_url(cli.base_url.as_deref()))?;
-    match cli.command.unwrap_or(Command::Tui) {
-        Command::Tui => run_tui(client).await,
+    match cli.command.unwrap_or(Command::Tui(TuiArgs::default())) {
+        Command::Tui(args) => run_tui(client, args.scene3d).await,
         Command::Plugins(_) => unreachable!("handled before gateway initialization"),
         Command::Login(args) => {
             let otp = match args.otp {
@@ -1228,15 +1243,21 @@ async fn command_raw(
     }
 }
 
-async fn run_tui(client: GatewayClient) -> Result<(), String> {
+async fn run_tui(client: GatewayClient, start_3d: bool) -> Result<(), String> {
     enable_raw_mode().map_err(|err| err.to_string())?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, cursor::Hide).map_err(|err| err.to_string())?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(|err| err.to_string())?;
-    let result = run_tui_loop(&mut terminal, client).await;
+    let result = run_tui_loop(&mut terminal, client, start_3d).await;
     disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show).ok();
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        cursor::Show
+    )
+    .ok();
     terminal.show_cursor().ok();
     result
 }
@@ -1246,11 +1267,29 @@ fn animation_toggle_key(key: KeyEvent) -> bool {
         || (key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
+fn scene3d_toggle_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::F(5)
+        || (key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+/// A left press in the 3D scene, selecting on release unless the mouse moved.
+struct MouseDrag {
+    start: (u16, u16),
+    last: (u16, u16),
+    moved: bool,
+}
+
 async fn run_tui_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     client: GatewayClient,
+    start_3d: bool,
 ) -> Result<(), String> {
     let mut app = TuiApp::new(client)?;
+    if start_3d {
+        app.toggle_3d();
+    }
+    let mut mouse_captured = false;
+    let mut mouse_drag: Option<MouseDrag> = None;
     let mut last_draw = Instant::now() - Duration::from_millis(250);
     loop {
         app.poll_network();
@@ -1259,6 +1298,22 @@ async fn run_tui_loop(
         if animated_overview {
             let size = terminal.size().map_err(|err| err.to_string())?;
             app.animation.resize(size.width, size.height);
+            app.update_3d(Rect::new(0, 0, size.width, size.height));
+        }
+        let capture_mouse = app.scene3d.is_some() && app.tab == Tab::Overview;
+        if capture_mouse != mouse_captured {
+            if capture_mouse {
+                execute!(terminal.backend_mut(), EnableMouseCapture)
+                    .map_err(|err| err.to_string())?;
+            } else {
+                execute!(terminal.backend_mut(), DisableMouseCapture)
+                    .map_err(|err| err.to_string())?;
+            }
+            mouse_captured = capture_mouse;
+        }
+        if mouse_captured && app.pending_account_login.is_some() {
+            execute!(terminal.backend_mut(), DisableMouseCapture).map_err(|err| err.to_string())?;
+            mouse_captured = false;
         }
         app.continue_pending_account_login(terminal)?;
         let frame_ms = if animated_overview && !app.animation.paused {
@@ -1268,9 +1323,20 @@ async fn run_tui_loop(
         };
         let interval = Duration::from_millis(frame_ms);
         if !animated_overview || last_draw.elapsed() >= interval {
-            terminal
+            let completed = terminal
                 .draw(|frame| draw_tui(frame, &app))
                 .map_err(|err| err.to_string())?;
+            // Pixel-accurate 3D draws its image after ratatui has written the text.
+            if let Some(scene) = &app.scene3d {
+                if animated_overview {
+                    scene.note_coverage(completed.buffer);
+                    scene
+                        .present(terminal.backend_mut())
+                        .map_err(|err| err.to_string())?;
+                } else {
+                    scene.suspend();
+                }
+            }
             last_draw = Instant::now();
         }
         if !event::poll(interval.saturating_sub(last_draw.elapsed()))
@@ -1278,8 +1344,68 @@ async fn run_tui_loop(
         {
             continue;
         }
-        let Event::Key(key) = event::read().map_err(|err| err.to_string())? else {
-            continue;
+        let key = match event::read().map_err(|err| err.to_string())? {
+            Event::Mouse(mouse) if capture_mouse && !app.has_modal() => {
+                match mouse.kind {
+                    // A press arms a click; moving the mouse first turns it into a drag
+                    // that orbits and tilts the camera instead of selecting.
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let at = (mouse.column, mouse.row);
+                        mouse_drag = Some(MouseDrag {
+                            start: at,
+                            last: at,
+                            moved: false,
+                        });
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        if let (Some(drag), Some(scene)) = (&mut mouse_drag, &mut app.scene3d) {
+                            drag.moved |= mouse.column.abs_diff(drag.start.0) >= 2
+                                || mouse.row.abs_diff(drag.start.1) >= 2;
+                            if drag.moved {
+                                scene.drag(
+                                    i32::from(mouse.column) - i32::from(drag.last.0),
+                                    i32::from(mouse.row) - i32::from(drag.last.1),
+                                );
+                                drag.last = (mouse.column, mouse.row);
+                            }
+                        }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        if mouse_drag.take().is_some_and(|drag| !drag.moved) {
+                            if let Some(target) = app
+                                .scene3d
+                                .as_ref()
+                                .and_then(|scene| scene.pick(mouse.column, mouse.row))
+                            {
+                                app.select_3d_target(target);
+                            }
+                        }
+                    }
+                    MouseEventKind::ScrollUp => {
+                        if let Some(scene) = &mut app.scene3d {
+                            scene.camera(0., 0.92);
+                        }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        if let Some(scene) = &mut app.scene3d {
+                            scene.camera(0., 1.08);
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            Event::Key(key) => {
+                // Shared actions can open line-entry prompts outside the TUI.
+                // The next loop restores capture if the 3D view is still visible.
+                if mouse_captured {
+                    execute!(terminal.backend_mut(), DisableMouseCapture)
+                        .map_err(|err| err.to_string())?;
+                    mouse_captured = false;
+                }
+                key
+            }
+            _ => continue,
         };
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             continue;
@@ -1287,7 +1413,14 @@ async fn run_tui_loop(
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(());
         }
+        if scene3d_toggle_key(key) && key.kind == KeyEventKind::Press && !app.has_modal() {
+            app.toggle_3d();
+            continue;
+        }
         if animation_toggle_key(key) && key.kind == KeyEventKind::Press {
+            if app.scene3d.is_some() {
+                app.exit_3d();
+            }
             if let Err(error) = app.animation.toggle() {
                 app.message = error;
             } else if app.animation.active {
@@ -1301,8 +1434,34 @@ async fn run_tui_loop(
         // Modals and every ordinary Overview action use the shared dispatcher
         // below. Only scene-specific, otherwise-unused shortcuts are intercepted.
         if animated_overview && !app.has_modal() {
+            if let Some(scene) = &mut app.scene3d {
+                match key.code {
+                    KeyCode::Char('[') => {
+                        scene.camera(-0.10, 1.);
+                        continue;
+                    }
+                    KeyCode::Char(']') => {
+                        scene.camera(0.10, 1.);
+                        continue;
+                    }
+                    KeyCode::Char('+') | KeyCode::Char('=') => {
+                        scene.camera(0., 0.92);
+                        continue;
+                    }
+                    KeyCode::Char('-') => {
+                        scene.camera(0., 1.08);
+                        continue;
+                    }
+                    KeyCode::Char('0') => {
+                        scene.reset_camera();
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             match key.code {
                 KeyCode::Esc => {
+                    app.scene3d = None;
                     app.animation.exit();
                     continue;
                 }
@@ -1311,6 +1470,10 @@ async fn run_tui_loop(
                     continue;
                 }
                 KeyCode::Char('t') if key.kind == KeyEventKind::Press => {
+                    if app.scene3d.is_some() {
+                        app.message = "3D Café · F4 pixel themes · F5 normal UI".into();
+                        continue;
+                    }
                     app.animation.cycle_theme();
                     continue;
                 }
@@ -1335,6 +1498,8 @@ async fn run_tui_loop(
                 }
                 KeyCode::PageDown | KeyCode::PageUp | KeyCode::Home | KeyCode::End => {
                     match key.code {
+                        KeyCode::PageDown if app.scene3d.is_some() => app.animation.page_3d(1),
+                        KeyCode::PageUp if app.scene3d.is_some() => app.animation.page_3d(-1),
                         KeyCode::PageDown => app.animation.turn_page(1),
                         KeyCode::PageUp => app.animation.turn_page(-1),
                         KeyCode::Home => app.animation.first(),
@@ -1686,6 +1851,69 @@ impl TuiApp {
         self.message.clear();
     }
 
+    fn toggle_3d(&mut self) {
+        if self.scene3d.is_some() {
+            self.exit_3d();
+            return;
+        }
+        match scene3d::Scene::new() {
+            Ok(scene) => {
+                self.animation.exit();
+                self.animation.enter_3d();
+                self.scene3d = Some(scene);
+                self.tab = Tab::Overview;
+                self.clamp_selection();
+                self.animation.observe(&self.data);
+                self.sync_animated_accounts();
+                self.message.clear();
+            }
+            Err(error) => self.message = error,
+        }
+    }
+
+    fn exit_3d(&mut self) {
+        self.scene3d = None;
+        self.animation.exit();
+    }
+
+    fn update_3d(&mut self, area: Rect) {
+        if self.scene3d.is_none() {
+            return;
+        }
+        let view = self.animation.view_3d(&self.data);
+        let result = self.scene3d.as_mut().unwrap().update(area, view);
+        if let Err(error) = result {
+            self.exit_3d();
+            self.message = error;
+        }
+    }
+
+    fn select_3d_target(&mut self, target: scene3d::Target) {
+        match target {
+            scene3d::Target::Models => self.overview_section = OverviewSection::CustomModels,
+            scene3d::Target::Account { provider, key } => {
+                // Resolve the displayed identity again against the CURRENT
+                // filtered order. A stale frame never becomes another account.
+                let index = overview_account_usage_account_rows(self)
+                    .iter()
+                    .position(|row| {
+                        self.data
+                            .accounts
+                            .get(row.account_index)
+                            .is_some_and(|account| {
+                                account.provider == provider && account.key == key
+                            })
+                    });
+                let Some(index) = index else { return };
+                self.overview_section = OverviewSection::AccountUsage;
+                self.overview_account_selected = index;
+            }
+        }
+        self.sync_selected_from_overview_section();
+        self.sync_animated_accounts();
+        self.message.clear();
+    }
+
     fn new(client: GatewayClient) -> Result<Self, String> {
         let preferences_path = preferences_path(&client.base_url)?;
         let preferences = load_tui_preferences(&preferences_path);
@@ -1717,6 +1945,7 @@ impl TuiApp {
             message: String::new(),
             network: TuiNetwork::new(),
             animation: animated::Animation::new(),
+            scene3d: None,
         })
     }
 
@@ -3358,11 +3587,33 @@ fn btop_plain_block() -> Block<'static> {
 
 fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp) {
     if app.animation.active && app.tab == Tab::Overview {
-        app.animation.draw(
-            frame,
-            app.network
-                .connection_label(Tab::Overview, &app.data.session),
-        );
+        let connection = app
+            .network
+            .connection_label(Tab::Overview, &app.data.session);
+        if let Some(scene) = &app.scene3d {
+            scene.draw(
+                frame,
+                connection,
+                app.animation.paused,
+                &app.animation.metrics_3d(),
+            );
+            if app.needs_login() {
+                let area = centered_rect(frame.area(), 58, 5);
+                frame.render_widget(Clear, area);
+                frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::from("Login required · [o] Log in"),
+                        Line::from("? help · F5 normal UI"),
+                        Line::from(app.message.as_str()),
+                    ])
+                    .style(btop_style())
+                    .block(btop_block_with_border("Gateway locked", BTOP_ATTENTION)),
+                    area,
+                );
+            }
+        } else {
+            app.animation.draw(frame, connection);
+        }
         draw_animated_overview_context(frame, app);
         draw_tui_modals(frame, app);
         return;
@@ -3431,6 +3682,9 @@ fn draw_tui(frame: &mut Frame<'_>, app: &TuiApp) {
     };
     if app.message.trim().is_empty() && animated::any_installed() {
         footer = format!(" F4 animated |{footer}");
+    }
+    if app.message.trim().is_empty() {
+        footer = format!(" F5 3D |{footer}");
     }
     let status = app.network.status(app.tab);
     frame.render_widget(
@@ -5107,6 +5361,23 @@ fn command_modal_rows(app: &TuiApp) -> Vec<(String, String)> {
             "animated Overview: switch theme · move in focused section".to_string(),
         ),
     );
+    rows.insert(
+        6,
+        (
+            "F5 / Ctrl+G".to_string(),
+            "switch to/from interactive 3D Café (requires Panda3D GPU)".to_string(),
+        ),
+    );
+    if app.scene3d.is_some() {
+        rows.insert(
+            7,
+            (
+                "Click · drag · [/] · +/- · 0".to_string(),
+                "3D: select actor · drag to orbit/tilt · [/] orbit · zoom (or wheel) · reset camera"
+                    .to_string(),
+            ),
+        );
+    }
 
     match app.tab {
         Tab::Overview => {
@@ -5784,6 +6055,7 @@ fn prompt_secret_in_terminal(
     execute!(terminal.backend_mut(), EnterAlternateScreen, cursor::Hide)
         .map_err(|e| e.to_string())?;
     terminal.clear().map_err(|e| e.to_string())?;
+    scene3d::screen_wiped();
     result
 }
 
@@ -5831,6 +6103,7 @@ fn prompt_in_terminal(
     execute!(io::stdout(), EnterAlternateScreen, cursor::Hide).map_err(|err| err.to_string())?;
     enable_raw_mode().map_err(|err| err.to_string())?;
     terminal.clear().map_err(|err| err.to_string())?;
+    scene3d::screen_wiped();
     value
 }
 
@@ -5847,6 +6120,7 @@ fn prompt_in_terminal_with_notice(
     execute!(io::stdout(), EnterAlternateScreen, cursor::Hide).map_err(|err| err.to_string())?;
     enable_raw_mode().map_err(|err| err.to_string())?;
     terminal.clear().map_err(|err| err.to_string())?;
+    scene3d::screen_wiped();
     value
 }
 
@@ -9176,6 +9450,119 @@ impl EmptyStringExt for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn three_d_startup_flag_is_explicit_and_existing_tui_command_still_parses() {
+        let cli = Cli::try_parse_from(["iogw", "tui", "--3d"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Tui(TuiArgs { scene3d: true }))
+        ));
+        let cli = Cli::try_parse_from(["iogw", "tui"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Tui(TuiArgs { scene3d: false }))
+        ));
+        assert!(Cli::try_parse_from(["iogw"]).unwrap().command.is_none());
+    }
+
+    #[test]
+    fn three_d_account_picks_follow_identity_across_reorder_filter_and_removal() {
+        let mut app =
+            TuiApp::new(GatewayClient::new("http://127.0.0.1:1".into()).unwrap()).unwrap();
+        app.hidden_usage_accounts.clear();
+        app.hidden_usage_providers.clear();
+        app.account_orders.clear();
+        app.data.accounts = (0..16)
+            .map(|index| AccountRow {
+                provider: "codex".into(),
+                key: format!("account-{index:02}"),
+                label: format!("Account {index:02}"),
+                enabled: true,
+                ..Default::default()
+            })
+            .collect();
+        app.animation.enter_3d();
+        app.animation.observe(&app.data);
+        app.sync_animated_accounts();
+        let target = scene3d::Target::Account {
+            provider: "codex".into(),
+            key: "account-04".into(),
+        };
+        app.select_3d_target(target.clone());
+        assert_eq!(app.selected_account().unwrap().key, "account-04");
+        app.data.accounts.reverse();
+        app.account_orders.insert(
+            "codex".into(),
+            vec!["account-04".into(), "account-01".into()],
+        );
+        app.animation.observe(&app.data);
+        app.sync_animated_accounts();
+        app.select_3d_target(target.clone());
+        assert_eq!(app.selected_account().unwrap().key, "account-04");
+        app.hidden_usage_accounts
+            .insert(("codex".into(), "account-04".into()));
+        app.clamp_overview_selections();
+        app.sync_animated_accounts();
+        let before = app.selected_account().unwrap().key;
+        app.select_3d_target(target.clone());
+        assert_eq!(app.selected_account().unwrap().key, before);
+        app.data
+            .accounts
+            .retain(|account| account.key != "account-04");
+        app.select_3d_target(target);
+        assert_eq!(app.selected_account().unwrap().key, before);
+        app.select_3d_target(scene3d::Target::Models);
+        assert!(app.selected_model().is_none()); // No models in this fixture.
+        assert!(matches!(
+            app.overview_section,
+            OverviewSection::CustomModels
+        ));
+    }
+
+    #[test]
+    fn three_d_uses_live_accounts_without_pixel_packs_and_pages_all_actors() {
+        let mut app =
+            TuiApp::new(GatewayClient::new("http://127.0.0.1:1".into()).unwrap()).unwrap();
+        app.hidden_usage_accounts.clear();
+        app.hidden_usage_providers.clear();
+        app.account_orders.clear();
+        app.data.accounts = (0..16)
+            .map(|index| AccountRow {
+                provider: "codex".into(),
+                key: format!("a{index:02}"),
+                label: format!("Account {index:02}"),
+                enabled: true,
+                ..Default::default()
+            })
+            .collect();
+        app.animation.enter_3d();
+        app.animation.observe(&app.data);
+        app.sync_animated_accounts();
+        app.animation.first();
+        let first = app.animation.view_3d(&app.data);
+        assert_eq!(first.avatars.len(), scene3d::PAGE_SIZE);
+        assert_eq!(first.avatars[0].target, scene3d::Target::Models);
+        let mut seen = first
+            .avatars
+            .iter()
+            .map(|avatar| avatar.target.clone())
+            .collect::<Vec<_>>();
+        for expected in [7, 3] {
+            app.animation.page_3d(1);
+            let page = app.animation.view_3d(&app.data);
+            assert_eq!(page.avatars.len(), expected);
+            seen.extend(page.avatars.iter().map(|avatar| avatar.target.clone()));
+        }
+        assert_eq!(seen.len(), 17);
+        app.animation.page_3d(1);
+        assert!(app.animation.models_focused());
+        app.animation.pause();
+        let a = app.animation.view_3d(&app.data);
+        let b = app.animation.view_3d(&app.data);
+        assert_eq!(a.time, b.time);
+        assert_eq!(a.avatars, b.avatars);
+    }
 
     #[test]
     fn qwen_cloud_type_follows_the_key_prefix() {

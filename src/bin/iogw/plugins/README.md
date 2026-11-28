@@ -1,6 +1,9 @@
 # Animated scene packs
 
 `pixel-cafe.json`, `pixel-office.json`, and `pixel-station.json` are independent optional artwork downloads.
+
+The separate **F5 / Ctrl+G** 3D mode uses an embedded mesh and a Panda3D GPU
+helper, rather than these packs. See [3D runtime setup and controls](../../../../docs/3d-tui.md).
 None is embedded in production `iogw` binaries. Install any combination:
 
 ```sh
@@ -114,7 +117,7 @@ python3 scripts/test-iogw-performance.py --binary target/release/iogw
 The ignored preview test writes HTML terminal frames to `target/iogw-previews/` for local
 visual review, including all three scenes, compact, tiny, empty and authentication states.
 Release CI copies the JSON into `iogw-pixel-cafe.json`, `iogw-pixel-office.json`, and `iogw-pixel-station.json` and includes all three in
-`SHA256SUMS`; normal archives and installers stay artwork-free.
+`SHA256SUMS`; these pixel-art JSON packs remain outside the normal archives.
 
 Visual inspiration: [Metrocity](https://github.com/Itz-Agasta/metrocity), an
 MIT-licensed terminal screensaver. This pack uses original sprites, no upstream

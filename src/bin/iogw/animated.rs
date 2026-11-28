@@ -423,6 +423,113 @@ impl Animation {
         Ok(())
     }
 
+    /// The built-in 3D scene shares account projection and clocks, but does not
+    /// need an installed pixel-art pack.
+    pub(super) fn enter_3d(&mut self) {
+        self.active = true;
+        self.notice = None;
+        self.monitor.start();
+        if std::env::var_os("IOGW_REDUCED_MOTION").is_some_and(|value| value == "1") && !self.paused
+        {
+            self.pause();
+        }
+    }
+
+    pub(super) fn page_3d(&mut self, delta: isize) {
+        let capacity = super::scene3d::PAGE_SIZE;
+        let pages = (self.order.len() + 1).div_ceil(capacity);
+        let page = (self.selected / capacity) as isize;
+        self.selected = (page + delta).rem_euclid(pages as isize) as usize * capacity;
+        self.resize(self.viewport.0, self.viewport.1);
+    }
+
+    pub(super) fn view_3d(&self, data: &GatewayData) -> super::scene3d::View {
+        use super::scene3d::{Avatar, Target, View, PAGE_SIZE};
+        let time = self.elapsed() as f32 / 1000.;
+        let start = self.selected / PAGE_SIZE * PAGE_SIZE;
+        let total = self.order.len() + 1;
+        let count = (total - start).min(PAGE_SIZE);
+        let rgb = |color| match color {
+            Color::Rgb(r, g, b) => [r as f32 / 255., g as f32 / 255., b as f32 / 255.],
+            _ => [0.65, 0.7, 0.75],
+        };
+        let avatars = (start..start + count)
+            .filter_map(|slot| {
+                let (account, target) = if slot == 0 {
+                    (&self.models_cat, Target::Models)
+                } else {
+                    let index = *self.order.get(slot - 1)?;
+                    let raw = data.accounts.get(index)?;
+                    (
+                        self.scene.get(index)?,
+                        Target::Account {
+                            provider: raw.provider.clone(),
+                            key: raw.key.clone(),
+                        },
+                    )
+                };
+                let walk = super::scene3d::walk(slot, time);
+                Some(Avatar {
+                    target,
+                    lines: account.label_lines(self.all_limits, slot == self.selected),
+                    position: [
+                        walk.position[0],
+                        0.04 + 0.012 * (time * 2. + slot as f32).sin(),
+                        walk.position[1],
+                    ],
+                    heading: walk.heading,
+                    gait: walk.gait,
+                    stride: walk.stride,
+                    color: if slot == 0 {
+                        [0.38, 0.65, 0.82]
+                    } else {
+                        rgb(provider_color(&account.provider))
+                    },
+                    status: rgb(status_color(account.status)),
+                    selected: slot == self.selected,
+                    models: slot == 0,
+                })
+            })
+            .collect();
+        View {
+            time,
+            selected: self.selected,
+            total,
+            avatars,
+            bubbles: self.bubbles,
+        }
+    }
+
+    pub(super) fn metrics_3d(&self) -> String {
+        let sample = &self.monitor.snapshot;
+        let percent =
+            |value: Option<f64>| value.map_or("N/A".into(), |value| format!("{value:.0}%"));
+        let capacity = |value: Option<(u64, u64)>| {
+            value.map_or("N/A".into(), |(used, total)| {
+                format!(
+                    "{}/{}",
+                    super::system_metrics::bytes(used as f64),
+                    super::system_metrics::bytes(total as f64)
+                )
+            })
+        };
+        let network = sample.network.map_or("N/A".into(), |(down, up)| {
+            format!(
+                "↓{}/s ↑{}/s",
+                super::system_metrics::bytes(down),
+                super::system_metrics::bytes(up)
+            )
+        });
+        format!(
+            "CPU {} · GPU {} · RAM {} · DISK {} · NET {}",
+            percent(sample.cpu),
+            percent(sample.gpu),
+            capacity(sample.memory),
+            capacity(sample.disk),
+            network
+        )
+    }
+
     pub(super) fn cycle_theme(&mut self) {
         // Missing optional downloads must not interrupt cycling installed ones.
         let next = self.theme.alternatives().next().unwrap();
@@ -659,7 +766,7 @@ impl Animation {
 
     pub(super) fn observe(&mut self, data: &GatewayData) {
         self.login.observe(&data.session, self.elapsed());
-        if self.pack.is_none() {
+        if self.pack.is_none() && !self.active {
             return;
         }
         self.dashboard = Dashboard::observe(data);
@@ -928,6 +1035,15 @@ impl Dashboard {
                 .map(|b| Some(b.total_tokens as f64))
                 .collect(),
         }
+    }
+}
+
+fn status_color(status: char) -> Color {
+    match status {
+        'd' => Color::Rgb(255, 71, 105),
+        'c' => Color::Rgb(71, 150, 212),
+        'a' => Color::Rgb(255, 184, 20),
+        _ => Color::Rgb(102, 199, 138),
     }
 }
 
@@ -1228,6 +1344,73 @@ impl SceneAccount {
         } else {
             format!("{name} {suffix}")
         }
+    }
+
+    /// The animated bubble's rows for a 3D label: heading, identity, quota windows
+    /// (more with `all_limits`) and credits, or the custom-model list.
+    fn label_lines(&self, all_limits: bool, chosen: bool) -> Vec<(String, Option<Color>)> {
+        const WIDTH: u16 = 28;
+        const WARN: Color = Color::Rgb(255, 184, 20);
+        let slots = self.quota_rows(all_limits);
+        if let Some(models) = &self.models {
+            let enabled = models.iter().filter(|(_, enabled)| *enabled).count();
+            let mut lines = vec![
+                (
+                    format!("◇ Custom Models · {}", models.len()),
+                    Some(provider_color(&self.provider)),
+                ),
+                (format!("{enabled} enabled"), None),
+            ];
+            if models.is_empty() {
+                lines.push(("No custom models".into(), Some(Color::Gray)));
+            }
+            let offset = self.model_selected.saturating_sub(slots - 1);
+            for (i, (name, enabled)) in models.iter().enumerate().skip(offset).take(slots) {
+                let remaining = models.len().saturating_sub(i + 1);
+                let suffix = if i + 1 == offset + slots && remaining > 0 {
+                    format!(" +{remaining}")
+                } else {
+                    String::new()
+                };
+                lines.push((
+                    format!(
+                        "{} {} {}{}",
+                        if chosen && i == self.model_selected {
+                            "›"
+                        } else {
+                            " "
+                        },
+                        if *enabled { "●" } else { "○" },
+                        clipped(name, WIDTH - 4 - suffix.len() as u16),
+                        suffix
+                    ),
+                    (!enabled).then_some(Color::Gray),
+                ));
+            }
+            return lines;
+        }
+        let mut lines = vec![
+            (self.heading(), Some(status_color(self.status))),
+            (self.identity().into(), None),
+        ];
+        let show_credits = all_limits && self.credits.is_some();
+        let limit_slots = slots - usize::from(show_credits);
+        for index in 0..limit_slots {
+            let hidden = if index + 1 == limit_slots {
+                self.limits.len().saturating_sub(limit_slots)
+            } else {
+                0
+            };
+            let used = self.limits.get(index).map_or(self.used, |(_, used)| *used);
+            lines.push((
+                self.limit_line(index, WIDTH, hidden),
+                used.is_some_and(|used| used >= 90.0).then_some(WARN),
+            ));
+        }
+        if show_credits {
+            lines.push((self.credit_line(WIDTH), None));
+        }
+        lines
     }
 
     fn bubble_width(&self, all_limits: bool) -> u16 {
@@ -5936,6 +6119,42 @@ mod tests {
                 .map(|index| (format!("Window {index}"), Some(index as f64)))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn three_d_labels_carry_the_animated_bubble_rows_in_both_quota_views() {
+        let mut account = example_account();
+        account.credits = Some("8.25".into());
+        account.limits[1].1 = Some(95.);
+        let warn = Some(status_color('a'));
+
+        // `a` off: heading, identity and two quota windows; overflow counted on the last.
+        let compact = account.label_lines(false, true);
+        assert_eq!(compact.len(), 4);
+        assert_eq!(compact[0], (account.heading(), Some(status_color('h'))));
+        assert_eq!(compact[1], ("alice@example.com".into(), None));
+        assert!(compact[3].0.starts_with("Window 1 95%") && compact[3].0.ends_with(" +8"));
+        assert_eq!((compact[2].1, compact[3].1), (None, warn));
+
+        // `a` on: four windows plus the credit balance.
+        let all = account.label_lines(true, true);
+        assert_eq!(all.len(), 7);
+        assert!(all[5].0.ends_with(" +6"));
+        assert_eq!(all[6].0, "Credits 8.25");
+
+        let mut models = SceneAccount::models_cat();
+        models.models = Some(vec![("alpha".into(), true), ("beta".into(), false)]);
+        models.model_selected = 1;
+        let rows: Vec<_> = models
+            .label_lines(false, true)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+        assert_eq!(
+            rows,
+            ["◇ Custom Models · 2", "1 enabled", "  ● alpha", "› ○ beta"]
+        );
+        assert_eq!(models.label_lines(false, false)[3].0, "  ○ beta");
     }
 
     #[test]

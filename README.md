@@ -97,6 +97,8 @@ iogw
 
 The normal management UI opens first and needs no theme packs. Optional **Café**, **Office**, and **Station** packs add an animated overview using the same client and account controls. After installing a compatible pack, press **F4** or **Ctrl+V** to switch views.
 
+An optional **interactive 3D Café** uses a Panda3D GPU helper while keeping management in Rust. Press **F5 / Ctrl+G**, or run `iogw tui --3d`. It supports mouse selection, camera controls, and the existing account actions. [Runtime setup and controls →](docs/3d-tui.md)
+
 Packs are separate, data-only downloads—not another app or installer. Older releases may not include animation support or packs; the guide explains release availability and the source-build option. Motion is decorative, not proof of account activity.
 
 [See the normal UI and all themes, installation, controls, and remote access →](https://gateway.giofahreza.com/docs/terminal-ui/)

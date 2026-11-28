@@ -187,7 +187,7 @@ class Screen:
 
 
 class Terminal:
-    def __init__(self, binary, gateway, config_dir=None):
+    def __init__(self, binary, gateway, config_dir=None, arguments=()):
         self.gateway = gateway
         self.config = tempfile.TemporaryDirectory(prefix="iogw-tui-test-")
         self.master, slave = pty.openpty()
@@ -201,7 +201,7 @@ class Terminal:
         self.screen = Screen()
         self.started = time.monotonic()
         self.process = subprocess.Popen(
-            [str(binary), "--base-url", f"http://127.0.0.1:{gateway.server_port}"],
+            [str(binary), "--base-url", f"http://127.0.0.1:{gateway.server_port}", *arguments],
             stdin=slave, stdout=slave, stderr=slave, env=env, start_new_session=True,
         )
         os.close(slave)
