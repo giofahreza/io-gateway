@@ -7,3 +7,4 @@ desktop/dist/
 desktop/src-tauri/gen/
 desktop/src-tauri/target/
 __pycache__/
+axiomcode-links.tsv
