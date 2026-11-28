@@ -1738,6 +1738,10 @@ impl TuiApp {
         let target = if hard {
             None
         } else {
+            if self.overview_section == OverviewSection::CustomModels {
+                self.message = "no focused account: use R to refresh all data".into();
+                return;
+            }
             let Some(account) =
                 selected_overview_account_index(self).and_then(|i| self.data.accounts.get(i))
             else {

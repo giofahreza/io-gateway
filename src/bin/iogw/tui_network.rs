@@ -1269,6 +1269,13 @@ mod tests {
         let expected = app.data.accounts[selected_overview_account_index_for_test(&app)]
             .file_name
             .clone();
+        // The model actor must not refresh the previously selected credential.
+        app.overview_section = OverviewSection::CustomModels;
+        app.refresh_quota(false);
+        assert!(app.message.contains("no focused account"));
+        assert!(!app.network.refresh_pending());
+        assert_eq!(mock.count("/models/refresh"), 0);
+        app.overview_section = OverviewSection::AccountUsage;
         app.refresh_quota(false);
         app.move_selection(1);
         for _ in 0..20 {
