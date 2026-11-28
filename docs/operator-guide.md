@@ -1483,6 +1483,53 @@ The gateway translates `tools` arrays and `tool_calls` / `functionCall` response
 | GitHub Copilot | Via Copilot Responses endpoint |
 | Claude | Native Anthropic Messages |
 
+Claude models selected in Codex use the gateway's Responses-to-Anthropic bridge.
+The bridge reads Anthropic's upstream SSE stream and accumulates the reply before
+releasing text and tool argument events and `response.output_item.done` for each
+finished output item. Upstream pings keep long thinking turns active within the
+configured per-read timeout; downstream SSE data heartbeats are sent every ten
+seconds while the reply is being accumulated. Streaming inference has a 30-minute
+total timeout. Client cancellation releases the selected account, including a
+probe after a cooldown, so interrupted requests cannot leave it stuck probing.
+Claude's
+`max_tokens` stop reason produces `response.incomplete` with reason
+`max_output_tokens`. A truncated tool call remains unfinalized so Codex does not
+execute its partial arguments. This also applies to a compatible API's tool item
+that is still `in_progress`; earlier completed calls can execute normally.
+
+The Responses bridge defaults to a 32,000-token output budget for Claude 4 and
+later models. Claude's adaptive thinking uses that same budget: a 4,096-token
+cap can be consumed entirely on thinking, before an answer or tool call appears.
+Codex can then retry the same insufficient budget repeatedly. Older and unknown
+compatible models retain the 4,096-token default. An explicit `max_tokens` or
+`max_output_tokens` value always takes precedence.
+
+When an implicitly budgeted reply stops at `max_tokens`, the gateway regenerates
+the same input once with 64,000 tokens for models with a known output limit of at
+least 64K. This covers Sonnet 4/5, Opus 4.5 and later 4.x/5, Haiku 4.5/5, and
+Fable/Mythos 5. Earlier Opus and unknown models keep their original budgets.
+The first attempt's tools and text are withheld until the recovery decision;
+the gateway never repairs partial JSON or replays a tool that the client already
+executed. Both inference attempts require separate quota reservations and usage
+settlement. If recovery also truncates, the reply remains incomplete and its
+unfinished tool remains unfinalized. Explicit caller caps are never increased.
+
+See Anthropic's [Sonnet 5.5 capabilities](https://platform.claude.com/docs/en/models/sonnet-5-5/overview)
+and [incomplete tool use guidance](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons#max-tokens),
+plus [streaming for long requests](https://platform.claude.com/docs/en/api/errors#long-requests).
+
+Run the streaming regression with fake accounts and a local upstream:
+
+```bash
+cargo build --locked --bin io-gateway
+python3 scripts/test-claude-responses.py --codex-bin codex
+```
+
+The optional `--codex-bin` check uses the installed Codex CLI in temporary
+directories to verify final answers, two shell tool calls and their follow-up
+answer, bounded regeneration of unfinished calls, slow upstream streams,
+cancellation cleanup, and quota accounting. It does not use real provider credentials.
+
 ---
 
 ## Notifications

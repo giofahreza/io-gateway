@@ -8,15 +8,46 @@ use axum::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, Map, Value};
-use std::time::Duration;
+use std::{collections::BTreeMap, error::Error, future::Future, time::Duration};
 use uuid::Uuid;
 
 const REQUEST_TIMEOUT_SECS: u64 = 180;
+const STREAM_REQUEST_TIMEOUT_SECS: u64 = 30 * 60;
+const RESPONSES_HEARTBEAT_SECS: u64 = 10;
 const DEFAULT_MAX_TOKENS: u64 = 4096;
+const MODERN_DEFAULT_MAX_TOKENS: u64 = 32_000;
 const CLAUDE_CODE_ATTRIBUTION_MARKER: &str =
     "x-anthropic-billing-header: cc_version=2.1.207.3a5; cc_entrypoint=sdk-cli; cch=00000;";
 const CLAUDE_CODE_AGENT_PROMPT: &str =
     "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+
+// candidate_accounts reserves its first account before any async policy or
+// credential work. Cancellation during that work must release the reservation.
+struct ClaudeReservationGuard {
+    state: crate::AppState,
+    account_key: Option<String>,
+}
+
+impl ClaudeReservationGuard {
+    fn new(state: &crate::AppState, accounts: &[super::accounts::ClaudeAccount]) -> Self {
+        Self {
+            state: state.clone(),
+            account_key: accounts.first().map(crate::claude_stats_key),
+        }
+    }
+
+    fn started(&mut self) {
+        self.account_key = None;
+    }
+}
+
+impl Drop for ClaudeReservationGuard {
+    fn drop(&mut self) {
+        if let Some(key) = &self.account_key {
+            crate::router_reservation_cancelled(&self.state, "claude", key);
+        }
+    }
+}
 
 pub async fn models(State(state): State<crate::AppState>, headers: HeaderMap) -> impl IntoResponse {
     if !crate::check_api_key(&state, &headers) {
@@ -116,6 +147,7 @@ pub async fn messages(
         }
     };
     let accounts = super::accounts::candidate_accounts(&state);
+    let mut reservation = ClaudeReservationGuard::new(&state, &accounts);
     if accounts.is_empty() {
         crate::release_api_key_budget_before_dispatch(&state);
         let reason = super::accounts::empty_accounts_reason(&state);
@@ -147,9 +179,12 @@ pub async fn messages(
             return response;
         }
         crate::record_claude_request(&state, &context);
+        reservation.started();
+        let mut lifecycle = crate::StreamRequestGuard::new(&state, &context);
         let access_token = match super::auth::ensure_access_token(&state, account).await {
             Ok(token) => token,
             Err(err) => {
+                lifecycle.finish();
                 if attempt_idx + 1 < accounts.len() {
                     crate::record_request_pre_dispatch_retry_error(&state, &context, err.as_str());
                 } else {
@@ -175,6 +210,7 @@ pub async fn messages(
         {
             Ok(resp) => resp,
             Err(err) => {
+                lifecycle.finish();
                 crate::record_claude_error(&state, &context, &err);
                 last_error = Some((StatusCode::BAD_GATEWAY, err));
                 if attempt_idx + 1 < accounts.len() {
@@ -195,12 +231,14 @@ pub async fn messages(
             },
         );
         if wants_stream && status.is_success() {
+            lifecycle.finish();
             return stream_anthropic_passthrough(state, context, resp, out_headers).await;
         }
         let bytes = match resp.bytes().await {
             Ok(bytes) => bytes,
             Err(err) => {
-                let message = format!("Claude body read failed: {}", err);
+                lifecycle.finish();
+                let message = claude_transport_error("body read", err);
                 crate::record_claude_error(&state, &context, &message);
                 last_error = Some((StatusCode::BAD_GATEWAY, message));
                 if attempt_idx + 1 < accounts.len() {
@@ -210,6 +248,7 @@ pub async fn messages(
             }
         };
         if !status.is_success() {
+            lifecycle.finish();
             let message = format!(
                 "Claude returned {}: {}",
                 status,
@@ -228,6 +267,7 @@ pub async fn messages(
             .map(|value| crate::usage_metrics_from_response_value(&value))
             .unwrap_or_default();
         crate::record_claude_success(&state, &context, &usage);
+        lifecycle.finish();
         return (status, out_headers, bytes).into_response();
     }
 
@@ -280,7 +320,7 @@ pub async fn responses(
         }
     };
     let wants_stream = crate::source::wants_stream(&headers, &body);
-    let anthropic_payload = match responses_to_anthropic_messages(&raw, &model, false) {
+    let anthropic_payload = match responses_to_anthropic_messages(&raw, &model, true) {
         Ok(payload) => payload,
         Err(err) => {
             crate::release_api_key_budget_before_dispatch(&state);
@@ -289,6 +329,7 @@ pub async fn responses(
     };
     let anthropic_body = Bytes::from(serde_json::to_vec(&anthropic_payload).unwrap_or_default());
     let accounts = super::accounts::candidate_accounts(&state);
+    let mut reservation = ClaudeReservationGuard::new(&state, &accounts);
     if accounts.is_empty() {
         crate::release_api_key_budget_before_dispatch(&state);
         let reason = super::accounts::empty_accounts_reason(&state);
@@ -319,9 +360,12 @@ pub async fn responses(
             return response;
         }
         crate::record_claude_request(&state, &context);
+        reservation.started();
+        let mut lifecycle = crate::StreamRequestGuard::new(&state, &context);
         let access_token = match super::auth::ensure_access_token(&state, account).await {
             Ok(token) => token,
             Err(err) => {
+                lifecycle.finish();
                 if attempt_idx + 1 < accounts.len() {
                     crate::record_request_pre_dispatch_retry_error(&state, &context, err.as_str());
                 } else {
@@ -340,12 +384,13 @@ pub async fn responses(
             &access_token,
             &headers,
             anthropic_body.clone(),
-            false,
+            true,
         )
         .await
         {
             Ok(resp) => resp,
             Err(err) => {
+                lifecycle.finish();
                 crate::record_claude_error(&state, &context, &err);
                 last_error = Some((StatusCode::BAD_GATEWAY, err));
                 if attempt_idx + 1 < accounts.len() {
@@ -356,21 +401,23 @@ pub async fn responses(
         };
         let status = resp.status();
         super::quota::observe_response_headers(&state, account, resp.headers());
-        let text = match resp.text().await {
-            Ok(text) => text,
-            Err(err) => {
-                let message = format!("Claude body read failed: {}", err);
-                crate::record_claude_error(&state, &context, &message);
-                last_error = Some((StatusCode::BAD_GATEWAY, message));
-                if attempt_idx + 1 < accounts.len() {
-                    continue;
-                }
-                break;
-            }
-        };
         if !status.is_success() {
+            let text = match resp.text().await {
+                Ok(text) => text,
+                Err(err) => {
+                    let message = claude_transport_error("body read", err);
+                    crate::record_claude_error(&state, &context, &message);
+                    lifecycle.finish();
+                    last_error = Some((StatusCode::BAD_GATEWAY, message));
+                    if attempt_idx + 1 < accounts.len() {
+                        continue;
+                    }
+                    break;
+                }
+            };
             let message = format!("Claude returned {}: {}", status, text);
             crate::record_claude_error(&state, &context, &message);
+            lifecycle.finish();
             if attempt_idx + 1 < accounts.len()
                 && crate::should_retry_account_error(status, &message)
             {
@@ -384,30 +431,29 @@ pub async fn responses(
             )
                 .into_response();
         }
-        let anthropic: Value = match serde_json::from_str(&text) {
-            Ok(value) => value,
-            Err(err) => {
-                let message = format!("Claude response JSON parse failed: {}", err);
-                crate::record_claude_error(&state, &context, &message);
-                return openai_error(StatusCode::BAD_GATEWAY, "server_error", &message);
-            }
-        };
-        let response = anthropic_message_to_response(&anthropic, &model);
-        let mut usage = crate::usage_metrics_from_response_value(&response);
-        if usage.total_tokens == 0 {
-            usage = crate::usage_metrics_from_response_value(&anthropic);
-        }
-        crate::quota_usage::preserve_native_usage(&mut usage, &anthropic, "anthropic");
-        crate::record_claude_success(&state, &context, &usage);
+        let completion = finish_claude_responses(
+            state.clone(),
+            account.clone(),
+            headers.clone(),
+            context,
+            lifecycle,
+            resp,
+            anthropic_payload.clone(),
+            recovery_max_tokens(&raw, &model),
+            model.clone(),
+        );
         if wants_stream {
-            return responses_sse(response).into_response();
+            return buffered_responses_stream(completion);
         }
-        return (
-            StatusCode::OK,
-            [("Content-Type", "application/json")],
-            serde_json::to_vec(&response).unwrap_or_default(),
-        )
-            .into_response();
+        return match completion.await {
+            Ok(response) => (
+                StatusCode::OK,
+                [("Content-Type", "application/json")],
+                serde_json::to_vec(&response).unwrap_or_default(),
+            )
+                .into_response(),
+            Err(response) => response,
+        };
     }
 
     let (status, message) = last_error.unwrap_or_else(|| {
@@ -421,6 +467,379 @@ pub async fn responses(
         "server_error",
         &format!("All Claude accounts failed; last error: {}", message),
     )
+}
+
+fn claude_transport_error(stage: &str, err: reqwest::Error) -> String {
+    // Display alone hides reqwest's timeout/connection cause. Keep the cause
+    // chain actionable for diagnostics and the router's short timeout cooldown.
+    // Strip the URL, which can contain credentials on custom upstreams.
+    let category = if err.is_timeout() {
+        "timeout"
+    } else {
+        "transport error"
+    };
+    let err = err.without_url();
+    let mut message = format!("Claude {stage} failed ({category}): {err}");
+    let mut source = err.source();
+    while let Some(cause) = source {
+        message.push_str(&format!(": {cause}"));
+        source = cause.source();
+    }
+    message
+}
+
+fn recovery_max_tokens(raw: &Value, model: &str) -> Option<u64> {
+    if raw.get("max_tokens").and_then(Value::as_u64).is_some()
+        || raw
+            .get("max_output_tokens")
+            .and_then(Value::as_u64)
+            .is_some()
+    {
+        return None;
+    }
+    // One regeneration from 32K to 64K, only for model families with a known
+    // >=64K output limit. Opus 4/4.1 top out at 32K; unknown models stay unchanged.
+    let (family, version) = model.strip_prefix("claude-")?.split_once('-')?;
+    let mut components = version.split('-');
+    let major = components.next()?.parse::<u32>().ok()?;
+    let minor = components
+        .next()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0);
+    let supported = match family {
+        "sonnet" => (4..=5).contains(&major),
+        "opus" | "haiku" => major == 5 || (major == 4 && (5..100).contains(&minor)),
+        "fable" | "mythos" => major == 5,
+        _ => false,
+    };
+    supported.then_some(64_000)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_claude_responses(
+    state: crate::AppState,
+    account: super::accounts::ClaudeAccount,
+    headers: HeaderMap,
+    context: crate::UsageContext,
+    mut lifecycle: crate::StreamRequestGuard,
+    mut resp: reqwest::Response,
+    mut payload: Value,
+    mut recovery_budget: Option<u64>,
+    model: String,
+) -> Result<Value, axum::response::Response> {
+    loop {
+        let (message, usage) = match collect_anthropic_message(resp).await {
+            Ok(result) => result,
+            Err(message) => {
+                crate::record_claude_error(&state, &context, &message);
+                lifecycle.finish();
+                return Err(openai_error(
+                    StatusCode::BAD_GATEWAY,
+                    "server_error",
+                    &message,
+                ));
+            }
+        };
+        crate::record_claude_success(&state, &context, &usage);
+        lifecycle.finish();
+        let needs_recovery = message["stop_reason"] == "max_tokens";
+        let Some(budget) = recovery_budget.take().filter(|_| needs_recovery) else {
+            return Ok(anthropic_message_to_response(&message, &model));
+        };
+        // No item from this attempt has been sent to the client. Regenerate the
+        // same input, never append unfinished arguments or replay executed tools.
+        // Settle and reserve every inference attempt separately, including when
+        // the API key has a renewable quota or a legacy input-token budget.
+        payload["max_tokens"] = json!(budget);
+        let body = Bytes::from(serde_json::to_vec(&payload).unwrap_or_default());
+        let prepared = prepare_anthropic_body(body.clone()).0;
+        crate::reserve_api_key_budgets_for_prepared_dispatch(
+            &state,
+            context.provider_name,
+            &context.key,
+            &prepared,
+        )
+        .await?;
+        crate::record_claude_request(&state, &context);
+        lifecycle = crate::StreamRequestGuard::new(&state, &context);
+        let token = match super::auth::ensure_access_token(&state, &account).await {
+            Ok(token) => token,
+            Err(message) => {
+                crate::record_request_pre_dispatch_error(&state, &context, &message);
+                lifecycle.finish();
+                return Err(openai_error(
+                    StatusCode::UNAUTHORIZED,
+                    "server_error",
+                    &message,
+                ));
+            }
+        };
+        resp = match post_anthropic_messages(&state.client, &account, &token, &headers, body, true)
+            .await
+        {
+            Ok(resp) => resp,
+            Err(message) => {
+                crate::record_claude_error(&state, &context, &message);
+                lifecycle.finish();
+                return Err(openai_error(
+                    StatusCode::BAD_GATEWAY,
+                    "server_error",
+                    &message,
+                ));
+            }
+        };
+        super::quota::observe_response_headers(&state, &account, resp.headers());
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let message = match resp.text().await {
+                Ok(text) => format!("Claude returned {status}: {text}"),
+                Err(err) => claude_transport_error("body read", err),
+            };
+            crate::record_claude_error(&state, &context, &message);
+            lifecycle.finish();
+            return Err(openai_error(status, "server_error", &message));
+        }
+    }
+}
+
+fn buffered_responses_stream(
+    completion: impl Future<Output = Result<Value, axum::response::Response>> + Send + 'static,
+) -> axum::response::Response {
+    let stream = async_stream::stream! {
+        tokio::pin!(completion);
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(RESPONSES_HEARTBEAT_SECS));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let result = loop {
+            tokio::select! {
+                result = &mut completion => break result,
+                _ = heartbeat.tick() => {
+                    // Send an SSE data event: comment-only keepalives do not
+                    // reset Codex's eventsource-level idle timer.
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"event: ping\ndata: {\"type\":\"ping\"}\n\n"));
+                }
+            }
+        };
+        let response = match result {
+            Ok(response) => response,
+            Err(response) => {
+                let status = response.status();
+                // Codex-source policy errors use plain-text HTTP bodies. Once
+                // streaming has begun, retain their actionable status in the
+                // Responses error code rather than labelling all failures 5xx.
+                let fallback_code = match status {
+                    StatusCode::TOO_MANY_REQUESTS => "rate_limit_exceeded",
+                    StatusCode::UNAUTHORIZED => "invalid_api_key",
+                    StatusCode::FORBIDDEN => "permission_denied",
+                    StatusCode::BAD_REQUEST => "invalid_request_error",
+                    _ => "server_error",
+                };
+                let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap_or_default();
+                let error: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                let message = error.pointer("/error/message").and_then(Value::as_str)
+                    .map(str::to_owned).unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+                json!({
+                    "id": format!("resp_{}", Uuid::new_v4().simple()), "object": "response",
+                    "status": "failed", "output": [], "usage": null,
+                    "error": {"code": error.pointer("/error/code").and_then(Value::as_str).unwrap_or(fallback_code),
+                        "message": format!("Claude Responses request failed ({status}): {message}")}
+                })
+            }
+        };
+        let mut body = responses_sse(response).into_body().into_data_stream();
+        while let Some(chunk) = body.next().await {
+            yield chunk.map_err(std::io::Error::other);
+        }
+    };
+    (
+        StatusCode::OK,
+        [
+            ("Content-Type", "text/event-stream"),
+            ("Cache-Control", "no-cache"),
+            ("X-Accel-Buffering", "no"),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+#[derive(Default)]
+struct AnthropicMessageAccumulator {
+    buffer: Vec<u8>,
+    message: Option<Value>,
+    blocks: BTreeMap<u64, Value>,
+    partial_inputs: BTreeMap<u64, String>,
+    stopped_blocks: std::collections::BTreeSet<u64>,
+    stopped: bool,
+}
+
+impl AnthropicMessageAccumulator {
+    fn push(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.buffer.extend_from_slice(bytes);
+        while let Some((end, delimiter)) = find_sse_boundary(&self.buffer) {
+            let event = self.buffer.drain(..end + delimiter).collect::<Vec<_>>();
+            self.absorb(&event[..end])?;
+        }
+        Ok(())
+    }
+
+    fn absorb(&mut self, event: &[u8]) -> Result<(), String> {
+        if let Some(error) = crate::sse_terminal_error_from_event(event) {
+            return Err(format!("Claude stream error: {error}"));
+        }
+        let Some(data) = parse_sse_data(event) else {
+            return Ok(());
+        };
+        let value: Value = serde_json::from_str(&data)
+            .map_err(|err| format!("Claude stream JSON parse failed: {err}"))?;
+        match value["type"].as_str() {
+            Some("message_start") => {
+                if self.message.is_some() || !value["message"].is_object() {
+                    return Err("Claude stream has an invalid message_start".into());
+                }
+                self.message = Some(value["message"].clone());
+            }
+            Some("content_block_start") => {
+                let index = value["index"]
+                    .as_u64()
+                    .ok_or("Claude stream is missing block index")?;
+                if !value["content_block"].is_object()
+                    || self
+                        .blocks
+                        .insert(index, value["content_block"].clone())
+                        .is_some()
+                {
+                    return Err("Claude stream has an invalid content_block_start".into());
+                }
+            }
+            Some("content_block_delta") => {
+                let index = value["index"]
+                    .as_u64()
+                    .ok_or("Claude stream is missing block index")?;
+                let block = self
+                    .blocks
+                    .get_mut(&index)
+                    .ok_or("Claude stream delta has no content block")?;
+                let delta = &value["delta"];
+                let field = match delta["type"].as_str() {
+                    Some("text_delta") => "text",
+                    Some("thinking_delta") => "thinking",
+                    Some("signature_delta") => "signature",
+                    Some("input_json_delta") => {
+                        self.partial_inputs
+                            .entry(index)
+                            .or_default()
+                            .push_str(delta["partial_json"].as_str().unwrap_or(""));
+                        return Ok(());
+                    }
+                    _ => return Ok(()),
+                };
+                let mut text = block[field].as_str().unwrap_or("").to_string();
+                text.push_str(delta[field].as_str().unwrap_or(""));
+                block[field] = json!(text);
+            }
+            Some("content_block_stop") => {
+                let index = value["index"]
+                    .as_u64()
+                    .ok_or("Claude stream is missing block index")?;
+                self.stopped_blocks.insert(index);
+            }
+            Some("message_delta") => {
+                let message = self
+                    .message
+                    .as_mut()
+                    .ok_or("Claude stream delta has no message")?;
+                if let Some(delta) = value["delta"].as_object() {
+                    message.as_object_mut().unwrap().extend(delta.clone());
+                }
+                if let Some(usage) = value["usage"].as_object() {
+                    if !message["usage"].is_object() {
+                        message["usage"] = json!({});
+                    }
+                    message["usage"]
+                        .as_object_mut()
+                        .unwrap()
+                        .extend(usage.clone());
+                }
+            }
+            Some("message_stop") => self.stopped = true,
+            _ => {} // Includes upstream pings and future event types.
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Value, String> {
+        if !self.buffer.is_empty() {
+            let remaining = std::mem::take(&mut self.buffer);
+            self.absorb(&remaining)?;
+        }
+        if !self.stopped {
+            return Err("Claude stream ended before message_stop".into());
+        }
+        let mut message = self
+            .message
+            .ok_or("Claude stream ended without message_start")?;
+        let truncated = message["stop_reason"] == "max_tokens";
+        if message["stop_reason"].as_str().is_none() {
+            return Err("Claude stream ended without stop_reason".into());
+        }
+        let last_index = self.blocks.keys().last().copied();
+        for (index, block) in &mut self.blocks {
+            let unfinished = truncated && Some(*index) == last_index;
+            if !self.stopped_blocks.contains(index) && !unfinished {
+                return Err("Claude stream ended with an unfinished content block".into());
+            }
+            if block["type"] == "tool_use" {
+                if let Some(input) = self
+                    .partial_inputs
+                    .get(index)
+                    .filter(|input| !input.is_empty())
+                {
+                    match serde_json::from_str::<Value>(input) {
+                        Ok(value) if value.is_object() => block["input"] = value,
+                        _ if unfinished => block["__iogw_partial_json"] = json!(input),
+                        _ => return Err("Claude stream returned invalid tool argument JSON".into()),
+                    }
+                }
+                if !unfinished && !block["input"].is_object() {
+                    return Err("Claude stream returned non-object tool arguments".into());
+                }
+            }
+        }
+        message["content"] = Value::Array(self.blocks.into_values().collect());
+        Ok(message)
+    }
+}
+
+async fn collect_anthropic_message(
+    resp: reqwest::Response,
+) -> Result<(Value, crate::UsageMetrics), String> {
+    if !resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/event-stream"))
+    {
+        // Custom Anthropic-compatible servers can return JSON despite stream:true.
+        let message: Value = resp
+            .json()
+            .await
+            .map_err(|err| claude_transport_error("body read", err))?;
+        let mut usage = crate::usage_metrics_from_response_value(&message);
+        crate::quota_usage::preserve_native_usage(&mut usage, &message, "anthropic");
+        return Ok((message, usage));
+    }
+    let mut upstream = resp.bytes_stream();
+    let mut message = AnthropicMessageAccumulator::default();
+    let mut usage = AnthropicSseUsageTracker::default();
+    while let Some(chunk) = upstream.next().await {
+        let bytes = chunk.map_err(|err| claude_transport_error("stream read", err))?;
+        usage.push(&bytes);
+        message.push(&bytes)?;
+        if message.stopped {
+            break;
+        }
+    }
+    Ok((message.finish()?, usage.finish()?.unwrap_or_default()))
 }
 
 async fn post_anthropic_messages(
@@ -462,7 +881,11 @@ async fn post_anthropic_messages(
         .header("User-Agent", super::CLAUDE_CODE_CLI_USER_AGENT)
         .header("x-app", "cli")
         .header("Accept-Encoding", "identity")
-        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(if stream {
+            STREAM_REQUEST_TIMEOUT_SECS
+        } else {
+            REQUEST_TIMEOUT_SECS
+        }))
         .body(body);
     request = request.header("anthropic-beta", beta);
     for (key, value) in incoming_headers.iter() {
@@ -481,7 +904,7 @@ async fn post_anthropic_messages(
     request
         .send()
         .await
-        .map_err(|err| format!("Claude request failed: {}", err))
+        .map_err(|err| claude_transport_error("request", err))
 }
 
 fn anthropic_messages_url(base_url: &str) -> String {
@@ -651,9 +1074,9 @@ pub(crate) fn responses_to_anthropic_messages(
     object.insert(
         "max_tokens".to_string(),
         raw.get("max_tokens")
-            .or_else(|| raw.get("max_output_tokens"))
             .and_then(|value| value.as_u64())
-            .unwrap_or(DEFAULT_MAX_TOKENS)
+            .or_else(|| raw.get("max_output_tokens").and_then(Value::as_u64))
+            .unwrap_or_else(|| default_max_tokens(model))
             .into(),
     );
     object.insert("stream".to_string(), Value::Bool(stream));
@@ -716,6 +1139,31 @@ pub(crate) fn responses_to_anthropic_messages(
     }
 
     Ok(Value::Object(object))
+}
+
+fn default_max_tokens(model: &str) -> u64 {
+    // Current Claude models include adaptive thinking in max_tokens. A 4096
+    // default can be exhausted entirely on thinking, causing Codex to replay
+    // the same failed request without ever reaching a tool or final answer.
+    // Keep the legacy default for older/unknown compatible models, whose
+    // output limits may be lower, and always respect an explicit caller cap.
+    let Some((family, version)) = model
+        .strip_prefix("claude-")
+        .and_then(|model| model.split_once('-'))
+    else {
+        return DEFAULT_MAX_TOKENS;
+    };
+    let major = version
+        .split('-')
+        .next()
+        .and_then(|version| version.parse::<u32>().ok());
+    if matches!(family, "sonnet" | "opus" | "haiku" | "fable" | "mythos")
+        && major.is_some_and(|major| major >= 4)
+    {
+        MODERN_DEFAULT_MAX_TOKENS
+    } else {
+        DEFAULT_MAX_TOKENS
+    }
 }
 
 fn chat_messages_to_anthropic(messages: Vec<Value>, system_parts: &mut Vec<String>) -> Vec<Value> {
@@ -1421,8 +1869,7 @@ fn normalize_stop_sequences(value: &Value) -> Value {
 }
 
 pub(crate) fn anthropic_message_to_response(message: &Value, model: &str) -> Value {
-    let mut output = Vec::new();
-    let mut text_parts = Vec::new();
+    let mut output: Vec<Value> = Vec::new();
     for block in message
         .get("content")
         .and_then(|value| value.as_array())
@@ -1432,14 +1879,31 @@ pub(crate) fn anthropic_message_to_response(message: &Value, model: &str) -> Val
         match block.get("type").and_then(|value| value.as_str()) {
             Some("text") => {
                 if let Some(text) = block.get("text").and_then(|value| value.as_str()) {
-                    text_parts.push(json!({"type": "output_text", "text": text}));
+                    let part = json!({
+                        "type": "output_text", "text": text, "annotations": [], "logprobs": []
+                    });
+                    // Coalesce adjacent text blocks without moving text ahead of
+                    // the thinking or tool blocks that preceded it upstream.
+                    if let Some(item) = output.last_mut().filter(|item| item["type"] == "message") {
+                        item["content"].as_array_mut().unwrap().push(part);
+                    } else {
+                        output.push(json!({
+                            "id": format!("msg_{}", Uuid::new_v4().simple()),
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [part],
+                            "status": "completed"
+                        }));
+                    }
                 }
             }
             Some("thinking") => {
                 if let Some(text) = block.get("thinking").and_then(|value| value.as_str()) {
                     output.push(json!({
+                        "id": format!("rs_{}", Uuid::new_v4().simple()),
                         "type": "reasoning",
-                        "summary": [{"type": "summary_text", "text": text}]
+                        "summary": [{"type": "summary_text", "text": text}],
+                        "status": "completed"
                     }));
                 }
             }
@@ -1447,18 +1911,21 @@ pub(crate) fn anthropic_message_to_response(message: &Value, model: &str) -> Val
                 let id = block
                     .get("id")
                     .and_then(|value| value.as_str())
-                    .unwrap_or("call_claude");
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
                 let name = block
                     .get("name")
                     .and_then(|value| value.as_str())
                     .unwrap_or("tool");
                 let arguments = block
-                    .get("input")
-                    .map(|value| value.to_string())
+                    .get("__iogw_partial_json")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| block.get("input").map(Value::to_string))
                     .unwrap_or_else(|| "{}".to_string());
                 output.push(json!({
                     "type": "function_call",
-                    "id": id,
+                    "id": format!("fc_{}", Uuid::new_v4().simple()),
                     "call_id": id,
                     "name": name,
                     "arguments": arguments,
@@ -1468,16 +1935,11 @@ pub(crate) fn anthropic_message_to_response(message: &Value, model: &str) -> Val
             _ => {}
         }
     }
-    if !text_parts.is_empty() {
-        output.insert(
-            0,
-            json!({
-                "type": "message",
-                "role": "assistant",
-                "content": text_parts,
-                "status": "completed"
-            }),
-        );
+    let truncated = message.get("stop_reason").and_then(Value::as_str) == Some("max_tokens");
+    if truncated {
+        if let Some(item) = output.last_mut() {
+            item["status"] = json!("incomplete");
+        }
     }
 
     let usage = message.get("usage").cloned().unwrap_or_else(|| json!({}));
@@ -1494,7 +1956,9 @@ pub(crate) fn anthropic_message_to_response(message: &Value, model: &str) -> Val
         "object": "response",
         "created_at": chrono::Utc::now().timestamp(),
         "model": message.get("model").and_then(|value| value.as_str()).unwrap_or(model),
-        "status": "completed",
+        "status": if truncated { "incomplete" } else { "completed" },
+        "error": null,
+        "incomplete_details": if truncated { json!({"reason": "max_output_tokens"}) } else { Value::Null },
         "output": output,
         "usage": {
             "input_tokens": input_tokens,
@@ -1504,32 +1968,173 @@ pub(crate) fn anthropic_message_to_response(message: &Value, model: &str) -> Val
     })
 }
 
-pub(crate) fn responses_sse(response: Value) -> axum::response::Response {
-    let mut events = String::new();
-    events.push_str(&format!(
-        "event: response.created\ndata: {}\n\n",
-        json!({"type": "response.created", "response": response}).to_string()
-    ));
+pub(crate) fn responses_sse(mut response: Value) -> axum::response::Response {
+    // This emitter is also used by compatible APIs. Assign missing IDs once,
+    // before making any events, so deltas, done events and the final snapshot
+    // all refer to the same items.
     for item in response
-        .get("output")
-        .and_then(|value| value.as_array())
+        .get_mut("output")
+        .and_then(Value::as_array_mut)
         .into_iter()
         .flatten()
     {
-        events.push_str(&format!(
-            "event: response.output_item.added\ndata: {}\n\n",
-            json!({
-                "type": "response.output_item.added",
-                "output_index": 0,
-                "item": item
-            })
-            .to_string()
-        ));
+        if item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .is_none()
+        {
+            item["id"] = json!(format!("item_{}", Uuid::new_v4().simple()));
+        }
     }
-    events.push_str(&format!(
-        "event: response.completed\ndata: {}\n\n",
-        json!({"type": "response.completed", "response": response}).to_string()
-    ));
+    let mut events = String::new();
+    let mut sequence_number = 0_u64;
+    let mut emit = |kind: &str, mut data: Value| {
+        data["type"] = json!(kind);
+        data["sequence_number"] = json!(sequence_number);
+        sequence_number += 1;
+        events.push_str(&format!("event: {kind}\ndata: {data}\n\n"));
+    };
+    // The upstream call is buffered, but the downstream lifecycle must still
+    // start empty and finish each item. Codex consumes output_item.done to
+    // finalize answers and dispatch tools; response.completed alone is not enough.
+    let mut initial = response.clone();
+    initial["status"] = json!("in_progress");
+    initial["output"] = json!([]);
+    initial["usage"] = Value::Null;
+    initial["error"] = Value::Null;
+    initial["incomplete_details"] = Value::Null;
+    emit("response.created", json!({"response": initial}));
+    emit("response.in_progress", json!({"response": initial}));
+    for (output_index, item) in response
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let item_id = &item["id"];
+        let unfinished_tool = item["type"] == "function_call"
+            && matches!(item["status"].as_str(), Some("incomplete" | "in_progress"));
+        let mut added = item.clone();
+        added["status"] = json!("in_progress");
+        match item["type"].as_str() {
+            Some("message") => added["content"] = json!([]),
+            Some("function_call") => added["arguments"] = json!(""),
+            Some("reasoning") => added["summary"] = json!([]),
+            _ => {}
+        }
+        emit(
+            "response.output_item.added",
+            json!({"output_index": output_index, "item": added}),
+        );
+        match item["type"].as_str() {
+            Some("message") => {
+                for (content_index, part) in item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    let (field, prefix) = match part["type"].as_str() {
+                        Some("output_text") => ("text", "response.output_text"),
+                        Some("refusal") => ("refusal", "response.refusal"),
+                        _ => continue,
+                    };
+                    let text = part.get(field).and_then(Value::as_str).unwrap_or("");
+                    let mut empty_part = part.clone();
+                    empty_part[field] = json!("");
+                    let common = json!({
+                        "item_id": item_id, "output_index": output_index, "content_index": content_index
+                    });
+                    let mut data = common.clone();
+                    data["part"] = empty_part;
+                    emit("response.content_part.added", data);
+                    let mut data = common.clone();
+                    data["delta"] = json!(text);
+                    if field == "text" {
+                        data["logprobs"] = json!([]);
+                    }
+                    if !text.is_empty() {
+                        emit(&format!("{prefix}.delta"), data);
+                    }
+                    let mut data = common.clone();
+                    data[field] = json!(text);
+                    if field == "text" {
+                        data["logprobs"] = json!([]);
+                    }
+                    emit(&format!("{prefix}.done"), data);
+                    let mut data = common;
+                    data["part"] = part.clone();
+                    emit("response.content_part.done", data);
+                }
+            }
+            Some("function_call") => {
+                let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or("");
+                if !arguments.is_empty() {
+                    emit(
+                        "response.function_call_arguments.delta",
+                        json!({
+                            "item_id": item_id, "output_index": output_index, "delta": arguments
+                        }),
+                    );
+                }
+                if !unfinished_tool {
+                    emit(
+                        "response.function_call_arguments.done",
+                        json!({
+                            "item_id": item_id, "output_index": output_index, "arguments": arguments
+                        }),
+                    );
+                }
+            }
+            Some("reasoning") => {
+                for (summary_index, part) in item
+                    .get("summary")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    let text = part.get("text").and_then(Value::as_str).unwrap_or("");
+                    let common = json!({
+                        "item_id": item_id, "output_index": output_index, "summary_index": summary_index
+                    });
+                    let mut data = common.clone();
+                    data["part"] = json!({"type": "summary_text", "text": ""});
+                    emit("response.reasoning_summary_part.added", data);
+                    if !text.is_empty() {
+                        let mut data = common.clone();
+                        data["delta"] = json!(text);
+                        emit("response.reasoning_summary_text.delta", data);
+                    }
+                    let mut data = common.clone();
+                    data["text"] = json!(text);
+                    emit("response.reasoning_summary_text.done", data);
+                    let mut data = common;
+                    data["part"] = part.clone();
+                    emit("response.reasoning_summary_part.done", data);
+                }
+            }
+            _ => {}
+        }
+        // An unfinished tool is visible in the final incomplete snapshot, but
+        // must never be finalized as executable. Codex dispatches tools on
+        // output_item.done even when that item's status says incomplete.
+        if !unfinished_tool {
+            emit(
+                "response.output_item.done",
+                json!({"output_index": output_index, "item": item}),
+            );
+        }
+    }
+    let terminal = match response.get("status").and_then(Value::as_str) {
+        Some("incomplete") => "response.incomplete",
+        Some("failed") => "response.failed",
+        _ => "response.completed",
+    };
+    emit(terminal, json!({"response": response}));
     (
         StatusCode::OK,
         [
@@ -1569,7 +2174,7 @@ async fn stream_anthropic_passthrough(
                     yield Ok::<Bytes, std::io::Error>(bytes);
                 }
                 Err(err) => {
-                    let message = format!("Claude stream read failed: {}", err);
+                    let message = claude_transport_error("stream read", err);
                     crate::record_claude_error(&usage_state, &usage_context, &message);
                     lifecycle.finish();
                     yield Err(std::io::Error::new(std::io::ErrorKind::Other, "stream"));
@@ -1806,16 +2411,15 @@ fn merge_usage_metrics(current: &mut crate::UsageMetrics, incoming: crate::Usage
 }
 
 fn find_sse_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
-    buffer
+    let crlf = buffer
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .map(|idx| (idx, 4))
-        .or_else(|| {
-            buffer
-                .windows(2)
-                .position(|window| window == b"\n\n")
-                .map(|idx| (idx, 2))
-        })
+        .map(|idx| (idx, 4));
+    let lf = buffer
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|idx| (idx, 2));
+    crlf.into_iter().chain(lf).min_by_key(|(idx, _)| *idx)
 }
 
 fn parse_sse_data(raw_event: &[u8]) -> Option<String> {
@@ -1837,6 +2441,126 @@ fn parse_sse_data(raw_event: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn accumulate_fixture(events: &[Value]) -> Result<Value, String> {
+        let mut parser = AnthropicMessageAccumulator::default();
+        let mut bytes = Vec::new();
+        for (index, event) in events.iter().enumerate() {
+            // Split UTF-8 and SSE boundaries across arbitrary network chunks,
+            // with both permitted line endings in a single read.
+            let delimiter = if index % 2 == 0 { "\n\n" } else { "\r\n\r\n" };
+            bytes.extend_from_slice(format!("data: {event}{delimiter}").as_bytes());
+        }
+        for chunk in bytes.chunks(7) {
+            parser.push(chunk)?;
+        }
+        parser.finish()
+    }
+
+    fn tool_stream_fixture(stop: &str, arguments: &str) -> Vec<Value> {
+        vec![
+            json!({"type":"message_start","message":{"id":"msg_test","model":"claude-sonnet-5-5",
+                "type":"message","role":"assistant","content":[],"usage":{"input_tokens":5,"output_tokens":0}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Plan café 🐈"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"fixture-signature"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"ping"}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_one","name":"shell","input":{}}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":arguments}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"message_delta","delta":{"stop_reason":stop},"usage":{"output_tokens":9}}),
+            json!({"type":"message_stop"}),
+        ]
+    }
+
+    #[test]
+    fn streamed_message_preserves_blocks_arguments_signatures_and_usage() {
+        let message =
+            accumulate_fixture(&tool_stream_fixture("tool_use", r#"{"cmd":"printf café"}"#))
+                .unwrap();
+        assert_eq!(message["content"][0]["thinking"], "Plan café 🐈");
+        assert_eq!(message["content"][0]["signature"], "fixture-signature");
+        assert_eq!(message["content"][1]["input"], json!({"cmd":"printf café"}));
+        assert_eq!(message["stop_reason"], "tool_use");
+        assert_eq!(
+            message["usage"],
+            json!({"input_tokens":5,"output_tokens":9})
+        );
+    }
+
+    #[test]
+    fn streamed_partial_tool_arguments_remain_unfinished_without_json_repair() {
+        let message = accumulate_fixture(&tool_stream_fixture(
+            "max_tokens",
+            r#"{"cmd":"printf unfinished"#,
+        ))
+        .unwrap();
+        let response = anthropic_message_to_response(&message, "claude-sonnet-5-5");
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(response["output"][1]["status"], "incomplete");
+        assert_eq!(
+            response["output"][1]["arguments"],
+            r#"{"cmd":"printf unfinished"#
+        );
+        assert!(accumulate_fixture(&tool_stream_fixture(
+            "tool_use",
+            r#"{"cmd":"printf unfinished"#
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn streamed_message_requires_terminal_events_before_tools_can_execute() {
+        let events = tool_stream_fixture("tool_use", r#"{"cmd":"printf ok"}"#);
+        assert!(accumulate_fixture(&events[..events.len() - 1])
+            .unwrap_err()
+            .contains("message_stop"));
+        let mut missing_block_stop = events.clone();
+        missing_block_stop.remove(8);
+        assert!(accumulate_fixture(&missing_block_stop)
+            .unwrap_err()
+            .contains("unfinished content block"));
+        let mut missing_stop_reason = events;
+        missing_stop_reason.remove(9);
+        assert!(accumulate_fixture(&missing_stop_reason)
+            .unwrap_err()
+            .contains("stop_reason"));
+    }
+
+    #[test]
+    fn truncated_recovery_only_increases_an_implicit_supported_budget() {
+        for model in [
+            "claude-sonnet-5-5",
+            "claude-sonnet-4-20250514",
+            "claude-opus-4-5",
+            "claude-haiku-4-5",
+        ] {
+            assert_eq!(
+                recovery_max_tokens(&json!({}), model),
+                Some(64_000),
+                "{model}"
+            );
+            assert_eq!(
+                recovery_max_tokens(&json!({"max_output_tokens":null}), model),
+                Some(64_000)
+            );
+            assert_eq!(
+                recovery_max_tokens(&json!({"max_tokens":null,"max_output_tokens":32}), model),
+                None
+            );
+            assert_eq!(recovery_max_tokens(&json!({"max_tokens":32}), model), None);
+        }
+        for model in [
+            "claude-opus-4-1-20250805",
+            "claude-opus-4-20250514",
+            "claude-3-7-sonnet",
+            "unknown",
+            "claude-sonnet-99",
+        ] {
+            assert_eq!(recovery_max_tokens(&json!({}), model), None, "{model}");
+        }
+    }
 
     #[test]
     fn quota_native_tool_arguments_are_literal_but_result_media_is_not() {
@@ -1895,6 +2619,47 @@ mod tests {
             assert_eq!(normalized.trustworthy_final, complete, "{tail:?}");
             assert_eq!(normalized.input_tokens, Some(15));
             if complete { assert_eq!(normalized.output_tokens, Some(9)); }
+        }
+    }
+
+    #[test]
+    fn responses_payload_defaults_leave_room_for_modern_claude_thinking() {
+        for model in [
+            "claude-sonnet-5-5",
+            "claude-sonnet-4-20250514",
+            "claude-opus-4-1-20250805",
+            "claude-haiku-4-5-20251001",
+            "claude-fable-5",
+            "claude-mythos-5-2",
+        ] {
+            let out =
+                responses_to_anthropic_messages(&json!({"input": "hello"}), model, false).unwrap();
+            assert_eq!(out["max_tokens"], 32_000, "{model}");
+        }
+        for model in ["claude-3-5-sonnet-20241022", "claude-2.1", "custom-model"] {
+            let out =
+                responses_to_anthropic_messages(&json!({"input": "hello"}), model, false).unwrap();
+            assert_eq!(out["max_tokens"], 4096, "{model}");
+        }
+    }
+
+    #[test]
+    fn responses_payload_preserves_explicit_output_budgets() {
+        for (limits, expected) in [
+            (json!({"max_output_tokens": 64}), 64),
+            (json!({"max_tokens": 128}), 128),
+            (json!({"max_tokens": 128, "max_output_tokens": 256}), 128),
+            (json!({"max_tokens": null, "max_output_tokens": 64}), 64),
+            (
+                json!({"max_tokens": "invalid", "max_output_tokens": 64}),
+                64,
+            ),
+        ] {
+            let mut payload = limits;
+            payload["input"] = json!("hello");
+            let out =
+                responses_to_anthropic_messages(&payload, "claude-sonnet-5-5", false).unwrap();
+            assert_eq!(out["max_tokens"], expected);
         }
     }
 
@@ -1980,6 +2745,314 @@ mod tests {
         assert_eq!(out["output"][0]["type"], "function_call");
         assert_eq!(out["output"][0]["arguments"], "{\"ok\":true}");
         assert_eq!(out["usage"]["total_tokens"], 7);
+    }
+
+    fn response_fixture(content: Value) -> Value {
+        anthropic_message_to_response(
+            &json!({
+                "id": "msg_fixture", "model": "claude-fixture", "content": content,
+                "stop_reason": "end_turn", "usage": {"input_tokens": 5, "output_tokens": 9}
+            }),
+            "claude-fixture",
+        )
+    }
+
+    async fn buffered_sse_events(response: Value) -> Vec<Value> {
+        let response = responses_sse(response);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        let events: Vec<Value> =
+            body.split("\n\n")
+                .filter(|frame| !frame.is_empty())
+                .map(|frame| {
+                    let value: Value =
+                        serde_json::from_str(&parse_sse_data(frame.as_bytes()).unwrap()).unwrap();
+                    assert!(
+                        frame.starts_with(&format!("event: {}\n", value["type"].as_str().unwrap()))
+                    );
+                    value
+                })
+                .collect();
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event["sequence_number"], index);
+        }
+        assert_eq!(events[0]["type"], "response.created");
+        assert_eq!(events[1]["type"], "response.in_progress");
+        assert_eq!(events[0]["response"]["status"], "in_progress");
+        assert_eq!(events[0]["response"]["output"], json!([]));
+        assert_eq!(events[0]["response"]["usage"], Value::Null);
+        let final_output = events.last().unwrap()["response"]["output"]
+            .as_array()
+            .unwrap();
+        for (index, item) in final_output.iter().enumerate() {
+            let added: Vec<_> = events
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| {
+                    event["type"] == "response.output_item.added" && event["output_index"] == index
+                })
+                .collect();
+            let done: Vec<_> = events
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| {
+                    event["type"] == "response.output_item.done" && event["output_index"] == index
+                })
+                .collect();
+            assert_eq!(added.len(), 1);
+            if item["type"] == "function_call"
+                && matches!(item["status"].as_str(), Some("incomplete" | "in_progress"))
+            {
+                assert!(done.is_empty());
+                continue;
+            }
+            assert_eq!(done.len(), 1);
+            assert!(added[0].0 < done[0].0);
+            assert!(done[0].0 < events.len() - 1);
+            assert_eq!(added[0].1["item"]["id"], item["id"]);
+            assert_eq!(added[0].1["item"]["status"], "in_progress");
+            assert_eq!(&done[0].1["item"], item);
+            for (event_index, event) in events.iter().enumerate().filter(|(_, event)| {
+                event.get("item_id").is_some() && event["output_index"] == index
+            }) {
+                assert_eq!(event["item_id"], item["id"]);
+                assert!(added[0].0 < event_index && event_index < done[0].0);
+            }
+        }
+        events
+    }
+
+    #[test]
+    fn anthropic_response_preserves_block_order_and_distinct_tool_ids() {
+        let out = response_fixture(json!([
+            {"type": "thinking", "thinking": "Plan"},
+            {"type": "text", "text": "Hello"},
+            {"type": "text", "text": " world"},
+            {"type": "tool_use", "id": "toolu_a", "name": "first", "input": {}},
+            {"type": "tool_use", "id": "toolu_b", "name": "second", "input": {"q": "café"}},
+            {"type": "text", "text": "After tools"}
+        ]));
+        let items = out["output"].as_array().unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "reasoning",
+                "message",
+                "function_call",
+                "function_call",
+                "message"
+            ]
+        );
+        assert_eq!(items[1]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(items[2]["call_id"], "toolu_a");
+        assert_eq!(items[3]["call_id"], "toolu_b");
+        let ids: std::collections::HashSet<_> = items
+            .iter()
+            .map(|item| item["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), items.len());
+        assert!(ids.iter().all(|id| !id.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn responses_sse_finishes_multipart_text_without_duplicate_deltas() {
+        let response = response_fixture(json!([
+            {"type": "text", "text": "Hello\n"}, {"type": "text", "text": "café 🐈"}
+        ]));
+        let events = buffered_sse_events(response.clone()).await;
+        assert_eq!(events.last().unwrap()["type"], "response.completed");
+        assert_eq!(events.last().unwrap()["response"], response);
+        let deltas: Vec<_> = events
+            .iter()
+            .filter(|e| e["type"] == "response.output_text.delta")
+            .collect();
+        assert_eq!(
+            deltas
+                .iter()
+                .map(|e| e["delta"].as_str().unwrap())
+                .collect::<String>(),
+            "Hello\ncafé 🐈"
+        );
+        assert_eq!(deltas[0]["content_index"], 0);
+        assert_eq!(deltas[1]["content_index"], 1);
+        for event in events
+            .iter()
+            .filter(|e| e["type"] == "response.content_part.added")
+        {
+            assert_eq!(event["part"]["text"], "");
+        }
+        let done: Vec<_> = events
+            .iter()
+            .filter(|e| e["type"] == "response.content_part.done")
+            .collect();
+        assert_eq!(done.len(), 2);
+        assert_eq!(done[1]["part"]["text"], "café 🐈");
+    }
+
+    #[tokio::test]
+    async fn responses_sse_finishes_reasoning_and_parallel_tool_arguments() {
+        let response = response_fixture(json!([
+            {"type": "thinking", "thinking": "Check two values"},
+            {"type": "text", "text": "Checking"},
+            {"type": "tool_use", "id": "toolu_a", "name": "lookup", "input": {}},
+            {"type": "tool_use", "id": "toolu_b", "name": "lookup", "input": {"q": "café"}}
+        ]));
+        let events = buffered_sse_events(response.clone()).await;
+        assert_eq!(events.last().unwrap()["response"], response);
+        let indices: Vec<_> = events
+            .iter()
+            .filter(|e| e["type"] == "response.output_item.done")
+            .map(|e| e["output_index"].as_u64().unwrap())
+            .collect();
+        assert_eq!(indices, [0, 1, 2, 3]);
+        assert!(events
+            .iter()
+            .any(|e| e["type"] == "response.reasoning_summary_text.done"
+                && e["text"] == "Check two values"));
+        for index in [2, 3] {
+            let delta = events
+                .iter()
+                .find(|e| {
+                    e["type"] == "response.function_call_arguments.delta"
+                        && e["output_index"] == index
+                })
+                .unwrap();
+            let done = events
+                .iter()
+                .find(|e| {
+                    e["type"] == "response.function_call_arguments.done"
+                        && e["output_index"] == index
+                })
+                .unwrap();
+            assert_eq!(delta["delta"], response["output"][index]["arguments"]);
+            assert_eq!(done["arguments"], delta["delta"]);
+            let added = events
+                .iter()
+                .find(|e| e["type"] == "response.output_item.added" && e["output_index"] == index)
+                .unwrap();
+            assert_eq!(added["item"]["arguments"], "");
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_sse_reports_max_tokens_as_incomplete() {
+        let response = anthropic_message_to_response(
+            &json!({
+                "id": "msg_truncated", "content": [
+                    {"type": "thinking", "thinking": "Plan"},
+                    {"type": "text", "text": "Partial answer"}
+                ],
+                "stop_reason": "max_tokens", "usage": {"input_tokens": 5, "output_tokens": 100}
+            }),
+            "claude-fixture",
+        );
+        assert_eq!(response["output"][0]["status"], "completed");
+        assert_eq!(response["output"][1]["status"], "incomplete");
+        let events = buffered_sse_events(response.clone()).await;
+        assert_eq!(events.last().unwrap()["type"], "response.incomplete");
+        assert_eq!(events.last().unwrap()["response"], response);
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+        assert!(!events.iter().any(|e| e["type"] == "response.completed"));
+    }
+
+    #[tokio::test]
+    async fn responses_sse_never_finalizes_a_truncated_tool_as_executable() {
+        let response = anthropic_message_to_response(
+            &json!({
+                "id": "msg_truncated_tool", "stop_reason": "max_tokens",
+                "content": [{"type": "tool_use", "id": "toolu_partial", "name": "lookup", "input": {}}]
+            }),
+            "claude-fixture",
+        );
+        let events = buffered_sse_events(response.clone()).await;
+        assert_eq!(events.last().unwrap()["type"], "response.incomplete");
+        assert_eq!(events.last().unwrap()["response"], response);
+        assert_eq!(response["output"][0]["call_id"], "toolu_partial");
+        assert_eq!(response["output"][0]["status"], "incomplete");
+        assert!(!events
+            .iter()
+            .any(|e| e["type"] == "response.function_call_arguments.done"
+                || e["type"] == "response.output_item.done"));
+    }
+
+    #[tokio::test]
+    async fn responses_sse_finishes_only_completed_tools_in_a_truncated_batch() {
+        let response = anthropic_message_to_response(
+            &json!({
+                "id": "msg_mixed", "stop_reason": "max_tokens",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_complete", "name": "lookup", "input": {"q": "complete"}},
+                    {"type": "tool_use", "id": "toolu_partial", "name": "lookup", "input": {"q": "partial"}}
+                ]
+            }),
+            "claude-sonnet-5-5",
+        );
+        let events = buffered_sse_events(response.clone()).await;
+        let done: Vec<_> = events
+            .iter()
+            .filter(|e| e["type"] == "response.output_item.done")
+            .collect();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0]["item"]["call_id"], "toolu_complete");
+        assert_eq!(response["output"][1]["status"], "incomplete");
+        assert!(!events.iter().any(
+            |e| e["type"] == "response.function_call_arguments.done" && e["output_index"] == 1
+        ));
+        assert_eq!(events.last().unwrap()["type"], "response.incomplete");
+    }
+
+    #[tokio::test]
+    async fn responses_sse_does_not_finalize_a_compatible_tool_still_in_progress() {
+        let response = json!({
+            "id": "resp_partial_compatible", "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{"type": "function_call", "call_id": "call_partial", "name": "lookup",
+                "arguments": "{\"q\":\"valid JSON is not proof of completion\"}", "status": "in_progress"}]
+        });
+        let events = buffered_sse_events(response).await;
+        assert!(!events
+            .iter()
+            .any(|e| e["type"] == "response.function_call_arguments.done"
+                || e["type"] == "response.output_item.done"));
+    }
+
+    #[tokio::test]
+    async fn responses_sse_assigns_stable_ids_and_finishes_empty_parts() {
+        let events = buffered_sse_events(json!({
+            "id": "resp_compatible", "status": "completed", "output": [
+                {"type": "message", "role": "assistant", "status": "completed", "content": [
+                    {"type": "output_text", "text": "", "annotations": []},
+                    {"type": "refusal", "refusal": "Unavailable"}
+                ]},
+                {"type": "function_call", "call_id": "call_empty", "name": "test", "arguments": "", "status": "completed"}
+            ]
+        })).await;
+        assert!(events
+            .iter()
+            .any(|e| e["type"] == "response.output_text.done" && e["text"] == ""));
+        assert!(events
+            .iter()
+            .any(|e| e["type"] == "response.refusal.done" && e["refusal"] == "Unavailable"));
+        assert!(events
+            .iter()
+            .any(|e| e["type"] == "response.function_call_arguments.done" && e["arguments"] == ""));
+        let items = events.last().unwrap()["response"]["output"]
+            .as_array()
+            .unwrap();
+        assert!(items
+            .iter()
+            .all(|item| item["id"].as_str().is_some_and(|id| !id.is_empty())));
+        assert_ne!(items[0]["id"], items[1]["id"]);
     }
 
     #[test]
