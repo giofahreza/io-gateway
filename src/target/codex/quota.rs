@@ -777,6 +777,18 @@ fn extract_additional_rate_limits(
         .collect()
 }
 
+/// Codex reports a bare countdown, but some upstream builds still prefix it
+/// with "resets in". Keep the label a plain duration everywhere.
+fn normalize_reset_label(label: &str) -> String {
+    let trimmed = label.trim();
+    for prefix in ["resets in ", "reset in ", "in "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return rest.trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
 fn extract_window_summary(
     window: &serde_json::Value,
     default_bucket: Option<&str>,
@@ -803,7 +815,7 @@ fn extract_window_summary(
         .get("reset_label")
         .or_else(|| window.get("resetAtLabel"))
         .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
+        .map(normalize_reset_label)
         .filter(|s| !s.trim().is_empty())
         .or_else(|| {
             let seconds = window
@@ -831,20 +843,20 @@ fn format_reset_after(seconds: i64, bucket: Option<&str>) -> String {
     match bucket {
         Some("weekly") => {
             if days > 0 {
-                format!("resets in {}d {}h", days, hours)
+                format!("{}d {}h", days, hours)
             } else if hours > 0 {
-                format!("resets in {}h {}m", hours, mins)
+                format!("{}h {}m", hours, mins)
             } else {
-                format!("resets in {}m", mins)
+                format!("{}m", mins)
             }
         }
         _ => {
             if days > 0 {
-                format!("resets in {}d {}h", days, hours)
+                format!("{}d {}h", days, hours)
             } else if hours > 0 {
-                format!("resets in {}h {}m", hours, mins)
+                format!("{}h {}m", hours, mins)
             } else {
-                format!("resets in {}m", mins)
+                format!("{}m", mins)
             }
         }
     }
@@ -972,7 +984,7 @@ mod tests {
                 .five_hour
                 .as_ref()
                 .map(|window| window.reset_label.as_str()),
-            Some("resets in 6d 16h")
+            Some("6d 16h")
         );
         assert!(summary.weekly.is_none());
     }

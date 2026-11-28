@@ -73,6 +73,44 @@ pub fn credit_fields(account: &Value) -> Vec<Field> {
     out
 }
 
+/// A currency balance is an available amount, never a usage percentage.
+pub fn balance_fields(account: &Value) -> Vec<Field> {
+    let mut out = Vec::new();
+    let Some(balances) = account.get("balances").and_then(Value::as_array) else {
+        return out;
+    };
+    for balance in balances {
+        let currency = balance.get("currency").and_then(text).unwrap_or_default();
+        let amount = |key: &str| -> Option<String> {
+            let value = balance.get(key).and_then(text)?;
+            Some(if currency.is_empty() {
+                value
+            } else {
+                format!("{value} {currency}")
+            })
+        };
+        let Some(total) = amount("total_balance") else {
+            continue;
+        };
+        push(&mut out, "Available balance", total);
+        // Secondary amounts are noise at zero; the main balance above always shows.
+        for (key, label) in [
+            ("granted_balance", "Granted balance"),
+            ("topped_up_balance", "Topped up balance"),
+        ] {
+            let is_zero = balance
+                .get(key)
+                .and_then(text)
+                .and_then(|value| value.parse::<f64>().ok())
+                .is_some_and(|value| value == 0.0);
+            if let Some(value) = amount(key).filter(|_| !is_zero) {
+                push(&mut out, label, value);
+            }
+        }
+    }
+    out
+}
+
 fn text(value: &Value) -> Option<String> {
     let value = match value {
         Value::String(value) => value.clone(),
@@ -103,6 +141,9 @@ pub fn summarize(account: &Value) -> Vec<Field> {
     let mut out = Vec::new();
     if account.get("credits").is_some() {
         out.extend(credit_fields(account));
+    }
+    if account.get("balances").is_some() {
+        out.extend(balance_fields(account));
     }
     for (key, label) in [
         ("plan_type", "Plan"),
@@ -179,6 +220,14 @@ fn visit(node: &Value, label: &str, depth: usize, out: &mut Vec<Field>) {
     let mut metrics = Vec::new();
     // Preserve actual units/counts as well as percentages. In particular a
     // currency balance must never become a fabricated percentage or reset.
+    // A percentage is reported once, without the "used" wording, and a total
+    // percentage never appears next to the used percentage.
+    let percent_text = |keys: &[&str]| -> Option<String> {
+        let value = keys.iter().find_map(|key| map.get(*key).and_then(text))?;
+        Some(value)
+    };
+    let used_percent = percent_text(&["used_percent", "usage_percent", "utilization"]);
+    let remaining_percent = percent_text(&["remaining_percent", "percent_remaining"]);
     for (aliases, name) in [
         (&["used_text", "used", "usage_count"][..], "used"),
         (
@@ -189,10 +238,7 @@ fn visit(node: &Value, label: &str, depth: usize, out: &mut Vec<Field>) {
             &["remaining_text", "remaining", "quota_remaining"][..],
             "remaining",
         ),
-        (
-            &["used_percent", "usage_percent", "utilization"][..],
-            "used %",
-        ),
+        (&["used_percent", "usage_percent", "utilization"][..], "%"),
         (
             &["remaining_percent", "percent_remaining"][..],
             "remaining %",
@@ -201,7 +247,7 @@ fn visit(node: &Value, label: &str, depth: usize, out: &mut Vec<Field>) {
         (&["has_credits"][..], "has credits"),
         (&["balance", "total_balance"][..], "balance"),
         (&["granted_balance"][..], "granted"),
-        (&["topped_up_balance"][..], "paid"),
+        (&["topped_up_balance"][..], "topped up"),
         (&["monthly_limit"][..], "monthly limit"),
         (&["used_credits"][..], "used credits"),
         (&["is_enabled"][..], "enabled"),
@@ -215,13 +261,29 @@ fn visit(node: &Value, label: &str, depth: usize, out: &mut Vec<Field>) {
         (&["end_time"][..], "window end"),
         (&["remains_time"][..], "reset in seconds"),
     ] {
-        if let Some(value) = aliases.iter().find_map(|key| map.get(*key).and_then(text)) {
-            metrics.push(if let Some(name) = name.strip_suffix(" %") {
-                format!("{value}% {name}")
-            } else {
-                format!("{name} {value}")
-            });
+        let Some(value) = aliases.iter().find_map(|key| map.get(*key).and_then(text)) else {
+            continue;
+        };
+        // A percentage replaces the matching count, a total percentage is
+        // never reported next to the used percentage, and the remaining
+        // percentage is dropped once the used percentage is known.
+        let redundant = match name {
+            "used" => used_percent.is_some() && value.ends_with('%'),
+            "remaining" => remaining_percent.is_some() && value.ends_with('%'),
+            "limit" => value.ends_with('%'),
+            "remaining %" => used_percent.is_some(),
+            _ => false,
+        };
+        if redundant {
+            continue;
         }
+        metrics.push(match name {
+            "%" => format!("{value}%"),
+            _ if name.ends_with(" %") => {
+                format!("{value}% {}", &name[..name.len() - 2])
+            }
+            _ => format!("{name} {value}"),
+        });
     }
     if !metrics.is_empty() {
         push(out, label, metrics.join("; "));
@@ -240,7 +302,6 @@ fn visit(node: &Value, label: &str, depth: usize, out: &mut Vec<Field>) {
             "weekly" | "seven_day" => "Weekly",
             "seven_day_sonnet" => "Sonnet weekly",
             "seven_day_opus" => "Opus weekly",
-            "balances" | "balance_infos" => "Balance",
             "credits" => "Credits",
             "extra_usage" => "Extra usage",
             "quota_snapshots" => "Allowance",
@@ -368,7 +429,7 @@ mod tests {
             (
                 "gemini",
                 json!({"models":[{"model_id":"gemini-test","current":{"used_percent":20}}]}),
-                "20% used",
+                "20%",
             ),
             (
                 "qwen",
@@ -378,7 +439,7 @@ mod tests {
             (
                 "deepseek",
                 json!({"balances":[{"currency":"USD","total_balance":"4.50"}]}),
-                "balance 4.50",
+                "Available balance",
             ),
             (
                 "minimax",
@@ -398,7 +459,7 @@ mod tests {
             (
                 "glm",
                 json!({"balance_note":"not reported","balances":[{"currency":"CNY","total_balance":"0"}]}),
-                "balance 0",
+                "Available balance",
             ),
             (
                 "grok",

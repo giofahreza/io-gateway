@@ -251,7 +251,8 @@ fn quota_limits_from_usage(usage: &serde_json::Value) -> Vec<serde_json::Value> 
     let reset_label = usage
         .get("quota_reset_date")
         .and_then(|value| value.as_str())
-        .map(|value| format!("resets {}", value))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
         .unwrap_or_default();
     let Some(snapshots) = usage
         .get("quota_snapshots")

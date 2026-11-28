@@ -1350,7 +1350,6 @@ impl SceneAccount {
     /// (more with `all_limits`) and credits, or the custom-model list.
     fn label_lines(&self, all_limits: bool, chosen: bool) -> Vec<(String, Option<Color>)> {
         const WIDTH: u16 = 28;
-        const WARN: Color = Color::Rgb(255, 184, 20);
         let slots = self.quota_rows(all_limits);
         if let Some(models) = &self.models {
             let enabled = models.iter().filter(|(_, enabled)| *enabled).count();
@@ -1401,11 +1400,9 @@ impl SceneAccount {
             } else {
                 0
             };
-            let used = self.limits.get(index).map_or(self.used, |(_, used)| *used);
-            lines.push((
-                self.limit_line(index, WIDTH, hidden),
-                used.is_some_and(|used| used >= 90.0).then_some(WARN),
-            ));
+            // The used percentage and the reset countdown stay white; the
+            // severity is carried by the bar itself.
+            lines.push((self.limit_line(index, WIDTH, hidden), None));
         }
         if show_credits {
             lines.push((self.credit_line(WIDTH), None));
@@ -6126,7 +6123,6 @@ mod tests {
         let mut account = example_account();
         account.credits = Some("8.25".into());
         account.limits[1].1 = Some(95.);
-        let warn = Some(status_color('a'));
 
         // `a` off: heading, identity and two quota windows; overflow counted on the last.
         let compact = account.label_lines(false, true);
@@ -6134,7 +6130,8 @@ mod tests {
         assert_eq!(compact[0], (account.heading(), Some(status_color('h'))));
         assert_eq!(compact[1], ("alice@example.com".into(), None));
         assert!(compact[3].0.starts_with("Window 1 95%") && compact[3].0.ends_with(" +8"));
-        assert_eq!((compact[2].1, compact[3].1), (None, warn));
+        // The used percentage and the reset countdown stay white.
+        assert_eq!((compact[2].1, compact[3].1), (None, None));
 
         // `a` on: four windows plus the credit balance.
         let all = account.label_lines(true, true);

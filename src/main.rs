@@ -4451,7 +4451,7 @@ async fn dashboard() -> impl IntoResponse {
       }
       .quota-bar-text span:last-child {
         flex-shrink: 0;
-        color: var(--muted);
+        color: var(--text);
         font-weight: 600;
       }
       .quota-status {
@@ -8081,8 +8081,8 @@ async fn dashboard() -> impl IntoResponse {
         }
         function resetHint(label) {
           var value = String(label || '').trim();
-          if (!value || value === '\u2014') return 'resets in \u2014';
-          return /^resets?\s+in\b/i.test(value) ? value : ('resets in ' + value);
+          if (!value || value === '\u2014') return '';
+          return value;
         }
         function pctValue(value) {
           var pct = Number(value);
@@ -8214,11 +8214,18 @@ async fn dashboard() -> impl IntoResponse {
           quota.limits.forEach(function(l) {
             var label = l.label || l.scope || 'Limit';
             var pct = l.used_percent != null ? l.used_percent : 0;
-            var used = l.used_text ?? l.used;
-            var total = l.limit_text ?? l.limit;
-            var hint = used != null || total != null
-              ? (used ?? '?') + '/' + (total ?? '?')
-              : (l.used_percent != null ? Number(l.used_percent).toFixed(1) + '% used' : 'Not reported');
+            // Show the used percentage only; a total percentage is not repeated.
+            // Without a percentage the reported counts stay as they are.
+            var hint;
+            if (l.used_percent != null) {
+              hint = Number(l.used_percent).toFixed(1) + '%';
+            } else if (l.used_text != null && l.limit_text != null) {
+              hint = String(l.used_text) + '/' + String(l.limit_text);
+            } else if (l.used_text != null) {
+              hint = String(l.used_text);
+            } else {
+              hint = 'Not reported';
+            }
             if (l.reset_label || l.reset_at) hint += ' · ' + (l.reset_label || l.reset_at);
             bars += renderProgressBar(label, hint, pct);
           });
@@ -8278,14 +8285,14 @@ async fn dashboard() -> impl IntoResponse {
           var cw = quota.current_window;
           var cwPct = cw.used_percent != null ? cw.used_percent : 0;
           var cwHint = (cw.used_percent != null ? cw.used_percent.toFixed(1) + '%' : '\u2014')
-            + ' used \u00b7 ' + resetHint(cw.reset_label);
+            + (resetHint(cw.reset_label) ? ' \u00b7 ' + resetHint(cw.reset_label) : '');
           bars += renderProgressBar('5h window', cwHint, cwPct);
         }
         if (quota.weekly) {
           var wk = quota.weekly;
           var wkPct = wk.used_percent != null ? wk.used_percent : 0;
           var wkHint = (wk.used_percent != null ? wk.used_percent.toFixed(1) + '%' : '\u2014')
-            + ' used \u00b7 ' + resetHint(wk.reset_label);
+            + (resetHint(wk.reset_label) ? ' \u00b7 ' + resetHint(wk.reset_label) : '');
           bars += renderProgressBar('Weekly window', wkHint, wkPct);
         }
         // Balance tile: providers expose a balances list when they have a
@@ -8301,17 +8308,23 @@ async fn dashboard() -> impl IntoResponse {
           var accountType = options && options.provider ? String(options.provider).toLowerCase() : '';
           var balanceHtml = '';
           if (hasBalances) {
+            // Same presentation as the Qwen Cloud account: the available
+            // balance is an amount, never a usage percentage.
+            var balanceRows = [];
             quota.balances.forEach(function(b) {
               if (b.total_balance == null) return;
-              var label = 'Balance ' + (b.currency || 'USD');
-              var detail = b.total_balance + ' ' + (b.currency || 'USD');
-              if (b.topped_up_balance && b.topped_up_balance !== '0.00' && b.topped_up_balance !== '0') {
-                detail += ' (topped up ' + b.topped_up_balance + ')';
-              } else if (b.granted_balance && b.granted_balance !== '0.00' && b.granted_balance !== '0') {
-                detail += ' (granted ' + b.granted_balance + ')';
+              var currency = b.currency ? ' ' + b.currency : '';
+              balanceRows.push(['Available balance', b.total_balance + currency]);
+              if (b.granted_balance && b.granted_balance !== '0.00' && b.granted_balance !== '0') {
+                balanceRows.push(['Granted balance', b.granted_balance + currency]);
               }
-              balanceHtml += renderProgressBar(label, detail, 100, 'low');
+              if (b.topped_up_balance && b.topped_up_balance !== '0.00' && b.topped_up_balance !== '0') {
+                balanceRows.push(['Topped up balance', b.topped_up_balance + currency]);
+              }
             });
+            balanceHtml += balanceRows.map(function(row) {
+              return '<div class="quota-status"><strong>' + escapeHtml(row[0]) + ':</strong> ' + escapeHtml(row[1]) + '</div>';
+            }).join('');
           }
           if (hasBalanceNote) {
             balanceHtml += '<div class="muted quota-status">'

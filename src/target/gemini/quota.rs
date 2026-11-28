@@ -500,11 +500,11 @@ fn format_reset_time(value: &str) -> String {
     let hours = (seconds % 86_400) / 3_600;
     let mins = (seconds % 3_600) / 60;
     if days > 0 {
-        format!("resets in {}d {}h", days, hours)
+        format!("{}d {}h", days, hours)
     } else if hours > 0 {
-        format!("resets in {}h {}m", hours, mins)
+        format!("{}h {}m", hours, mins)
     } else {
-        format!("resets in {}m", mins)
+        format!("{}m", mins)
     }
 }
 

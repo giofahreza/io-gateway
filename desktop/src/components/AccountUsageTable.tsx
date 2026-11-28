@@ -19,7 +19,13 @@ type QuotaAccount = {
   label: string;
   keys: string[];
   bars: QuotaBar[];
+  balances: QuotaBalance[];
   status: string | null;
+};
+
+type QuotaBalance = {
+  label: string;
+  value: string;
 };
 
 type MergedRow = {
@@ -147,7 +153,7 @@ function MiniQuota({ quota }: { quota: QuotaAccount | null }) {
 }
 
 function QuotaBars({ quota }: { quota: QuotaAccount | null }) {
-  if (!quota || quota.bars.length === 0) {
+  if (!quota || (quota.bars.length === 0 && quota.balances.length === 0)) {
     return <span className="quota-compact muted">{quota?.status || 'No quota'}</span>;
   }
   return (
@@ -166,6 +172,14 @@ function QuotaBars({ quota }: { quota: QuotaAccount | null }) {
                 ['--quota-color' as string]: quotaColor(bar.percent),
               }}
             />
+          </div>
+        </div>
+      ))}
+      {quota.balances.map((balance, index) => (
+        <div className="quota-bar-row" key={`${balance.label}:${index}`}>
+          <div className="quota-bar-labels">
+            <span>{balance.label}</span>
+            <span>{balance.value}</span>
           </div>
         </div>
       ))}
@@ -364,6 +378,7 @@ function quotaAccount(provider: string, item: unknown): QuotaAccount {
     label,
     keys: keys.length ? keys : [label],
     bars: quotaBars(normalizedProvider, record),
+    balances: quotaBalances(record),
     status: firstString(record, ['status_msg', 'message', 'status', 'note', 'balance_note']),
   };
 }
@@ -401,12 +416,17 @@ function quotaBars(provider: string, quota: Record<string, unknown>): QuotaBar[]
   for (const limit of arrayRecords(quota.limits)) {
     const label = firstString(limit, ['label', 'scope']) || 'Limit';
     const pct = percentValue(limit) ?? 0;
-    const used = firstString(limit, ['used_text']) || stringOrNumber(limit.used);
-    const total = firstString(limit, ['limit_text']) || stringOrNumber(limit.limit);
+    // Show the used percentage only; a total percentage is not repeated.
+    // Without a percentage the reported counts stay as they are.
+    const used = firstString(limit, ['used_text']);
+    const total = firstString(limit, ['limit_text']);
+    const percent = percentValue(limit) != null
+      ? `${pct.toFixed(1)}%`
+      : (used && total ? `${used}/${total}` : (used || 'Not reported'));
     const reset = firstString(limit, ['reset_label']) || '';
     bars.push({
       label,
-      hint: `${used || ''}/${total || ''} ${reset}`.trim(),
+      hint: reset ? `${percent} · ${reset}` : percent,
       percent: pct,
     });
   }
@@ -421,16 +441,25 @@ function quotaBars(provider: string, quota: Record<string, unknown>): QuotaBar[]
     const bucket = asRecord(quota.weekly);
     bars.push(progressBar('Weekly window', bucket, 'N/A', true));
   }
+  return bars.filter((bar) => Number.isFinite(bar.percent));
+}
+
+function quotaBalances(quota: Record<string, unknown>): QuotaBalance[] {
+  const rows: QuotaBalance[] = [];
   for (const balance of arrayRecords(quota.balances)) {
     if (balance.total_balance == null) continue;
     const currency = firstString(balance, ['currency']) || 'USD';
-    bars.push({
-      label: `Balance ${currency}`,
-      hint: `${String(balance.total_balance)} ${currency}`,
-      percent: 100,
-    });
+    rows.push({ label: 'Available balance', value: `${String(balance.total_balance)} ${currency}` });
+    const granted = firstString(balance, ['granted_balance']);
+    if (granted && granted !== '0.00' && granted !== '0') {
+      rows.push({ label: 'Granted balance', value: `${granted} ${currency}` });
+    }
+    const toppedUp = firstString(balance, ['topped_up_balance']);
+    if (toppedUp && toppedUp !== '0.00' && toppedUp !== '0') {
+      rows.push({ label: 'Topped up balance', value: `${toppedUp} ${currency}` });
+    }
   }
-  return bars.filter((bar) => Number.isFinite(bar.percent));
+  return rows;
 }
 
 function progressPair(label: string, fiveHour: unknown, weekly: unknown): QuotaBar[] {
@@ -448,7 +477,9 @@ function progressBar(label: string, bucket: Record<string, unknown> | null, fall
   if (bucket && percentValue(bucket) != null) {
     const percent = `${pct.toFixed(1)}%`;
     const resetLabel = firstString(bucket, ['reset_label']) || '';
-    hint = resetPhrase ? `${percent} used · ${resetHint(resetLabel)}` : `${percent} ${resetLabel}`.trim();
+    hint = resetPhrase
+      ? (resetLabel ? `${percent} · ${resetLabel}` : percent)
+      : (resetLabel ? `${percent} ${resetLabel}` : percent);
   }
   return { label, hint, percent: pct };
 }
@@ -557,12 +588,6 @@ function geminiModelFamily(model: Record<string, unknown>): string {
 
 function geminiFamilySortValue(label: string): number {
   return label === 'Flash' ? 0 : label === 'Flash Lite' ? 1 : label === 'Pro' ? 2 : 99;
-}
-
-function resetHint(label: string): string {
-  const value = label.trim();
-  if (!value || value === '—') return 'resets in —';
-  return /^resets?\s+in\b/i.test(value) ? value : `resets in ${value}`;
 }
 
 function normalizeProvider(provider: string): string {

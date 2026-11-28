@@ -893,11 +893,11 @@ fn format_reset_label(reset_at: &chrono::DateTime<chrono::Utc>) -> String {
     let hours = (d.as_secs() % 86_400) / 3_600;
     let mins = (d.as_secs() % 3_600) / 60;
     if days > 0 {
-        format!("resets in {}d {}h", days, hours)
+        format!("{}d {}h", days, hours)
     } else if hours > 0 {
-        format!("resets in {}h {}m", hours, mins)
+        format!("{}h {}m", hours, mins)
     } else {
-        format!("resets in {}m", mins.max(1))
+        format!("{}m", mins.max(1))
     }
 }
 

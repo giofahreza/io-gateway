@@ -4448,7 +4448,6 @@ fn account_quota_usage_line(
         ));
         return Line::from(spans);
     }
-
     let marker_width = 2;
     let state_width = 2 + if account.attention { 2 } else { 0 };
     let priority_width = 6;
@@ -4465,10 +4464,6 @@ fn account_quota_usage_line(
     let account_name = truncate_text(&account.label, account_width);
     let percent = account.percent.unwrap_or(0.0);
     let bar_style = account
-        .percent
-        .map(quota_usage_color)
-        .unwrap_or(BTOP_INACTIVE_FG);
-    let percent_style = account
         .percent
         .map(quota_usage_color)
         .unwrap_or(BTOP_INACTIVE_FG);
@@ -4497,7 +4492,7 @@ fn account_quota_usage_line(
         ),
         Span::styled(
             format!("{percent_text:>pct_width$} "),
-            selected_or(btop_fg(percent_style), selected),
+            selected_or(btop_fg(Color::White), selected),
         ),
         Span::styled(
             percent_bar(percent, bar_width),
@@ -4567,7 +4562,7 @@ fn account_quota_usage_detail_line(
         .unwrap_or_else(|| {
             account
                 .percent
-                .map(|percent| format!("{percent:.1}% used"))
+                .map(|percent| format!("{percent:.1}%"))
                 .unwrap_or_else(|| "No quota".to_string())
         });
     let limit_name = if account.limit_label.trim().is_empty() {
@@ -4596,8 +4591,13 @@ fn account_quota_usage_detail_line(
     };
 
     if content_width < 48 {
-        let text = format!("{selection}   {limit_name}  {percent_text}{reset}");
-        return Line::from(Span::styled(truncate_text(&text, content_width), style));
+        let prefix = format!("{selection}   {limit_name}  ");
+        let value = format!("{percent_text}{reset}");
+        let value_width = content_width.saturating_sub(prefix.len());
+        return Line::from(vec![
+            Span::styled(truncate_text(&prefix, content_width), style),
+            Span::styled(truncate_text(&value, value_width), btop_fg(Color::White)),
+        ]);
     }
 
     let percent = account.percent.unwrap_or(0.0);
@@ -4618,15 +4618,7 @@ fn account_quota_usage_detail_line(
         ),
         Span::styled(
             format!("{percent_text:>10} "),
-            selected_or(
-                btop_fg(
-                    account
-                        .percent
-                        .map(quota_usage_color)
-                        .unwrap_or(BTOP_INACTIVE_FG),
-                ),
-                selected,
-            ),
+            selected_or(btop_fg(Color::White), selected),
         ),
         Span::styled(
             percent_bar(percent, bar_width),
@@ -4640,36 +4632,22 @@ fn account_quota_usage_detail_line(
                 selected,
             ),
         ),
-        Span::styled(suffix, style),
+        Span::styled(suffix, btop_fg(Color::White)),
     ])
 }
 
-fn account_usage_reset_label(provider: &str, reset: &str) -> String {
+fn account_usage_reset_label(_provider: &str, reset: &str) -> String {
     let reset = reset.trim();
     if reset.is_empty() {
         return String::new();
     }
-
-    if provider == "codex" {
-        return reset
-            .strip_prefix("resets in ")
-            .or_else(|| reset.strip_prefix("Resets in "))
-            .unwrap_or(reset)
-            .trim()
-            .to_string();
+    // Reset labels are bare countdowns; older payloads may still carry the
+    // "resets in" wording.
+    for prefix in ["resets in ", "Resets in ", "resets ", "Resets "] {
+        if let Some(rest) = reset.strip_prefix(prefix) {
+            return rest.trim().to_string();
+        }
     }
-
-    if provider == "copilot" {
-        return reset
-            .strip_prefix("resets ")
-            .or_else(|| reset.strip_prefix("Resets "))
-            .or_else(|| reset.strip_prefix("resets"))
-            .or_else(|| reset.strip_prefix("Resets"))
-            .unwrap_or(reset)
-            .trim()
-            .to_string();
-    }
-
     reset.to_string()
 }
 
@@ -5590,20 +5568,15 @@ fn draw_account_details_modal(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             };
             let text = if quota.detail_text.trim().is_empty() {
                 let used = display_or(&quota.used_percent, "not reported");
-                let remaining = if quota.remaining_percent.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!("; remaining {}", quota.remaining_percent)
-                };
                 let reset = if quota.reset.trim().is_empty() {
                     String::new()
                 } else {
                     format!(
-                        "; reset {}",
+                        " · {}",
                         account_usage_reset_label(&account.provider, &quota.reset)
                     )
                 };
-                format!("{used} used{remaining}{reset}")
+                format!("{used}{reset}")
             } else {
                 quota.detail_text.clone()
             };
@@ -7105,7 +7078,16 @@ fn quota_detail_from_parts(
     if (provider == "qwen" || provider == "claude")
         && (!used_text.is_empty() || !limit_text.is_empty())
     {
-        let mut text = format!("{used_text}/{limit_text}");
+        // Show the used percentage only; a total percentage is not repeated.
+        // Without a percentage the reported counts stay as they are.
+        let mut text = match used_percent {
+            Some(value) => format!("{value:.1}%"),
+            None if !used_text.is_empty() && !limit_text.is_empty() => {
+                format!("{used_text}/{limit_text}")
+            }
+            None if !used_text.is_empty() => used_text.clone(),
+            None => "N/A".to_string(),
+        };
         if !reset.trim().is_empty() {
             text.push(' ');
             text.push_str(reset.trim());
@@ -7123,15 +7105,12 @@ fn quota_detail_from_parts(
     }
     if provider == "minimax" {
         let used = used_percent
-            .map(|value| format!("{value:.1}% used"))
-            .unwrap_or_else(|| "— used".to_string());
-        let reset = if reset.trim().is_empty() {
-            "resets in —".to_string()
-        } else if reset.to_ascii_lowercase().starts_with("resets in ") {
-            reset.trim().to_string()
-        } else {
-            format!("resets in {}", reset.trim())
-        };
+            .map(|value| format!("{value:.1}%"))
+            .unwrap_or_else(|| "—".to_string());
+        let reset = reset.trim();
+        if reset.is_empty() {
+            return used;
+        }
         return format!("{used} · {reset}");
     }
     let used = used_percent
@@ -8281,14 +8260,6 @@ fn collect_quota_percent_values(provider: &str, quota: &Value, out: &mut Vec<f64
     if provider == "grok" {
         collect_grok_quota_percent_values(quota, out);
     }
-    for balance in array_values(quota.get("balances")) {
-        if balance
-            .get("total_balance")
-            .is_some_and(|value| !value.is_null())
-        {
-            out.push(100.0);
-        }
-    }
 
     if out.is_empty() {
         collect_direct_quota_percent_values(quota, out);
@@ -8619,13 +8590,12 @@ fn quota_row_is_more_constrained(candidate: &QuotaRow, current: &QuotaRow) -> bo
 
 fn print_quota(rows: &[QuotaRow]) {
     print_table(
-        &["Provider", "Account/limit", "Used", "Remaining", "Reset"],
+        &["Provider", "Account/limit", "Percent", "Reset"],
         rows.iter().map(|row| {
             vec![
                 provider_label(&row.provider).to_string(),
                 row.label.clone(),
                 row.used_percent.clone(),
-                row.remaining_percent.clone(),
                 row.reset.clone(),
             ]
         }),
@@ -9738,6 +9708,7 @@ mod tests {
         assert_eq!(fields, account_quota_summary_fields(&new, &account));
         let text = serde_json::to_string(&fields).unwrap();
         assert!(text.contains("USD") && text.contains("4.50"));
+        assert!(text.contains("Available balance"));
         assert!(!text.contains("999") && !text.contains("SECRET"));
         assert!(account_quota_summary_fields(&json!({"quotas":{}}), &account).is_empty());
     }
@@ -9968,6 +9939,31 @@ mod tests {
             vec!["Text requests", "Text tokens", "Image requests"]
         );
         assert_eq!(rows[0].detail_text, "8/10 (no reset info)");
+    }
+
+    #[test]
+    fn quota_rows_show_the_used_percentage_without_the_total_or_wording() {
+        let rows = quota_rows_from_provider(
+            "claude",
+            &json!({
+                "accounts": [{
+                    "label": "Claude",
+                    "file_name": "claude.json",
+                    "limits": [{
+                        "label": "5h",
+                        "used_percent": 12.5,
+                        "remaining_percent": 87.5,
+                        "limit": 100.0,
+                        "used_text": "12.5%",
+                        "limit_text": "100%",
+                        "reset_label": "4h 41m"
+                    }]
+                }]
+            }),
+        );
+        assert_eq!(rows[0].detail_text, "12.5% 4h 41m");
+        assert_eq!(rows[0].used_percent, "12%");
+        assert_eq!(rows[0].reset, "4h 41m");
     }
 
     #[test]

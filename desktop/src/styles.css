@@ -610,6 +610,7 @@ th {
 }
 
 .quota-bar-labels span:last-child {
+  color: var(--text);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
