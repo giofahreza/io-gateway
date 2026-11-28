@@ -659,7 +659,9 @@ def quota_summary_details(terminal, gateway, binary):
     # First check an older gateway's balance shape through the local projection.
     terminal.send(b"\r")
     terminal.marker(b"Account Details")
-    terminal.marker(b"balance 4.50")
+    # A currency balance is an available amount, never a usage percentage.
+    terminal.marker(b"Available balance")
+    terminal.marker(b"4.50 USD")
     terminal.send(b"\x1b")
     terminal.until(lambda: "Account Details" not in terminal.screen.text())
     # Then supply the new wire format, with enough wrapping to require scroll.
